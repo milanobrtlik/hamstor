@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/thumb"
 )
 
 type HamstorHandle struct {
@@ -140,6 +141,18 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	if oldKey != "" && oldKey != newKey {
 		if err := h.hfs.Store.Delete(ctx, oldKey); err != nil {
 			log.Printf("hamstor: flush delete old key %s: %v", oldKey, err)
+		}
+	}
+
+	// Async thumbnail generation for image files
+	if thumb.IsImageExt(meta.Name) {
+		if relPath, pathErr := h.hfs.DB.InodePath(h.inodeID); pathErr == nil {
+			updated, err2 := h.hfs.DB.GetInode(h.inodeID)
+			if err2 == nil {
+				imgData := make([]byte, len(h.buf))
+				copy(imgData, h.buf)
+				go thumb.Generate(h.hfs.Mountpoint, relPath, updated.MtimeNs/1e9, imgData)
+			}
 		}
 	}
 

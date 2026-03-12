@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"syscall"
 	"time"
 
@@ -204,6 +205,23 @@ func (d *DB) GetPending() ([]InodeMeta, error) {
 		result = append(result, m)
 	}
 	return result, rows.Err()
+}
+
+func (d *DB) InodePath(id int64) (string, error) {
+	var parts []string
+	current := id
+	for current > 1 {
+		m, err := d.GetInode(current)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, m.Name)
+		current = m.ParentID
+	}
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return strings.Join(parts, "/"), nil
 }
 
 func (d *DB) SetAttr(id int64, size *int64, mode *uint32, mtimeNs *int64) error {
