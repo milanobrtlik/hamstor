@@ -1,0 +1,6 @@
+.env
+.claude/
+.idea/
+data/
+/hamstor
+/hamstor.service

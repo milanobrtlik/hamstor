@@ -1,0 +1,112 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+
+	"github.com/milan/hamstor/internal/creds"
+	"github.com/milan/hamstor/internal/db"
+	"github.com/milan/hamstor/internal/hfuse"
+	"github.com/milan/hamstor/internal/replicate"
+	"github.com/milan/hamstor/internal/s3store"
+)
+
+func main() {
+	mountpoint := flag.String("mount", "", "mount point (required)")
+	dbPath := flag.String("db", "data/hamstor.db", "SQLite database path")
+	bucket := flag.String("bucket", "", "S3 bucket name (required)")
+	endpoint := flag.String("endpoint", "", "S3 endpoint URL (for Garage/MinIO)")
+	region := flag.String("region", "", "S3 region (for Garage/MinIO)")
+	enableReplication := flag.Bool("replicate", true, "enable SQLite replication to S3")
+	flag.Parse()
+
+	if *mountpoint == "" || *bucket == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	// Resolve region: flag > embedded > empty (SDK default chain)
+	r := *region
+	if r == "" {
+		r = creds.AWSRegion
+	}
+
+	// Ensure DB parent directory exists
+	if dir := filepath.Dir(*dbPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("create db directory: %v", err)
+		}
+	}
+
+	ctx := context.Background()
+
+	// Litestream: restore DB from S3 if local file missing, then start replication
+	var rep *replicate.Replicator
+	if *enableReplication {
+		rep = replicate.New(replicate.Config{
+			DBPath:         *dbPath,
+			Bucket:         *bucket,
+			Endpoint:       *endpoint,
+			Region:         r,
+			Path:           "litestream",
+			AccessKeyID:    creds.AWSAccessKeyID,
+			SecretAccessKey: creds.AWSSecretAccessKey,
+		})
+		if err := rep.Restore(ctx); err != nil {
+			log.Printf("litestream restore failed: %v", err)
+		}
+		if err := rep.Start(ctx); err != nil {
+			log.Printf("litestream start failed, continuing without replication: %v", err)
+			rep = nil
+		}
+	}
+
+	database, err := db.Open(*dbPath)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+
+	store, err := s3store.New(ctx, *bucket, *endpoint, creds.AWSAccessKeyID, creds.AWSSecretAccessKey, r)
+	if err != nil {
+		log.Fatalf("create s3 store: %v", err)
+	}
+
+	if err := hfuse.Cleanup(database, store); err != nil {
+		log.Fatalf("cleanup: %v", err)
+	}
+
+	hfs := &hfuse.HamstorFS{DB: database, Store: store, Mountpoint: *mountpoint}
+	server, err := hfuse.Mount(*mountpoint, hfs)
+	if err != nil {
+		log.Fatalf("mount: %v", err)
+	}
+
+	log.Printf("hamstor: mounted on %s", *mountpoint)
+
+	// Wait for shutdown signal
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-ch
+		log.Println("hamstor: unmounting...")
+		server.Unmount()
+	}()
+
+	server.Wait()
+
+	// Shutdown: close DB before stopping replication (critical ordering)
+	database.Close()
+	if rep != nil {
+		if err := rep.Stop(ctx); err != nil {
+			log.Printf("litestream stop: %v", err)
+		}
+	}
+
+	log.Println("hamstor: stopped")
+}
