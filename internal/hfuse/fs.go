@@ -11,8 +11,9 @@ import (
 )
 
 type HamstorFS struct {
-	DB    *db.DB
-	Store *s3store.Store
+	DB         *db.DB
+	Store      *s3store.Store
+	Mountpoint string
 
 	// TestCrashBeforeCommit, when non-nil, is called after S3 upload
 	// but before SQLite commit. Tests use this to simulate a crash

@@ -9,6 +9,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/thumb"
 )
 
 type HamstorNode struct {
@@ -212,6 +213,12 @@ func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		return toErrno(err)
 	}
 
+	if thumb.IsImageExt(meta.Name) {
+		if relPath, err := n.hfs.DB.InodePath(meta.ID); err == nil {
+			go thumb.RemoveThumbnails(n.hfs.Mountpoint, relPath)
+		}
+	}
+
 	if meta.S3Key != "" {
 		if err := n.hfs.Store.Delete(ctx, meta.S3Key); err != nil {
 			log.Printf("hamstor: unlink s3 delete %s: %v", meta.S3Key, err)
@@ -259,9 +266,21 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 
 	newParentNode := newParent.EmbeddedInode().Operations().(*HamstorNode)
 
+	// Remove old thumbnails (URI will change)
+	if thumb.IsImageExt(meta.Name) {
+		if oldRelPath, err := n.hfs.DB.InodePath(meta.ID); err == nil {
+			go thumb.RemoveThumbnails(n.hfs.Mountpoint, oldRelPath)
+		}
+	}
+
 	// Check if target exists — if so, remove it
 	existing, err := n.hfs.DB.LookupChild(newParentNode.inodeID, newName)
 	if err == nil {
+		if thumb.IsImageExt(existing.Name) {
+			if existingPath, err := n.hfs.DB.InodePath(existing.ID); err == nil {
+				go thumb.RemoveThumbnails(n.hfs.Mountpoint, existingPath)
+			}
+		}
 		if existing.S3Key != "" {
 			if delErr := n.hfs.Store.Delete(ctx, existing.S3Key); delErr != nil {
 				log.Printf("hamstor: rename delete old s3 %s: %v", existing.S3Key, delErr)
