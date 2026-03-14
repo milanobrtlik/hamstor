@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/milan/hamstor/internal/creds"
+	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/hfuse"
 	"github.com/milan/hamstor/internal/ops"
@@ -23,6 +24,7 @@ func main() {
 	bucket := flag.String("bucket", "", "S3 bucket name (required)")
 	endpoint := flag.String("endpoint", "", "S3 endpoint URL (for Garage/MinIO)")
 	region := flag.String("region", "", "S3 region (for Garage/MinIO)")
+	passphrase := flag.String("passphrase", "", "encryption passphrase (or set HAMSTOR_PASSPHRASE)")
 	enableReplication := flag.Bool("replicate", true, "enable SQLite replication to S3")
 	dryRun := flag.Bool("dry-run", false, "dry-run mode for gc subcommand")
 	flag.Parse()
@@ -30,6 +32,11 @@ func main() {
 	subcmd := ""
 	if args := flag.Args(); len(args) > 0 {
 		subcmd = args[0]
+		for _, a := range args[1:] {
+			if a == "--dry-run" || a == "-dry-run" {
+				*dryRun = true
+			}
+		}
 	}
 
 	if *bucket == "" {
@@ -99,7 +106,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("gc: %v", err)
 		}
-		log.Printf("gc: %d orphans found, %d deleted, %d errors", result.OrphansFound, result.OrphansDeleted, result.Errors)
+		log.Printf("gc: %d s3 orphans, %d db orphans, %d deleted, %d errors", result.OrphansFound, result.DBOrphans, result.OrphansDeleted, result.Errors)
 		database.Close()
 		return
 	}
@@ -108,7 +115,36 @@ func main() {
 		log.Fatalf("cleanup: %v", err)
 	}
 
-	hfs := &hfuse.HamstorFS{DB: database, Store: store, Mountpoint: *mountpoint}
+	// Encryption setup: flag > env > embedded
+	var enc *crypto.Encryptor
+	pass := *passphrase
+	if pass == "" {
+		pass = os.Getenv("HAMSTOR_PASSPHRASE")
+	}
+	if pass == "" {
+		pass = creds.Passphrase
+	}
+	if pass != "" {
+		salt, err := database.GetConfig("encryption_salt")
+		if err != nil {
+			salt, err = crypto.GenerateSalt()
+			if err != nil {
+				log.Fatalf("generate encryption salt: %v", err)
+			}
+			if err := database.SetConfig("encryption_salt", salt); err != nil {
+				log.Fatalf("store encryption salt: %v", err)
+			}
+			log.Println("hamstor: encryption enabled (new salt generated)")
+		} else {
+			log.Println("hamstor: encryption enabled")
+		}
+		enc, err = crypto.New(pass, salt)
+		if err != nil {
+			log.Fatalf("init encryption: %v", err)
+		}
+	}
+
+	hfs := &hfuse.HamstorFS{DB: database, Store: store, Mountpoint: *mountpoint, Encryptor: enc}
 	server, err := hfuse.Mount(*mountpoint, hfs)
 	if err != nil {
 		log.Fatalf("mount: %v", err)

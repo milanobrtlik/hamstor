@@ -9,6 +9,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/s3store"
 	"github.com/milan/hamstor/internal/thumb"
 )
@@ -59,6 +60,13 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	if err != nil {
 		return toErrno(err)
 	}
+	if h.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+		data, err = h.hfs.Encryptor.Decrypt(data)
+		if err != nil {
+			log.Printf("hamstor: decrypt failed for inode %d: %v", h.inodeID, err)
+			return syscall.EIO
+		}
+	}
 	h.buf = data
 	h.loaded = true
 	return 0
@@ -105,7 +113,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 
 	if !h.dirty {
 		if h.isNew {
-			if err := h.hfs.DB.CommitInode(h.inodeID, "", 0); err != nil {
+			if _, err := h.hfs.DB.CommitInode(h.inodeID, "", 0); err != nil {
 				return toErrno(err)
 			}
 			h.isNew = false
@@ -126,6 +134,19 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	bufCopy := make([]byte, len(h.buf))
 	copy(bufCopy, h.buf)
 	bufSize := int64(len(h.buf))
+
+	// Keep plaintext for thumbnail generation
+	plainBuf := bufCopy
+
+	// Encrypt before upload
+	if h.hfs.Encryptor != nil {
+		encrypted, encErr := h.hfs.Encryptor.Encrypt(bufCopy)
+		if encErr != nil {
+			log.Printf("hamstor: encrypt failed for inode %d: %v", h.inodeID, encErr)
+			return syscall.EIO
+		}
+		bufCopy = encrypted
+	}
 
 	// Capture state for async upload
 	hfs := h.hfs
@@ -155,12 +176,20 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			hfs.TestCrashBeforeCommit()
 		}
 
-		if err := hfs.DB.CommitInode(inodeID, newKey, bufSize); err != nil {
+		committed, err := hfs.DB.CommitInode(inodeID, newKey, bufSize)
+		if err != nil {
 			log.Printf("hamstor: async commit failed: %v", err)
 			if delErr := hfs.Store.Delete(uploadCtx, newKey); delErr != nil {
 				log.Printf("hamstor: async cleanup failed: %v", delErr)
 			}
 			h.uploadErr = err
+			return
+		}
+		if !committed {
+			log.Printf("hamstor: inode %d deleted during upload, cleaning up S3 key %s", inodeID, newKey)
+			if delErr := hfs.Store.Delete(uploadCtx, newKey); delErr != nil {
+				log.Printf("hamstor: orphan cleanup failed: %v", delErr)
+			}
 			return
 		}
 
@@ -176,7 +205,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			if relPath, pathErr := hfs.DB.InodePath(inodeID); pathErr == nil {
 				updated, err2 := hfs.DB.GetInode(inodeID)
 				if err2 == nil {
-					go thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, bufCopy)
+					go thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, plainBuf)
 				}
 			}
 		}

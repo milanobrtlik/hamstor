@@ -5,4 +5,5 @@ var (
 	AWSAccessKeyID     string
 	AWSSecretAccessKey string
 	AWSRegion          string
+	Passphrase         string
 )

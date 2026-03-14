@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS inodes (
     UNIQUE(parent_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_inodes_parent_status ON inodes(parent_id, status);
+CREATE TABLE IF NOT EXISTS config (
+    key   TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);
 `
 
 type InodeMeta struct {
@@ -150,6 +154,51 @@ func (d *DB) ListChildren(parentID int64) ([]InodeMeta, error) {
 	return result, rows.Err()
 }
 
+func (d *DB) ListAllChildren(parentID int64) ([]InodeMeta, error) {
+	rows, err := d.db.Query(
+		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE parent_id = ?",
+		parentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []InodeMeta
+	for rows.Next() {
+		var m InodeMeta
+		var s3key sql.NullString
+		if err := rows.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs); err != nil {
+			return nil, err
+		}
+		m.S3Key = s3key.String
+		result = append(result, m)
+	}
+	return result, rows.Err()
+}
+
+func (d *DB) GetOrphanedInodes() ([]InodeMeta, error) {
+	rows, err := d.db.Query(
+		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []InodeMeta
+	for rows.Next() {
+		var m InodeMeta
+		var s3key sql.NullString
+		if err := rows.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs); err != nil {
+			return nil, err
+		}
+		m.S3Key = s3key.String
+		result = append(result, m)
+	}
+	return result, rows.Err()
+}
+
 func (d *DB) InsertInode(parentID int64, name string, mode uint32, status string) (int64, error) {
 	now := time.Now().UnixNano()
 	res, err := d.db.Exec(
@@ -162,13 +211,17 @@ func (d *DB) InsertInode(parentID int64, name string, mode uint32, status string
 	return res.LastInsertId()
 }
 
-func (d *DB) CommitInode(id int64, s3Key string, size int64) error {
+func (d *DB) CommitInode(id int64, s3Key string, size int64) (bool, error) {
 	now := time.Now().UnixNano()
-	_, err := d.db.Exec(
+	res, err := d.db.Exec(
 		"UPDATE inodes SET s3_key = ?, size = ?, status = 'committed', mtime_ns = ? WHERE id = ?",
 		s3Key, size, now, id,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (d *DB) DeleteInode(id int64) error {
@@ -267,6 +320,23 @@ func (d *DB) AllS3KeySet() (map[string]struct{}, error) {
 
 func (d *DB) UpdateS3Key(id int64, newKey string) error {
 	_, err := d.db.Exec("UPDATE inodes SET s3_key = ? WHERE id = ?", newKey, id)
+	return err
+}
+
+func (d *DB) GetConfig(key string) ([]byte, error) {
+	var val []byte
+	err := d.db.QueryRow("SELECT value FROM config WHERE key = ?", key).Scan(&val)
+	if err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
+func (d *DB) SetConfig(key string, value []byte) error {
+	_, err := d.db.Exec(
+		"INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+		key, value,
+	)
 	return err
 }
 
