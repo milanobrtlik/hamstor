@@ -3,7 +3,8 @@ export
 
 LDFLAGS = -X github.com/milan/hamstor/internal/creds.AWSAccessKeyID=$(AWS_ACCESS_KEY_ID) \
           -X github.com/milan/hamstor/internal/creds.AWSSecretAccessKey=$(AWS_SECRET_ACCESS_KEY) \
-          -X github.com/milan/hamstor/internal/creds.AWSRegion=$(AWS_REGION)
+          -X github.com/milan/hamstor/internal/creds.AWSRegion=$(AWS_REGION) \
+          -X github.com/milan/hamstor/internal/creds.Passphrase=$(HAMSTOR_PASSPHRASE)
 
 build:
 	@mkdir -p data

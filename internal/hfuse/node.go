@@ -9,6 +9,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/thumb"
 )
 
@@ -204,6 +205,13 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			if err != nil {
 				return nil, 0, toErrno(err)
 			}
+			if n.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+				data, err = n.hfs.Encryptor.Decrypt(data)
+				if err != nil {
+					log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, err)
+					return nil, 0, syscall.EIO
+				}
+			}
 			handle.buf = data
 			handle.loaded = true
 		}
@@ -242,18 +250,43 @@ func (n *HamstorNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return toErrno(err)
 	}
 
-	children, err := n.hfs.DB.ListChildren(meta.ID)
-	if err != nil {
-		return toErrno(err)
-	}
-	if len(children) > 0 {
-		return syscall.ENOTEMPTY
-	}
-
-	if err := n.hfs.DB.DeleteInode(meta.ID); err != nil {
+	if err := deleteTree(ctx, n.hfs, meta.ID); err != nil {
 		return toErrno(err)
 	}
 	return 0
+}
+
+// deleteTree recursively deletes a directory and all its descendants,
+// including S3 objects and thumbnails.
+func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
+	children, err := hfs.DB.ListAllChildren(dirID)
+	if err != nil {
+		return err
+	}
+
+	for _, child := range children {
+		if child.Mode&syscall.S_IFDIR != 0 {
+			if err := deleteTree(ctx, hfs, child.ID); err != nil {
+				return err
+			}
+		} else {
+			if child.S3Key != "" {
+				if err := hfs.Store.Delete(ctx, child.S3Key); err != nil {
+					log.Printf("hamstor: rmdir delete s3 %s: %v", child.S3Key, err)
+				}
+			}
+			if thumb.IsImageExt(child.Name) {
+				if relPath, pathErr := hfs.DB.InodePath(child.ID); pathErr == nil {
+					go thumb.RemoveThumbnails(hfs.Mountpoint, relPath)
+				}
+			}
+			if err := hfs.DB.DeleteInode(child.ID); err != nil {
+				return err
+			}
+		}
+	}
+
+	return hfs.DB.DeleteInode(dirID)
 }
 
 func (n *HamstorNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {

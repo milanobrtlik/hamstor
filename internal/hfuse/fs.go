@@ -6,6 +6,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
 )
@@ -14,6 +15,7 @@ type HamstorFS struct {
 	DB         *db.DB
 	Store      *s3store.Store
 	Mountpoint string
+	Encryptor  *crypto.Encryptor // nil means no encryption
 
 	// TestCrashBeforeCommit, when non-nil, is called after S3 upload
 	// but before SQLite commit. Tests use this to simulate a crash
