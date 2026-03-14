@@ -79,6 +79,36 @@ func (s *Store) Download(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
+func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+	var keys []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3store: list prefix %q: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, *obj.Key)
+		}
+	}
+	return keys, nil
+}
+
+func (s *Store) Copy(ctx context.Context, srcKey, dstKey string) error {
+	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(s.bucket),
+		CopySource: aws.String(s.bucket + "/" + srcKey),
+		Key:        aws.String(dstKey),
+	})
+	if err != nil {
+		return fmt.Errorf("s3store: copy %s -> %s: %w", srcKey, dstKey, err)
+	}
+	return nil
+}
+
 func (s *Store) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),

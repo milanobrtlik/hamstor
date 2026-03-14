@@ -78,7 +78,12 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 		sizePtr = &s
 	}
 	if m, ok := in.GetMode(); ok {
-		modePtr = &m
+		meta, err := n.hfs.DB.GetInode(n.inodeID)
+		if err != nil {
+			return toErrno(err)
+		}
+		merged := (meta.Mode & syscall.S_IFMT) | (m & ^uint32(syscall.S_IFMT))
+		modePtr = &merged
 	}
 	if mt, ok := in.GetMTime(); ok {
 		ns := mt.UnixNano()

@@ -12,12 +12,12 @@ import (
 )
 
 type Config struct {
-	DBPath         string
-	Bucket         string
-	Endpoint       string
-	Region         string // S3 region, default "us-east-1"
-	Path           string // S3 key prefix, default "litestream"
-	AccessKeyID    string // optional, for build-time embedded creds
+	DBPath          string
+	Bucket          string
+	Endpoint        string
+	Region          string // S3 region, default "us-east-1"
+	Path            string // S3 key prefix, default "litestream"
+	AccessKeyID     string // optional, for build-time embedded creds
 	SecretAccessKey string // optional, for build-time embedded creds
 }
 
