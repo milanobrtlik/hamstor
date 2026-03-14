@@ -22,3 +22,13 @@ func (th *TestHandle) TestWrite(data []byte) {
 func (th *TestHandle) TestFlush() {
 	th.h.Flush(context.Background())
 }
+
+func (th *TestHandle) TestRelease() {
+	th.h.Release(context.Background())
+}
+
+func (th *TestHandle) WaitUpload() {
+	if th.h.uploadDone != nil {
+		<-th.h.uploadDone
+	}
+}

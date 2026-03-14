@@ -2,6 +2,7 @@ package hfuse
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"syscall"
@@ -20,6 +21,10 @@ type HamstorHandle struct {
 	dirty   bool
 	loaded  bool
 	isNew   bool
+
+	// Async upload state
+	uploadDone chan struct{}
+	uploadErr  error
 }
 
 var (
@@ -114,47 +119,68 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		return toErrno(err)
 	}
 	oldKey := meta.S3Key
+	fileName := meta.Name
 
-	// Generate new S3 key and upload
+	// Generate new S3 key
 	newKey := s3store.NewKey()
-	if err := h.hfs.Store.Upload(ctx, newKey, h.buf); err != nil {
-		log.Printf("hamstor: flush upload failed: %v", err)
-		return syscall.EIO
-	}
+	bufCopy := make([]byte, len(h.buf))
+	copy(bufCopy, h.buf)
+	bufSize := int64(len(h.buf))
 
-	// Test hook: simulate crash between S3 upload and SQLite commit
-	if h.hfs.TestCrashBeforeCommit != nil {
-		h.hfs.TestCrashBeforeCommit()
-	}
+	// Capture state for async upload
+	hfs := h.hfs
+	inodeID := h.inodeID
 
-	// Commit to SQLite
-	if err := h.hfs.DB.CommitInode(h.inodeID, newKey, int64(len(h.buf))); err != nil {
-		log.Printf("hamstor: flush commit failed: %v", err)
-		// Best-effort cleanup of the uploaded object
-		if delErr := h.hfs.Store.Delete(ctx, newKey); delErr != nil {
-			log.Printf("hamstor: flush cleanup failed: %v", delErr)
+	h.uploadDone = make(chan struct{})
+
+	go func() {
+		defer close(h.uploadDone)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("hamstor: async upload panic: %v", r)
+				h.uploadErr = fmt.Errorf("panic: %v", r)
+			}
+		}()
+
+		uploadCtx := context.Background()
+
+		if err := hfs.Store.Upload(uploadCtx, newKey, bufCopy); err != nil {
+			log.Printf("hamstor: async upload failed: %v", err)
+			h.uploadErr = err
+			return
 		}
-		return syscall.EIO
-	}
 
-	// Clean up old S3 object if it changed
-	if oldKey != "" && oldKey != newKey {
-		if err := h.hfs.Store.Delete(ctx, oldKey); err != nil {
-			log.Printf("hamstor: flush delete old key %s: %v", oldKey, err)
+		// Test hook: simulate crash between S3 upload and SQLite commit
+		if hfs.TestCrashBeforeCommit != nil {
+			hfs.TestCrashBeforeCommit()
 		}
-	}
 
-	// Async thumbnail generation for image files
-	if thumb.IsImageExt(meta.Name) {
-		if relPath, pathErr := h.hfs.DB.InodePath(h.inodeID); pathErr == nil {
-			updated, err2 := h.hfs.DB.GetInode(h.inodeID)
-			if err2 == nil {
-				imgData := make([]byte, len(h.buf))
-				copy(imgData, h.buf)
-				go thumb.Generate(h.hfs.Mountpoint, relPath, updated.MtimeNs/1e9, imgData)
+		if err := hfs.DB.CommitInode(inodeID, newKey, bufSize); err != nil {
+			log.Printf("hamstor: async commit failed: %v", err)
+			if delErr := hfs.Store.Delete(uploadCtx, newKey); delErr != nil {
+				log.Printf("hamstor: async cleanup failed: %v", delErr)
+			}
+			h.uploadErr = err
+			return
+		}
+
+		// Clean up old S3 object if it changed
+		if oldKey != "" && oldKey != newKey {
+			if err := hfs.Store.Delete(uploadCtx, oldKey); err != nil {
+				log.Printf("hamstor: flush delete old key %s: %v", oldKey, err)
 			}
 		}
-	}
+
+		// Async thumbnail generation for image files
+		if thumb.IsImageExt(fileName) {
+			if relPath, pathErr := hfs.DB.InodePath(inodeID); pathErr == nil {
+				updated, err2 := hfs.DB.GetInode(inodeID)
+				if err2 == nil {
+					go thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, bufCopy)
+				}
+			}
+		}
+	}()
 
 	h.dirty = false
 	h.isNew = false
@@ -162,12 +188,34 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 }
 
 func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	return h.Flush(ctx)
+	errno := h.Flush(ctx)
+	if errno != 0 {
+		return errno
+	}
+	// Wait for async upload to complete — fsync guarantees durability
+	h.mu.Lock()
+	done := h.uploadDone
+	h.mu.Unlock()
+	if done != nil {
+		<-done
+		if h.uploadErr != nil {
+			return syscall.EIO
+		}
+	}
+	return 0
 }
 
 func (h *HamstorHandle) Release(ctx context.Context) syscall.Errno {
-	if errno := h.Flush(ctx); errno != 0 {
-		log.Printf("hamstor: release flush failed for inode %d", h.inodeID)
+	// Wait for any pending async upload
+	h.mu.Lock()
+	done := h.uploadDone
+	h.mu.Unlock()
+
+	if done != nil {
+		<-done
+		if h.uploadErr != nil {
+			log.Printf("hamstor: release: async upload failed for inode %d: %v", h.inodeID, h.uploadErr)
+		}
 	}
 
 	h.mu.Lock()
