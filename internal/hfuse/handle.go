@@ -6,9 +6,9 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/google/uuid"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/s3store"
 	"github.com/milan/hamstor/internal/thumb"
 )
 
@@ -116,7 +116,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	oldKey := meta.S3Key
 
 	// Generate new S3 key and upload
-	newKey := uuid.New().String()
+	newKey := s3store.NewKey()
 	if err := h.hfs.Store.Upload(ctx, newKey, h.buf); err != nil {
 		log.Printf("hamstor: flush upload failed: %v", err)
 		return syscall.EIO

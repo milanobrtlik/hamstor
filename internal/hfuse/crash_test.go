@@ -10,6 +10,16 @@ import (
 	"github.com/milan/hamstor/internal/s3store"
 )
 
+func testEnv(testKey, fallbackKey, defaultVal string) string {
+	if v := os.Getenv(testKey); v != "" {
+		return v
+	}
+	if v := os.Getenv(fallbackKey); v != "" {
+		return v
+	}
+	return defaultVal
+}
+
 func setupTest(t *testing.T) (*HamstorFS, string) {
 	t.Helper()
 
@@ -19,17 +29,11 @@ func setupTest(t *testing.T) (*HamstorFS, string) {
 		t.Fatalf("open db: %v", err)
 	}
 
-	endpoint := os.Getenv("HAMSTOR_ENDPOINT")
-	if endpoint == "" {
-		endpoint = "http://localhost:3900"
-	}
-	bucket := os.Getenv("HAMSTOR_BUCKET")
-	if bucket == "" {
-		bucket = "hamstor"
-	}
-	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
-	region := os.Getenv("AWS_REGION")
+	endpoint := testEnv("HAMSTOR_TEST_ENDPOINT", "HAMSTOR_ENDPOINT", "http://localhost:3900")
+	bucket := testEnv("HAMSTOR_TEST_BUCKET", "HAMSTOR_BUCKET", "hamstor")
+	accessKey := testEnv("HAMSTOR_TEST_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID", "")
+	secretKey := testEnv("HAMSTOR_TEST_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", "")
+	region := testEnv("HAMSTOR_TEST_REGION", "AWS_REGION", "")
 
 	store, err := s3store.New(context.Background(), bucket, endpoint, accessKey, secretKey, region)
 	if err != nil {

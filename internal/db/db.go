@@ -224,6 +224,52 @@ func (d *DB) InodePath(id int64) (string, error) {
 	return strings.Join(parts, "/"), nil
 }
 
+type S3KeyRecord struct {
+	ID    int64
+	S3Key string
+}
+
+func (d *DB) AllS3Keys() ([]S3KeyRecord, error) {
+	rows, err := d.db.Query("SELECT id, s3_key FROM inodes WHERE s3_key IS NOT NULL AND s3_key != ''")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []S3KeyRecord
+	for rows.Next() {
+		var r S3KeyRecord
+		if err := rows.Scan(&r.ID, &r.S3Key); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+func (d *DB) AllS3KeySet() (map[string]struct{}, error) {
+	rows, err := d.db.Query("SELECT s3_key FROM inodes WHERE s3_key IS NOT NULL AND s3_key != ''")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	set := make(map[string]struct{})
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		set[key] = struct{}{}
+	}
+	return set, rows.Err()
+}
+
+func (d *DB) UpdateS3Key(id int64, newKey string) error {
+	_, err := d.db.Exec("UPDATE inodes SET s3_key = ? WHERE id = ?", newKey, id)
+	return err
+}
+
 func (d *DB) SetAttr(id int64, size *int64, mode *uint32, mtimeNs *int64) error {
 	now := time.Now().UnixNano()
 	if size != nil {

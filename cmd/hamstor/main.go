@@ -12,20 +12,31 @@ import (
 	"github.com/milan/hamstor/internal/creds"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/hfuse"
+	"github.com/milan/hamstor/internal/ops"
 	"github.com/milan/hamstor/internal/replicate"
 	"github.com/milan/hamstor/internal/s3store"
 )
 
 func main() {
-	mountpoint := flag.String("mount", "", "mount point (required)")
+	mountpoint := flag.String("mount", "", "mount point (required for normal operation)")
 	dbPath := flag.String("db", "data/hamstor.db", "SQLite database path")
 	bucket := flag.String("bucket", "", "S3 bucket name (required)")
 	endpoint := flag.String("endpoint", "", "S3 endpoint URL (for Garage/MinIO)")
 	region := flag.String("region", "", "S3 region (for Garage/MinIO)")
 	enableReplication := flag.Bool("replicate", true, "enable SQLite replication to S3")
+	dryRun := flag.Bool("dry-run", false, "dry-run mode for gc subcommand")
 	flag.Parse()
 
-	if *mountpoint == "" || *bucket == "" {
+	subcmd := ""
+	if args := flag.Args(); len(args) > 0 {
+		subcmd = args[0]
+	}
+
+	if *bucket == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+	if subcmd == "" && *mountpoint == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -47,14 +58,14 @@ func main() {
 
 	// Litestream: restore DB from S3 if local file missing, then start replication
 	var rep *replicate.Replicator
-	if *enableReplication {
+	if *enableReplication && subcmd == "" {
 		rep = replicate.New(replicate.Config{
-			DBPath:         *dbPath,
-			Bucket:         *bucket,
-			Endpoint:       *endpoint,
-			Region:         r,
-			Path:           "litestream",
-			AccessKeyID:    creds.AWSAccessKeyID,
+			DBPath:          *dbPath,
+			Bucket:          *bucket,
+			Endpoint:        *endpoint,
+			Region:          r,
+			Path:            "litestream",
+			AccessKeyID:     creds.AWSAccessKeyID,
 			SecretAccessKey: creds.AWSSecretAccessKey,
 		})
 		if err := rep.Restore(ctx); err != nil {
@@ -74,6 +85,23 @@ func main() {
 	store, err := s3store.New(ctx, *bucket, *endpoint, creds.AWSAccessKeyID, creds.AWSSecretAccessKey, r)
 	if err != nil {
 		log.Fatalf("create s3 store: %v", err)
+	}
+
+	switch subcmd {
+	case "migrate":
+		if err := ops.Migrate(ctx, database, store); err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
+		database.Close()
+		return
+	case "gc":
+		result, err := ops.GC(ctx, database, store, *dryRun)
+		if err != nil {
+			log.Fatalf("gc: %v", err)
+		}
+		log.Printf("gc: %d orphans found, %d deleted, %d errors", result.OrphansFound, result.OrphansDeleted, result.Errors)
+		database.Close()
+		return
 	}
 
 	if err := hfuse.Cleanup(database, store); err != nil {

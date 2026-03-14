@@ -8,16 +8,16 @@ import (
 	"hash/crc32"
 	"image"
 	_ "image/gif"
-	"image/png"
 	_ "image/jpeg"
+	"image/png"
 	"log"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/image/draw"
 	_ "golang.org/x/image/bmp"
+	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
 
