@@ -117,7 +117,8 @@ func TestCrashBeforeCommit(t *testing.T) {
 func TestCrashHookInFlush(t *testing.T) {
 	hfs, dbPath := setupTest(t)
 
-	// Set the crash hook — it panics to simulate process death
+	// Set the crash hook — it panics to simulate process death.
+	// The async upload goroutine recovers panics internally.
 	crashCalled := false
 	hfs.TestCrashBeforeCommit = func() {
 		crashCalled = true
@@ -130,19 +131,17 @@ func TestCrashHookInFlush(t *testing.T) {
 		t.Fatalf("insert inode: %v", err)
 	}
 
-	// Call Flush via handle — expect panic
+	// Call Flush (starts async upload) then wait for it to complete
 	handle := NewTestHandle(hfs, fileID, true)
-	func() {
-		defer func() { recover() }()
-		handle.TestWrite([]byte("some data"))
-		handle.TestFlush()
-	}()
+	handle.TestWrite([]byte("some data"))
+	handle.TestFlush()
+	handle.WaitUpload()
 
 	if !crashCalled {
 		t.Fatal("crash hook was not called")
 	}
 
-	// The inode should still be pending (commit never happened)
+	// The inode should still be pending (commit never happened due to panic)
 	meta, err := hfs.DB.GetInode(fileID)
 	if err != nil {
 		t.Fatalf("get inode: %v", err)
