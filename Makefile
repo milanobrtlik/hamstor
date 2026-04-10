@@ -50,4 +50,10 @@ uninstall:
 		rm -rf /var/lib/hamstor; \
 		true'
 
-.PHONY: build install uninstall
+purge-s3: build
+	@systemctl is-active --quiet hamstor 2>/dev/null && { echo "Error: hamstor service is running. Run 'make uninstall' first."; exit 1; } || true
+	@echo "WARNING: This will delete ALL data in S3 bucket '$(HAMSTOR_BUCKET)' and the local database!"
+	@read -p "Type 'yes' to confirm: " confirm && [ "$$confirm" = "yes" ] || { echo "Aborted."; exit 1; }
+	./hamstor --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) purge-s3
+
+.PHONY: build install uninstall purge-s3
