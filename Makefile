@@ -14,10 +14,6 @@ build:
 	go build -ldflags "$(LDFLAGS)" -o hamstor ./cmd/hamstor
 
 install: build
-	-sudo systemctl stop hamstor 2>/dev/null
-	-sudo fusermount -uz $(HAMSTOR_MOUNT) 2>/dev/null
-	sudo cp hamstor /usr/local/bin/hamstor
-	sudo mkdir -p $(HAMSTOR_MOUNT)
 	@printf '[Unit]\n\
 Description=Hamstor FUSE filesystem\n\
 After=network-online.target\n\
@@ -34,17 +30,24 @@ RestartSec=5\n\
 \n\
 [Install]\n\
 WantedBy=multi-user.target\n' > hamstor.service
-	sudo mkdir -p /var/lib/hamstor
-	sudo cp hamstor.service /etc/systemd/system/
-	sudo systemctl daemon-reload
-	sudo systemctl enable --now hamstor
+	sudo sh -c '\
+		systemctl stop hamstor 2>/dev/null; \
+		fusermount -uz $(HAMSTOR_MOUNT) 2>/dev/null; \
+		cp hamstor /usr/local/bin/hamstor && \
+		mkdir -p $(HAMSTOR_MOUNT) && \
+		mkdir -p /var/lib/hamstor && \
+		cp hamstor.service /etc/systemd/system/ && \
+		systemctl daemon-reload && \
+		systemctl enable --now hamstor'
 
 uninstall:
-	-sudo systemctl disable --now hamstor 2>/dev/null
-	-sudo fusermount -uz $(HAMSTOR_MOUNT) 2>/dev/null
-	-sudo rm -f /etc/systemd/system/hamstor.service
-	sudo systemctl daemon-reload
-	-sudo rm -f /usr/local/bin/hamstor
-	-sudo rm -rf /var/lib/hamstor
+	sudo sh -c '\
+		systemctl disable --now hamstor 2>/dev/null; \
+		fusermount -uz $(HAMSTOR_MOUNT) 2>/dev/null; \
+		rm -f /etc/systemd/system/hamstor.service; \
+		systemctl daemon-reload; \
+		rm -f /usr/local/bin/hamstor; \
+		rm -rf /var/lib/hamstor; \
+		true'
 
 .PHONY: build install uninstall
