@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
+	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/creds"
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
@@ -18,8 +20,10 @@ import (
 	"github.com/milan/hamstor/internal/s3store"
 )
 
+var version = "dev"
+
 func main() {
-	mountpoint := flag.String("mount", "", "mount point (required for normal operation)")
+	mountpoint := flag.String("mount", "", "mount point (required for mount mode)")
 	dbPath := flag.String("db", "data/hamstor.db", "SQLite database path")
 	bucket := flag.String("bucket", "", "S3 bucket name (required)")
 	endpoint := flag.String("endpoint", "", "S3 endpoint URL (for Garage/MinIO)")
@@ -27,6 +31,12 @@ func main() {
 	passphrase := flag.String("passphrase", "", "encryption passphrase (or set HAMSTOR_PASSPHRASE)")
 	enableReplication := flag.Bool("replicate", true, "enable SQLite replication to S3")
 	dryRun := flag.Bool("dry-run", false, "dry-run mode for gc subcommand")
+	cacheDir := flag.String("cache-dir", "/var/lib/hamstor/cache", "local disk cache directory")
+	cacheSizeGB := flag.Int("cache-size", 10, "max cache size in GB (0 to disable)")
+	ownerUid := flag.Int("uid", os.Getuid(), "default file owner UID")
+	ownerGid := flag.Int("gid", os.Getgid(), "default file owner GID")
+	streamRate := flag.Int("stream-rate", 5, "streaming rate limit in MB/s for multimedia (0 to disable)")
+	streamBuffer := flag.Int("stream-buffer", 16, "streaming memory buffer in MB")
 	flag.Parse()
 
 	subcmd := ""
@@ -39,6 +49,23 @@ func main() {
 		}
 	}
 
+	// Handle version command
+	if subcmd == "version" {
+		fmt.Printf("hamstor %s\n", version)
+		return
+	}
+
+	// Handle commands that don't need S3
+	if subcmd == "fsck" || subcmd == "cache" {
+		switch subcmd {
+		case "fsck":
+			runFsck(*dbPath)
+		case "cache":
+			runCacheCmd(*cacheDir, *cacheSizeGB, flag.Args()[1:])
+		}
+		return
+	}
+
 	if *bucket == "" {
 		flag.Usage()
 		os.Exit(1)
@@ -48,13 +75,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Resolve region: flag > embedded > empty (SDK default chain)
 	r := *region
 	if r == "" {
 		r = creds.AWSRegion
 	}
 
-	// Ensure DB parent directory exists
 	if dir := filepath.Dir(*dbPath); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			log.Fatalf("create db directory: %v", err)
@@ -65,7 +90,7 @@ func main() {
 
 	// Litestream: restore DB from S3 if local file missing, then start replication
 	var rep *replicate.Replicator
-	if *enableReplication && subcmd == "" {
+	if *enableReplication {
 		rep = replicate.New(replicate.Config{
 			DBPath:          *dbPath,
 			Bucket:          *bucket,
@@ -75,8 +100,14 @@ func main() {
 			AccessKeyID:     creds.AWSAccessKeyID,
 			SecretAccessKey: creds.AWSSecretAccessKey,
 		})
-		if err := rep.Restore(ctx); err != nil {
-			log.Printf("litestream restore failed: %v", err)
+		if subcmd == "" || subcmd == "restore" {
+			if err := rep.Restore(ctx); err != nil {
+				log.Printf("litestream restore failed: %v", err)
+			}
+			if subcmd == "restore" {
+				log.Println("restore: done")
+				return
+			}
 		}
 		if err := rep.Start(ctx); err != nil {
 			log.Printf("litestream start failed, continuing without replication: %v", err)
@@ -111,48 +142,48 @@ func main() {
 		return
 	}
 
+	// Default: mount mode
 	if err := hfuse.Cleanup(database, store); err != nil {
 		log.Fatalf("cleanup: %v", err)
 	}
 
-	// Encryption setup: flag > env > embedded
-	var enc *crypto.Encryptor
-	pass := *passphrase
-	if pass == "" {
-		pass = os.Getenv("HAMSTOR_PASSPHRASE")
+	// Fix ownership of root inode and any legacy uid=0/gid=0 inodes
+	defaultUid := uint32(*ownerUid)
+	defaultGid := uint32(*ownerGid)
+	if err := database.SetOwner(1, &defaultUid, &defaultGid); err != nil {
+		log.Printf("hamstor: set root owner: %v", err)
 	}
-	if pass == "" {
-		pass = creds.Passphrase
+	if fixed, err := database.FixDefaultOwnership(defaultUid, defaultGid); err != nil {
+		log.Printf("hamstor: fix default ownership: %v", err)
+	} else if fixed > 0 {
+		log.Printf("hamstor: fixed ownership on %d inodes", fixed)
 	}
-	if pass != "" {
-		salt, err := database.GetConfig("encryption_salt")
+
+	enc := setupEncryption(database, *passphrase)
+
+	var diskCache *cache.DiskCache
+	if *cacheSizeGB > 0 {
+		diskCache, err = cache.New(*cacheDir, int64(*cacheSizeGB)*1<<30)
 		if err != nil {
-			salt, err = crypto.GenerateSalt()
-			if err != nil {
-				log.Fatalf("generate encryption salt: %v", err)
-			}
-			if err := database.SetConfig("encryption_salt", salt); err != nil {
-				log.Fatalf("store encryption salt: %v", err)
-			}
-			log.Println("hamstor: encryption enabled (new salt generated)")
+			log.Printf("hamstor: cache init failed, continuing without cache: %v", err)
 		} else {
-			log.Println("hamstor: encryption enabled")
-		}
-		enc, err = crypto.New(pass, salt)
-		if err != nil {
-			log.Fatalf("init encryption: %v", err)
+			log.Printf("hamstor: disk cache enabled (%s, %d GB)", *cacheDir, *cacheSizeGB)
 		}
 	}
 
-	hfs := &hfuse.HamstorFS{DB: database, Store: store, Mountpoint: *mountpoint, Encryptor: enc}
+	hfs := &hfuse.HamstorFS{
+		DB: database, Store: store, Mountpoint: *mountpoint,
+		Encryptor: enc, Cache: diskCache,
+		DefaultUid: defaultUid, DefaultGid: defaultGid,
+		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
+	}
 	server, err := hfuse.Mount(*mountpoint, hfs)
 	if err != nil {
 		log.Fatalf("mount: %v", err)
 	}
 
-	log.Printf("hamstor: mounted on %s", *mountpoint)
+	log.Printf("hamstor %s: mounted on %s", version, *mountpoint)
 
-	// Wait for shutdown signal
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 
@@ -164,7 +195,6 @@ func main() {
 
 	server.Wait()
 
-	// Shutdown: close DB before stopping replication (critical ordering)
 	database.Close()
 	if rep != nil {
 		if err := rep.Stop(ctx); err != nil {
@@ -173,4 +203,99 @@ func main() {
 	}
 
 	log.Println("hamstor: stopped")
+}
+
+func setupEncryption(database *db.DB, passphrase string) *crypto.Encryptor {
+	pass := passphrase
+	if pass == "" {
+		pass = os.Getenv("HAMSTOR_PASSPHRASE")
+	}
+	if pass == "" {
+		pass = creds.Passphrase
+	}
+	if pass == "" {
+		return nil
+	}
+
+	salt, err := database.GetConfig("encryption_salt")
+	if err != nil {
+		salt, err = crypto.GenerateSalt()
+		if err != nil {
+			log.Fatalf("generate encryption salt: %v", err)
+		}
+		if err := database.SetConfig("encryption_salt", salt); err != nil {
+			log.Fatalf("store encryption salt: %v", err)
+		}
+		log.Println("hamstor: encryption enabled (new salt generated)")
+	} else {
+		log.Println("hamstor: encryption enabled")
+	}
+	enc, err := crypto.New(pass, salt)
+	if err != nil {
+		log.Fatalf("init encryption: %v", err)
+	}
+	return enc
+}
+
+func runFsck(dbPath string) {
+	if dir := filepath.Dir(dbPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("create db directory: %v", err)
+		}
+	}
+	database, err := db.Open(dbPath)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	result, err := database.Fsck()
+	if err != nil {
+		log.Fatalf("fsck: %v", err)
+	}
+
+	fmt.Printf("fsck results:\n")
+	fmt.Printf("  total inodes:    %d\n", result.TotalInodes)
+	fmt.Printf("  orphaned inodes: %d\n", result.OrphanedInodes)
+	fmt.Printf("  pending inodes:  %d\n", result.PendingInodes)
+	fmt.Printf("  missing S3 keys: %d\n", result.MissingS3Keys)
+
+	if result.OrphanedInodes > 0 || result.PendingInodes > 0 || result.MissingS3Keys > 0 {
+		fmt.Println("  status: ISSUES FOUND (run gc to clean up)")
+		os.Exit(1)
+	}
+	fmt.Println("  status: OK")
+}
+
+func runCacheCmd(cacheDir string, cacheSizeGB int, args []string) {
+	if cacheSizeGB <= 0 {
+		fmt.Println("cache is disabled (--cache-size=0)")
+		return
+	}
+	c, err := cache.New(cacheDir, int64(cacheSizeGB)*1<<30)
+	if err != nil {
+		log.Fatalf("open cache: %v", err)
+	}
+
+	subcmd := "stats"
+	if len(args) > 0 {
+		subcmd = args[0]
+	}
+
+	switch subcmd {
+	case "stats":
+		totalBytes, count := c.Size()
+		fmt.Printf("cache: %s\n", cacheDir)
+		fmt.Printf("  entries: %d\n", count)
+		fmt.Printf("  size:    %.1f MB\n", float64(totalBytes)/(1<<20))
+		fmt.Printf("  limit:   %d GB\n", cacheSizeGB)
+	case "clear":
+		if err := c.Clear(); err != nil {
+			log.Fatalf("cache clear: %v", err)
+		}
+		fmt.Println("cache cleared")
+	default:
+		fmt.Fprintf(os.Stderr, "unknown cache subcommand: %s (use: stats, clear)\n", subcmd)
+		os.Exit(1)
+	}
 }

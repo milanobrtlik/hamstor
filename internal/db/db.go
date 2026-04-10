@@ -12,15 +12,18 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS inodes (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    parent_id INTEGER NOT NULL,
-    name      TEXT NOT NULL,
-    mode      INTEGER NOT NULL,
-    size      INTEGER NOT NULL DEFAULT 0,
-    s3_key    TEXT,
-    status    TEXT NOT NULL DEFAULT 'committed',
-    mtime_ns  INTEGER NOT NULL,
-    ctime_ns  INTEGER NOT NULL,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id       INTEGER NOT NULL,
+    name            TEXT NOT NULL,
+    mode            INTEGER NOT NULL,
+    size            INTEGER NOT NULL DEFAULT 0,
+    s3_key          TEXT,
+    status          TEXT NOT NULL DEFAULT 'committed',
+    mtime_ns        INTEGER NOT NULL,
+    ctime_ns        INTEGER NOT NULL,
+    uid             INTEGER NOT NULL DEFAULT 0,
+    gid             INTEGER NOT NULL DEFAULT 0,
+    symlink_target  TEXT,
     UNIQUE(parent_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_inodes_parent_status ON inodes(parent_id, status);
@@ -28,18 +31,42 @@ CREATE TABLE IF NOT EXISTS config (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS xattrs (
+    inode_id INTEGER NOT NULL,
+    name     TEXT NOT NULL,
+    value    BLOB NOT NULL,
+    PRIMARY KEY (inode_id, name)
+);
 `
 
+// Migrations for databases created before these columns existed.
+var migrations = []string{
+	"ALTER TABLE inodes ADD COLUMN uid INTEGER NOT NULL DEFAULT 0",
+	"ALTER TABLE inodes ADD COLUMN gid INTEGER NOT NULL DEFAULT 0",
+	"ALTER TABLE inodes ADD COLUMN symlink_target TEXT",
+	`CREATE TABLE IF NOT EXISTS xattrs (
+		inode_id INTEGER NOT NULL,
+		name     TEXT NOT NULL,
+		value    BLOB NOT NULL,
+		PRIMARY KEY (inode_id, name)
+	)`,
+}
+
+const inodeCols = "id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns, uid, gid, symlink_target"
+
 type InodeMeta struct {
-	ID       int64
-	ParentID int64
-	Name     string
-	Mode     uint32
-	Size     int64
-	S3Key    string
-	Status   string
-	MtimeNs  int64
-	CtimeNs  int64
+	ID            int64
+	ParentID      int64
+	Name          string
+	Mode          uint32
+	Size          int64
+	S3Key         string
+	Status        string
+	MtimeNs       int64
+	CtimeNs       int64
+	Uid           uint32
+	Gid           uint32
+	SymlinkTarget string
 }
 
 type DB struct {
@@ -71,6 +98,11 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("db schema: %w", err)
 	}
 
+	// Run migrations (ignore errors for already-applied changes)
+	for _, m := range migrations {
+		sqldb.Exec(m)
+	}
+
 	d := &DB{db: sqldb}
 	if err := d.seedRoot(); err != nil {
 		sqldb.Close()
@@ -95,7 +127,7 @@ func (d *DB) seedRoot() error {
 	now := time.Now().UnixNano()
 	mode := uint32(syscall.S_IFDIR | 0o755)
 	_, err = d.db.Exec(
-		"INSERT INTO inodes (id, parent_id, name, mode, size, status, mtime_ns, ctime_ns) VALUES (1, 0, '', ?, 0, 'committed', ?, ?)",
+		"INSERT INTO inodes (id, parent_id, name, mode, size, status, mtime_ns, ctime_ns, uid, gid) VALUES (1, 0, '', ?, 0, 'committed', ?, ?, 0, 0)",
 		mode, now, now,
 	)
 	if err != nil {
@@ -104,106 +136,110 @@ func (d *DB) seedRoot() error {
 	return nil
 }
 
-func (d *DB) GetInode(id int64) (*InodeMeta, error) {
+// scanInode scans a single row into InodeMeta.
+func scanInode(scanner interface{ Scan(...any) error }) (*InodeMeta, error) {
 	m := &InodeMeta{}
 	var s3key sql.NullString
-	err := d.db.QueryRow(
-		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE id = ?", id,
-	).Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs)
+	var symlinkTarget sql.NullString
+	err := scanner.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size,
+		&s3key, &m.Status, &m.MtimeNs, &m.CtimeNs, &m.Uid, &m.Gid, &symlinkTarget)
 	if err != nil {
 		return nil, err
 	}
 	m.S3Key = s3key.String
+	m.SymlinkTarget = symlinkTarget.String
 	return m, nil
 }
 
-func (d *DB) LookupChild(parentID int64, name string) (*InodeMeta, error) {
-	m := &InodeMeta{}
-	var s3key sql.NullString
-	err := d.db.QueryRow(
-		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE parent_id = ? AND name = ?",
-		parentID, name,
-	).Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs)
-	if err != nil {
-		return nil, err
+// scanInodeRows scans multiple rows into a slice of InodeMeta.
+func scanInodeRows(rows *sql.Rows) ([]InodeMeta, error) {
+	defer rows.Close()
+	var result []InodeMeta
+	for rows.Next() {
+		m, err := scanInode(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *m)
 	}
-	m.S3Key = s3key.String
-	return m, nil
+	return result, rows.Err()
+}
+
+func (d *DB) GetInode(id int64) (*InodeMeta, error) {
+	return scanInode(d.db.QueryRow("SELECT "+inodeCols+" FROM inodes WHERE id = ?", id))
+}
+
+func (d *DB) LookupChild(parentID int64, name string) (*InodeMeta, error) {
+	return scanInode(d.db.QueryRow(
+		"SELECT "+inodeCols+" FROM inodes WHERE parent_id = ? AND name = ?",
+		parentID, name,
+	))
 }
 
 func (d *DB) ListChildren(parentID int64) ([]InodeMeta, error) {
 	rows, err := d.db.Query(
-		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE parent_id = ? AND status = 'committed'",
+		"SELECT "+inodeCols+" FROM inodes WHERE parent_id = ? AND status = 'committed'",
 		parentID,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var result []InodeMeta
-	for rows.Next() {
-		var m InodeMeta
-		var s3key sql.NullString
-		if err := rows.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs); err != nil {
-			return nil, err
-		}
-		m.S3Key = s3key.String
-		result = append(result, m)
-	}
-	return result, rows.Err()
+	return scanInodeRows(rows)
 }
 
 func (d *DB) ListAllChildren(parentID int64) ([]InodeMeta, error) {
 	rows, err := d.db.Query(
-		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE parent_id = ?",
+		"SELECT "+inodeCols+" FROM inodes WHERE parent_id = ?",
 		parentID,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var result []InodeMeta
-	for rows.Next() {
-		var m InodeMeta
-		var s3key sql.NullString
-		if err := rows.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs); err != nil {
-			return nil, err
-		}
-		m.S3Key = s3key.String
-		result = append(result, m)
-	}
-	return result, rows.Err()
+	return scanInodeRows(rows)
 }
 
 func (d *DB) GetOrphanedInodes() ([]InodeMeta, error) {
 	rows, err := d.db.Query(
-		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)",
+		"SELECT "+inodeCols+" FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)",
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var result []InodeMeta
-	for rows.Next() {
-		var m InodeMeta
-		var s3key sql.NullString
-		if err := rows.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs); err != nil {
-			return nil, err
-		}
-		m.S3Key = s3key.String
-		result = append(result, m)
-	}
-	return result, rows.Err()
+	return scanInodeRows(rows)
 }
 
 func (d *DB) InsertInode(parentID int64, name string, mode uint32, status string) (int64, error) {
 	now := time.Now().UnixNano()
 	res, err := d.db.Exec(
-		"INSERT INTO inodes (parent_id, name, mode, size, status, mtime_ns, ctime_ns) VALUES (?, ?, ?, 0, ?, ?, ?)",
+		"INSERT INTO inodes (parent_id, name, mode, size, status, mtime_ns, ctime_ns, uid, gid) VALUES (?, ?, ?, 0, ?, ?, ?, 0, 0)",
 		parentID, name, mode, status, now, now,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// InsertInodeWithOwner creates a new inode with specific uid/gid.
+func (d *DB) InsertInodeWithOwner(parentID int64, name string, mode uint32, status string, uid, gid uint32) (int64, error) {
+	now := time.Now().UnixNano()
+	res, err := d.db.Exec(
+		"INSERT INTO inodes (parent_id, name, mode, size, status, mtime_ns, ctime_ns, uid, gid) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
+		parentID, name, mode, status, now, now, uid, gid,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// InsertSymlink creates a symlink inode.
+func (d *DB) InsertSymlink(parentID int64, name string, target string, uid, gid uint32) (int64, error) {
+	now := time.Now().UnixNano()
+	mode := uint32(syscall.S_IFLNK | 0o777)
+	res, err := d.db.Exec(
+		"INSERT INTO inodes (parent_id, name, mode, size, status, mtime_ns, ctime_ns, uid, gid, symlink_target) VALUES (?, ?, ?, ?, 'committed', ?, ?, ?, ?, ?)",
+		parentID, name, mode, len(target), now, now, uid, gid, target,
 	)
 	if err != nil {
 		return 0, err
@@ -225,6 +261,8 @@ func (d *DB) CommitInode(id int64, s3Key string, size int64) (bool, error) {
 }
 
 func (d *DB) DeleteInode(id int64) error {
+	// Delete xattrs first
+	d.db.Exec("DELETE FROM xattrs WHERE inode_id = ?", id)
 	_, err := d.db.Exec("DELETE FROM inodes WHERE id = ?", id)
 	return err
 }
@@ -240,24 +278,12 @@ func (d *DB) RenameInode(id int64, newParentID int64, newName string) error {
 
 func (d *DB) GetPending() ([]InodeMeta, error) {
 	rows, err := d.db.Query(
-		"SELECT id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns FROM inodes WHERE status = 'pending'",
+		"SELECT "+inodeCols+" FROM inodes WHERE status = 'pending'",
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var result []InodeMeta
-	for rows.Next() {
-		var m InodeMeta
-		var s3key sql.NullString
-		if err := rows.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size, &s3key, &m.Status, &m.MtimeNs, &m.CtimeNs); err != nil {
-			return nil, err
-		}
-		m.S3Key = s3key.String
-		result = append(result, m)
-	}
-	return result, rows.Err()
+	return scanInodeRows(rows)
 }
 
 func (d *DB) InodePath(id int64) (string, error) {
@@ -358,4 +384,116 @@ func (d *DB) SetAttr(id int64, size *int64, mode *uint32, mtimeNs *int64) error 
 		}
 	}
 	return nil
+}
+
+// FixDefaultOwnership updates all inodes with uid=0 AND gid=0 to the given values.
+func (d *DB) FixDefaultOwnership(uid, gid uint32) (int64, error) {
+	res, err := d.db.Exec("UPDATE inodes SET uid = ?, gid = ? WHERE uid = 0 AND gid = 0", uid, gid)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// SetOwner updates uid and/or gid for an inode.
+func (d *DB) SetOwner(id int64, uid *uint32, gid *uint32) error {
+	now := time.Now().UnixNano()
+	if uid != nil {
+		if _, err := d.db.Exec("UPDATE inodes SET uid = ?, ctime_ns = ? WHERE id = ?", *uid, now, id); err != nil {
+			return err
+		}
+	}
+	if gid != nil {
+		if _, err := d.db.Exec("UPDATE inodes SET gid = ?, ctime_ns = ? WHERE id = ?", *gid, now, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Extended attributes ---
+
+func (d *DB) GetXattr(inodeID int64, name string) ([]byte, error) {
+	var val []byte
+	err := d.db.QueryRow("SELECT value FROM xattrs WHERE inode_id = ? AND name = ?", inodeID, name).Scan(&val)
+	if err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
+func (d *DB) SetXattr(inodeID int64, name string, value []byte) error {
+	_, err := d.db.Exec(
+		"INSERT OR REPLACE INTO xattrs (inode_id, name, value) VALUES (?, ?, ?)",
+		inodeID, name, value,
+	)
+	return err
+}
+
+func (d *DB) RemoveXattr(inodeID int64, name string) error {
+	res, err := d.db.Exec("DELETE FROM xattrs WHERE inode_id = ? AND name = ?", inodeID, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (d *DB) ListXattrs(inodeID int64) ([]string, error) {
+	rows, err := d.db.Query("SELECT name FROM xattrs WHERE inode_id = ?", inodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// --- Filesystem stats ---
+
+type FSStats struct {
+	FileCount int64
+	DirCount  int64
+	TotalSize int64
+}
+
+func (d *DB) GetFSStats() (*FSStats, error) {
+	s := &FSStats{}
+	err := d.db.QueryRow(
+		"SELECT COALESCE(SUM(CASE WHEN mode & ? = 0 THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN mode & ? != 0 THEN 1 ELSE 0 END), 0), COALESCE(SUM(size), 0) FROM inodes WHERE status = 'committed'",
+		uint32(syscall.S_IFDIR), uint32(syscall.S_IFDIR),
+	).Scan(&s.FileCount, &s.DirCount, &s.TotalSize)
+	return s, err
+}
+
+// --- Fsck ---
+
+// FsckResult holds the results of a consistency check.
+type FsckResult struct {
+	OrphanedInodes int
+	PendingInodes  int
+	MissingS3Keys  int // inodes with status=committed but empty s3_key (non-dir, non-symlink)
+	TotalInodes    int
+}
+
+func (d *DB) Fsck() (*FsckResult, error) {
+	r := &FsckResult{}
+	d.db.QueryRow("SELECT COUNT(*) FROM inodes").Scan(&r.TotalInodes)
+	d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)").Scan(&r.OrphanedInodes)
+	d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE status = 'pending'").Scan(&r.PendingInodes)
+	d.db.QueryRow(
+		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND mode & ? = 0 AND mode & ? = 0 AND id > 1",
+		uint32(syscall.S_IFDIR), uint32(syscall.S_IFLNK),
+	).Scan(&r.MissingS3Keys)
+	return r, nil
 }

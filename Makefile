@@ -1,7 +1,10 @@
 include .env
 export
 
-LDFLAGS = -X github.com/milan/hamstor/internal/creds.AWSAccessKeyID=$(AWS_ACCESS_KEY_ID) \
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+LDFLAGS = -X main.version=$(VERSION) \
+          -X github.com/milan/hamstor/internal/creds.AWSAccessKeyID=$(AWS_ACCESS_KEY_ID) \
           -X github.com/milan/hamstor/internal/creds.AWSSecretAccessKey=$(AWS_SECRET_ACCESS_KEY) \
           -X github.com/milan/hamstor/internal/creds.AWSRegion=$(AWS_REGION) \
           -X github.com/milan/hamstor/internal/creds.Passphrase=$(HAMSTOR_PASSPHRASE)
@@ -24,7 +27,7 @@ Wants=network-online.target\n\
 Type=simple\n\
 ExecStartPre=-/bin/umount -l $(HAMSTOR_MOUNT)\n\
 ExecStartPre=/bin/mkdir -p $(HAMSTOR_MOUNT)\n\
-ExecStart=/usr/local/bin/hamstor --mount $(HAMSTOR_MOUNT) --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) --db /var/lib/hamstor/hamstor.db\n\
+ExecStart=/usr/local/bin/hamstor --mount $(HAMSTOR_MOUNT) --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) --db /var/lib/hamstor/hamstor.db --uid $(shell id -u) --gid $(shell id -g)\n\
 ExecStop=/bin/umount $(HAMSTOR_MOUNT)\n\
 Restart=on-failure\n\
 RestartSec=5\n\

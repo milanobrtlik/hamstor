@@ -9,7 +9,11 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/crypto"
+	"github.com/milan/hamstor/internal/db"
+	"github.com/milan/hamstor/internal/media"
+	"github.com/milan/hamstor/internal/ratelimit"
 	"github.com/milan/hamstor/internal/thumb"
 )
 
@@ -20,17 +24,23 @@ type HamstorNode struct {
 }
 
 var (
-	_ fs.NodeGetattrer = (*HamstorNode)(nil)
-	_ fs.NodeSetattrer = (*HamstorNode)(nil)
-	_ fs.NodeLookuper  = (*HamstorNode)(nil)
-	_ fs.NodeReaddirer = (*HamstorNode)(nil)
-	_ fs.NodeMkdirer   = (*HamstorNode)(nil)
-	_ fs.NodeCreater   = (*HamstorNode)(nil)
-	_ fs.NodeOpener    = (*HamstorNode)(nil)
-	_ fs.NodeUnlinker  = (*HamstorNode)(nil)
-	_ fs.NodeRmdirer   = (*HamstorNode)(nil)
-	_ fs.NodeRenamer   = (*HamstorNode)(nil)
-	_ fs.NodeStatfser  = (*HamstorNode)(nil)
+	_ fs.NodeGetattrer   = (*HamstorNode)(nil)
+	_ fs.NodeSetattrer   = (*HamstorNode)(nil)
+	_ fs.NodeLookuper    = (*HamstorNode)(nil)
+	_ fs.NodeReaddirer   = (*HamstorNode)(nil)
+	_ fs.NodeMkdirer     = (*HamstorNode)(nil)
+	_ fs.NodeCreater     = (*HamstorNode)(nil)
+	_ fs.NodeOpener      = (*HamstorNode)(nil)
+	_ fs.NodeUnlinker    = (*HamstorNode)(nil)
+	_ fs.NodeRmdirer     = (*HamstorNode)(nil)
+	_ fs.NodeRenamer     = (*HamstorNode)(nil)
+	_ fs.NodeStatfser    = (*HamstorNode)(nil)
+	_ fs.NodeSymlinker   = (*HamstorNode)(nil)
+	_ fs.NodeReadlinker  = (*HamstorNode)(nil)
+	_ fs.NodeGetxattrer  = (*HamstorNode)(nil)
+	_ fs.NodeSetxattrer  = (*HamstorNode)(nil)
+	_ fs.NodeRemovexattrer = (*HamstorNode)(nil)
+	_ fs.NodeListxattrer = (*HamstorNode)(nil)
 )
 
 func toErrno(err error) syscall.Errno {
@@ -44,17 +54,12 @@ func toErrno(err error) syscall.Errno {
 	return syscall.EIO
 }
 
-func (n *HamstorNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	meta, err := n.hfs.DB.GetInode(n.inodeID)
-	if err != nil {
-		return toErrno(err)
-	}
-	caller, _ := fuse.FromContext(ctx)
+func fillAttr(meta *db.InodeMeta, out *fuse.Attr) {
 	out.Ino = uint64(meta.ID)
 	out.Mode = meta.Mode
-	out.Uid = caller.Uid
-	out.Gid = caller.Gid
 	out.Size = uint64(meta.Size)
+	out.Uid = meta.Uid
+	out.Gid = meta.Gid
 	out.Mtime = uint64(meta.MtimeNs / 1e9)
 	out.Mtimensec = uint32(meta.MtimeNs % 1e9)
 	out.Ctime = uint64(meta.CtimeNs / 1e9)
@@ -66,6 +71,14 @@ func (n *HamstorNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.At
 	} else {
 		out.Nlink = 1
 	}
+}
+
+func (n *HamstorNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	meta, err := n.hfs.DB.GetInode(n.inodeID)
+	if err != nil {
+		return toErrno(err)
+	}
+	fillAttr(meta, &out.Attr)
 	return 0
 }
 
@@ -77,6 +90,20 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 	if sz, ok := in.GetSize(); ok {
 		s := int64(sz)
 		sizePtr = &s
+
+		// Truncate the buffer of the active file handle if one is provided
+		if fh, ok := f.(*HamstorHandle); ok {
+			fh.mu.Lock()
+			if fh.loaded && fh.cacheFile == nil {
+				if s < int64(len(fh.buf)) {
+					fh.buf = fh.buf[:s]
+				} else if s > int64(len(fh.buf)) {
+					fh.buf = append(fh.buf, make([]byte, s-int64(len(fh.buf)))...)
+				}
+				fh.dirty = true
+			}
+			fh.mu.Unlock()
+		}
 	}
 	if m, ok := in.GetMode(); ok {
 		meta, err := n.hfs.DB.GetInode(n.inodeID)
@@ -94,6 +121,19 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 	if err := n.hfs.DB.SetAttr(n.inodeID, sizePtr, modePtr, mtimePtr); err != nil {
 		return toErrno(err)
 	}
+
+	// Handle chown
+	if uid, ok := in.GetUID(); ok {
+		if err := n.hfs.DB.SetOwner(n.inodeID, &uid, nil); err != nil {
+			return toErrno(err)
+		}
+	}
+	if gid, ok := in.GetGID(); ok {
+		if err := n.hfs.DB.SetOwner(n.inodeID, nil, &gid); err != nil {
+			return toErrno(err)
+		}
+	}
+
 	return n.Getattr(ctx, f, out)
 }
 
@@ -107,21 +147,7 @@ func (n *HamstorNode) Lookup(ctx context.Context, name string, out *fuse.EntryOu
 	stable := fs.StableAttr{Mode: meta.Mode, Ino: uint64(meta.ID)}
 	inode := n.NewInode(ctx, child, stable)
 
-	out.Ino = uint64(meta.ID)
-	out.Mode = meta.Mode
-	out.Size = uint64(meta.Size)
-	out.Mtime = uint64(meta.MtimeNs / 1e9)
-	out.Mtimensec = uint32(meta.MtimeNs % 1e9)
-	out.Ctime = uint64(meta.CtimeNs / 1e9)
-	out.Ctimensec = uint32(meta.CtimeNs % 1e9)
-	out.Atime = out.Mtime
-	out.Atimensec = out.Mtimensec
-	if meta.Mode&syscall.S_IFDIR != 0 {
-		out.Nlink = 2
-	} else {
-		out.Nlink = 1
-	}
-
+	fillAttr(meta, &out.Attr)
 	return inode, 0
 }
 
@@ -143,8 +169,9 @@ func (n *HamstorNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno)
 }
 
 func (n *HamstorNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	caller, _ := fuse.FromContext(ctx)
 	dirMode := mode | syscall.S_IFDIR
-	newID, err := n.hfs.DB.InsertInode(n.inodeID, name, dirMode, "committed")
+	newID, err := n.hfs.DB.InsertInodeWithOwner(n.inodeID, name, dirMode, "committed", caller.Uid, caller.Gid)
 	if err != nil {
 		return nil, toErrno(err)
 	}
@@ -155,13 +182,16 @@ func (n *HamstorNode) Mkdir(ctx context.Context, name string, mode uint32, out *
 
 	out.Ino = uint64(newID)
 	out.Mode = dirMode
+	out.Uid = caller.Uid
+	out.Gid = caller.Gid
 	out.Nlink = 2
 	return inode, 0
 }
 
 func (n *HamstorNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (inode *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	caller, _ := fuse.FromContext(ctx)
 	fileMode := mode | syscall.S_IFREG
-	newID, err := n.hfs.DB.InsertInode(n.inodeID, name, fileMode, "pending")
+	newID, err := n.hfs.DB.InsertInodeWithOwner(n.inodeID, name, fileMode, "pending", caller.Uid, caller.Gid)
 	if err != nil {
 		return nil, nil, 0, toErrno(err)
 	}
@@ -178,6 +208,8 @@ func (n *HamstorNode) Create(ctx context.Context, name string, flags uint32, mod
 
 	out.Ino = uint64(newID)
 	out.Mode = fileMode
+	out.Uid = caller.Uid
+	out.Gid = caller.Gid
 	out.Nlink = 1
 	return node, handle, fuse.FOPEN_DIRECT_IO, 0
 }
@@ -189,11 +221,13 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 	}
 
 	handle := &HamstorHandle{
-		hfs:     n.hfs,
-		inodeID: n.inodeID,
+		hfs:      n.hfs,
+		inodeID:  n.inodeID,
+		s3Key:    meta.S3Key,
+		fileSize: meta.Size,
 	}
 
-	// If opening for write and file has existing content, preload it
+	// Enable streaming mode for multimedia files opened read-only
 	writeFlags := uint32(syscall.O_WRONLY | syscall.O_RDWR | syscall.O_APPEND | syscall.O_TRUNC)
 	if flags&writeFlags != 0 && meta.S3Key != "" {
 		if flags&uint32(syscall.O_TRUNC) != 0 {
@@ -201,19 +235,49 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			handle.loaded = true
 			handle.dirty = true
 		} else {
-			data, err := n.hfs.Store.Download(ctx, meta.S3Key)
-			if err != nil {
-				return nil, 0, toErrno(err)
+			// Try cache first for write preload
+			var data []byte
+			if n.hfs.Cache != nil {
+				if f, cacheErr := n.hfs.Cache.Open(meta.S3Key); cacheErr == nil {
+					info, _ := f.Stat()
+					data = make([]byte, info.Size())
+					f.ReadAt(data, 0)
+					f.Close()
+				}
 			}
-			if n.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
-				data, err = n.hfs.Encryptor.Decrypt(data)
-				if err != nil {
-					log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, err)
-					return nil, 0, syscall.EIO
+			if data == nil {
+				var dlErr error
+				data, dlErr = n.hfs.Store.Download(ctx, meta.S3Key)
+				if dlErr != nil {
+					return nil, 0, toErrno(dlErr)
+				}
+				if n.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+					data, dlErr = n.hfs.Encryptor.Decrypt(data)
+					if dlErr != nil {
+						log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, dlErr)
+						return nil, 0, syscall.EIO
+					}
+				}
+				if n.hfs.Cache != nil {
+					if putErr := n.hfs.Cache.Put(meta.S3Key, data); putErr != nil {
+						log.Printf("hamstor: cache put on open: %v", putErr)
+					}
 				}
 			}
 			handle.buf = data
 			handle.loaded = true
+		}
+	}
+
+	// Enable streaming mode for multimedia files opened read-only
+	if flags&writeFlags == 0 && media.IsMediaExt(meta.Name) && n.hfs.StreamRate > 0 {
+		rateBps := float64(n.hfs.StreamRate) * (1 << 20) // MB/s to bytes/s
+		burstBytes := float64(n.hfs.StreamBuffer) * (1 << 20)
+		handle.streaming = true
+		handle.rateLimiter = ratelimit.New(rateBps, burstBytes)
+		handle.streamChunksCap = n.hfs.StreamBuffer * (1 << 20) / cache.ChunkSize
+		if handle.streamChunksCap < 4 {
+			handle.streamChunksCap = 4
 		}
 	}
 
@@ -233,6 +297,9 @@ func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 
 	if meta.S3Key != "" {
+		if n.hfs.Cache != nil {
+			n.hfs.Cache.Evict(meta.S3Key)
+		}
 		if err := n.hfs.Store.Delete(ctx, meta.S3Key); err != nil {
 			log.Printf("hamstor: unlink s3 delete %s: %v", meta.S3Key, err)
 		}
@@ -256,8 +323,6 @@ func (n *HamstorNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return 0
 }
 
-// deleteTree recursively deletes a directory and all its descendants,
-// including S3 objects and thumbnails.
 func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 	children, err := hfs.DB.ListAllChildren(dirID)
 	if err != nil {
@@ -271,6 +336,9 @@ func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 			}
 		} else {
 			if child.S3Key != "" {
+				if hfs.Cache != nil {
+					hfs.Cache.Evict(child.S3Key)
+				}
 				if err := hfs.Store.Delete(ctx, child.S3Key); err != nil {
 					log.Printf("hamstor: rmdir delete s3 %s: %v", child.S3Key, err)
 				}
@@ -290,9 +358,33 @@ func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 }
 
 func (n *HamstorNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	stats, err := n.hfs.DB.GetFSStats()
+	if err != nil {
+		// Fallback to basic values
+		out.Bsize = 4096
+		out.NameLen = 255
+		out.Frsize = 4096
+		return 0
+	}
+
 	out.Bsize = 4096
-	out.NameLen = 255
 	out.Frsize = 4096
+	out.NameLen = 255
+
+	// Report files tracked in DB
+	totalInodes := uint64(stats.FileCount + stats.DirCount)
+	out.Files = totalInodes
+	out.Ffree = ^uint64(0) - totalInodes // effectively unlimited
+
+	// Report blocks based on total size
+	totalBlocks := uint64(stats.TotalSize) / 4096
+	if uint64(stats.TotalSize)%4096 != 0 {
+		totalBlocks++
+	}
+	out.Blocks = totalBlocks + 1<<20 // report some headroom
+	out.Bfree = 1 << 20              // report ~4 GB free (S3 is elastic)
+	out.Bavail = out.Bfree
+
 	return 0
 }
 
@@ -304,14 +396,13 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 
 	newParentNode := newParent.EmbeddedInode().Operations().(*HamstorNode)
 
-	// Remove old thumbnails (URI will change)
 	if thumb.IsImageExt(meta.Name) {
 		if oldRelPath, err := n.hfs.DB.InodePath(meta.ID); err == nil {
 			go thumb.RemoveThumbnails(n.hfs.Mountpoint, oldRelPath)
 		}
 	}
 
-	// Check if target exists — if so, remove it
+	// Check if target exists -- if so, remove it
 	existing, err := n.hfs.DB.LookupChild(newParentNode.inodeID, newName)
 	if err == nil {
 		if thumb.IsImageExt(existing.Name) {
@@ -320,6 +411,9 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 			}
 		}
 		if existing.S3Key != "" {
+			if n.hfs.Cache != nil {
+				n.hfs.Cache.Evict(existing.S3Key)
+			}
 			if delErr := n.hfs.Store.Delete(ctx, existing.S3Key); delErr != nil {
 				log.Printf("hamstor: rename delete old s3 %s: %v", existing.S3Key, delErr)
 			}
@@ -335,4 +429,100 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 		return toErrno(err)
 	}
 	return 0
+}
+
+// --- Symlinks ---
+
+func (n *HamstorNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	caller, _ := fuse.FromContext(ctx)
+	newID, err := n.hfs.DB.InsertSymlink(n.inodeID, name, target, caller.Uid, caller.Gid)
+	if err != nil {
+		return nil, toErrno(err)
+	}
+
+	meta, err := n.hfs.DB.GetInode(newID)
+	if err != nil {
+		return nil, toErrno(err)
+	}
+
+	child := &HamstorNode{hfs: n.hfs, inodeID: newID}
+	stable := fs.StableAttr{Mode: meta.Mode, Ino: uint64(newID)}
+	inode := n.NewInode(ctx, child, stable)
+
+	fillAttr(meta, &out.Attr)
+	return inode, 0
+}
+
+func (n *HamstorNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	meta, err := n.hfs.DB.GetInode(n.inodeID)
+	if err != nil {
+		return nil, toErrno(err)
+	}
+	if meta.SymlinkTarget == "" {
+		return nil, syscall.EINVAL
+	}
+	return []byte(meta.SymlinkTarget), 0
+}
+
+// --- Extended Attributes ---
+
+func (n *HamstorNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	val, err := n.hfs.DB.GetXattr(n.inodeID, attr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, syscall.ENODATA
+		}
+		return 0, toErrno(err)
+	}
+	if len(dest) == 0 {
+		return uint32(len(val)), 0
+	}
+	if len(val) > len(dest) {
+		return 0, syscall.ERANGE
+	}
+	copy(dest, val)
+	return uint32(len(val)), 0
+}
+
+func (n *HamstorNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	if err := n.hfs.DB.SetXattr(n.inodeID, attr, data); err != nil {
+		return toErrno(err)
+	}
+	return 0
+}
+
+func (n *HamstorNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	if err := n.hfs.DB.RemoveXattr(n.inodeID, attr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return syscall.ENODATA
+		}
+		return toErrno(err)
+	}
+	return 0
+}
+
+func (n *HamstorNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	names, err := n.hfs.DB.ListXattrs(n.inodeID)
+	if err != nil {
+		return 0, toErrno(err)
+	}
+	// Format: null-terminated names concatenated
+	var totalLen uint32
+	for _, name := range names {
+		totalLen += uint32(len(name)) + 1
+	}
+	if len(dest) == 0 {
+		return totalLen, 0
+	}
+	if totalLen > uint32(len(dest)) {
+		return 0, syscall.ERANGE
+	}
+	offset := 0
+	for _, name := range names {
+		copy(dest[offset:], name)
+		offset += len(name)
+		dest[offset] = 0
+		offset++
+	}
+	return totalLen, 0
 }
