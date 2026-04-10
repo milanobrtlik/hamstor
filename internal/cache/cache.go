@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // DiskCache stores file data on local disk keyed by S3 key.
@@ -28,8 +29,16 @@ func New(dir string, maxBytes int64) (*DiskCache, error) {
 }
 
 // path returns the on-disk path for a cache entry.
+// Validates the key does not escape the cache directory.
 func (c *DiskCache) path(s3Key string) string {
-	return filepath.Join(c.dir, s3Key)
+	p := filepath.Join(c.dir, s3Key)
+	if !strings.HasPrefix(p, c.dir+string(filepath.Separator)) && p != c.dir {
+		// Prevent path traversal (e.g., key containing "../")
+		safe := strings.ReplaceAll(s3Key, "..", "_")
+		safe = strings.ReplaceAll(safe, string(filepath.Separator), "_")
+		return filepath.Join(c.dir, safe)
+	}
+	return p
 }
 
 // Has reports whether the given S3 key is cached.
@@ -47,7 +56,11 @@ func (c *DiskCache) Has(s3Key string) bool {
 func (c *DiskCache) Open(s3Key string) (*os.File, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return os.Open(c.path(s3Key))
+	p := c.path(s3Key)
+	// Touch mtime so LRU eviction reflects actual access time, not write time.
+	now := time.Now()
+	os.Chtimes(p, now, now)
+	return os.Open(p)
 }
 
 // Put stores data in the cache. Writes to a temp file and renames atomically.

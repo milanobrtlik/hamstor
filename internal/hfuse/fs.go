@@ -2,6 +2,7 @@ package hfuse
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -24,6 +25,16 @@ type HamstorFS struct {
 	// Streaming mode config for multimedia files
 	StreamRate   int // MB/s rate limit (0 = disabled)
 	StreamBuffer int // MB memory buffer for recent chunks
+
+	// SpillDir is the directory for spill temp files (large writes).
+	// If empty, os.TempDir() is used.
+	SpillDir string
+
+	// InflightUploads tracks async upload goroutines for graceful shutdown.
+	InflightUploads sync.WaitGroup
+
+	// ThumbSem limits concurrent thumbnail operations.
+	ThumbSem chan struct{}
 
 	// TestCrashBeforeCommit, when non-nil, is called after S3 upload
 	// but before SQLite commit. Tests use this to simulate a crash

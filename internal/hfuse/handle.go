@@ -47,8 +47,9 @@ type HamstorHandle struct {
 	released bool
 
 	// Chunk prefetch coordination
-	prefetching sync.Map     // int64 -> bool: chunks currently being fetched
-	prefetchSem chan struct{} // limits concurrent prefetch goroutines
+	prefetching   sync.Map     // int64 -> bool: chunks currently being fetched
+	prefetchSem   chan struct{} // limits concurrent prefetch goroutines
+	cancelPrefetch context.CancelFunc // cancels background prefetch goroutines
 
 	// Streaming mode (multimedia files)
 	streaming       bool
@@ -252,10 +253,18 @@ func (h *HamstorHandle) prefetchChunks(startIndex int64, count int) {
 	hfs := h.hfs
 	fileSize := h.fileSize
 
-	// Lazy init semaphore (max 2 concurrent prefetches)
+	// Lazy init semaphore and cancel context (max 2 concurrent prefetches)
 	if h.prefetchSem == nil {
 		h.prefetchSem = make(chan struct{}, 2)
 	}
+	var prefetchCtx context.Context
+	if h.cancelPrefetch == nil {
+		prefetchCtx, h.cancelPrefetch = context.WithCancel(context.Background())
+	} else {
+		// Recreate context from existing cancel (it may be cancelled already)
+		prefetchCtx, h.cancelPrefetch = context.WithCancel(context.Background())
+	}
+	ctx := prefetchCtx
 
 	for i := 0; i < count; i++ {
 		ci := startIndex + int64(i)
@@ -285,7 +294,7 @@ func (h *HamstorHandle) prefetchChunks(startIndex int64, count int) {
 			if chunkStart+chunkLen > fileSize {
 				chunkLen = fileSize - chunkStart
 			}
-			data, err := hfs.Store.DownloadRange(context.Background(), s3Key, chunkStart, chunkLen)
+			data, err := hfs.Store.DownloadRange(ctx, s3Key, chunkStart, chunkLen)
 			if err != nil {
 				return
 			}
@@ -367,6 +376,10 @@ func (h *HamstorHandle) readStreaming(ctx context.Context, dest []byte, off int6
 					return nil, syscall.EINTR
 				}
 				h.mu.Lock()
+				// Revalidate after re-acquiring lock
+				if h.released {
+					return nil, syscall.EIO
+				}
 			}
 
 			// Check memory cache again (another Read might have fetched it while we waited)
@@ -449,7 +462,7 @@ func (h *HamstorHandle) spillToDisk() error {
 	if h.spillFile != nil {
 		return nil
 	}
-	f, err := os.CreateTemp("", "hamstor-spill-*")
+	f, err := os.CreateTemp(h.hfs.SpillDir, "hamstor-spill-*")
 	if err != nil {
 		return err
 	}
@@ -529,10 +542,14 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 			return 0, syscall.EIO
 		}
 		if end > h.spillSize {
-			h.spillFile.Truncate(end)
+			if err := h.spillFile.Truncate(end); err != nil {
+				return 0, syscall.EIO
+			}
 			h.spillSize = end
 		}
-		h.spillFile.WriteAt(data, off)
+		if _, err := h.spillFile.WriteAt(data, off); err != nil {
+			return 0, syscall.EIO
+		}
 		h.dirty = true
 		return uint32(len(data)), 0
 	}
@@ -600,8 +617,10 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	inodeID := h.inodeID
 
 	h.uploadDone = make(chan struct{})
+	hfs.InflightUploads.Add(1)
 
 	go func() {
+		defer hfs.InflightUploads.Done()
 		defer close(h.uploadDone)
 		defer func() {
 			if r := recover(); r != nil {
@@ -665,7 +684,11 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			if relPath, pathErr := hfs.DB.InodePath(inodeID); pathErr == nil {
 				updated, err2 := hfs.DB.GetInode(inodeID)
 				if err2 == nil {
-					go thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, plainBuf)
+					go func() {
+						hfs.ThumbSem <- struct{}{}
+						defer func() { <-hfs.ThumbSem }()
+						thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, plainBuf)
+					}()
 				}
 			}
 		}
@@ -707,6 +730,9 @@ func (h *HamstorHandle) Release(ctx context.Context) syscall.Errno {
 	}
 
 	h.mu.Lock()
+	if h.cancelPrefetch != nil {
+		h.cancelPrefetch()
+	}
 	h.buf = nil
 	if h.cacheFile != nil {
 		h.cacheFile.Close()

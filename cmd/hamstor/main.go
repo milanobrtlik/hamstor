@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -66,6 +68,9 @@ func main() {
 		return
 	}
 
+	if *cacheSizeGB < 0 {
+		log.Fatalf("--cache-size must be >= 0")
+	}
 	if *bucket == "" {
 		flag.Usage()
 		os.Exit(1)
@@ -86,7 +91,8 @@ func main() {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// Litestream: restore DB from S3 if local file missing, then start replication
 	var rep *replicate.Replicator
@@ -171,11 +177,25 @@ func main() {
 		}
 	}
 
+	// Set up spill directory and clean leftover temp files from crashes
+	spillDir := filepath.Join(filepath.Dir(*dbPath), "spill")
+	if err := os.MkdirAll(spillDir, 0o755); err != nil {
+		log.Printf("hamstor: spill dir: %v (using system temp)", err)
+		spillDir = ""
+	} else {
+		entries, _ := os.ReadDir(spillDir)
+		for _, e := range entries {
+			os.Remove(filepath.Join(spillDir, e.Name()))
+		}
+	}
+
 	hfs := &hfuse.HamstorFS{
 		DB: database, Store: store, Mountpoint: *mountpoint,
 		Encryptor: enc, Cache: diskCache,
 		DefaultUid: defaultUid, DefaultGid: defaultGid,
 		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
+		ThumbSem: make(chan struct{}, 4),
+		SpillDir: spillDir,
 	}
 	server, err := hfuse.Mount(*mountpoint, hfs)
 	if err != nil {
@@ -184,16 +204,16 @@ func main() {
 
 	log.Printf("hamstor %s: mounted on %s", version, *mountpoint)
 
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
-		<-ch
+		<-ctx.Done()
 		log.Println("hamstor: unmounting...")
 		server.Unmount()
 	}()
 
 	server.Wait()
+
+	log.Println("hamstor: waiting for in-flight uploads...")
+	hfs.InflightUploads.Wait()
 
 	database.Close()
 	if rep != nil {
@@ -218,7 +238,7 @@ func setupEncryption(database *db.DB, passphrase string) *crypto.Encryptor {
 	}
 
 	salt, err := database.GetConfig("encryption_salt")
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		salt, err = crypto.GenerateSalt()
 		if err != nil {
 			log.Fatalf("generate encryption salt: %v", err)
@@ -227,6 +247,8 @@ func setupEncryption(database *db.DB, passphrase string) *crypto.Encryptor {
 			log.Fatalf("store encryption salt: %v", err)
 		}
 		log.Println("hamstor: encryption enabled (new salt generated)")
+	} else if err != nil {
+		log.Fatalf("read encryption salt: %v", err)
 	} else {
 		log.Println("hamstor: encryption enabled")
 	}

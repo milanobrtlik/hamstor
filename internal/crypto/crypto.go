@@ -30,6 +30,10 @@ type Encryptor struct {
 func New(passphrase string, salt []byte) (*Encryptor, error) {
 	key := argon2.IDKey([]byte(passphrase), salt, ArgonTime, ArgonMemory, ArgonThreads, KeyLen)
 	block, err := aes.NewCipher(key)
+	// Zero the key material regardless of error
+	for i := range key {
+		key[i] = 0
+	}
 	if err != nil {
 		return nil, fmt.Errorf("crypto: new cipher: %w", err)
 	}
@@ -79,7 +83,8 @@ func (e *Encryptor) Decrypt(data []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// IsEncrypted checks if data begins with a known version byte.
+// IsEncrypted checks if data looks like our encryption format:
+// version byte + nonce + at least the GCM tag overhead.
 func IsEncrypted(data []byte) bool {
-	return len(data) > 0 && data[0] == Version1
+	return len(data) >= 1+NonceLen+16 && data[0] == Version1
 }
