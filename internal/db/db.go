@@ -83,7 +83,7 @@ func Open(path string) (*DB, error) {
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=5000",
+		"PRAGMA busy_timeout=10000",
 		"PRAGMA synchronous=NORMAL",
 	}
 	for _, p := range pragmas {
@@ -318,10 +318,21 @@ func (d *DB) InsertSymlink(parentID int64, name string, target string, uid, gid 
 
 func (d *DB) CommitInode(id int64, s3Key string, size int64) (bool, error) {
 	now := time.Now().UnixNano()
-	res, err := d.db.Exec(
-		"UPDATE inodes SET s3_key = ?, size = ?, status = 'committed', mtime_ns = ? WHERE id = ?",
-		s3Key, size, now, id,
-	)
+	var res sql.Result
+	var err error
+	for attempt := range 5 {
+		res, err = d.db.Exec(
+			"UPDATE inodes SET s3_key = ?, size = ?, status = 'committed', mtime_ns = ? WHERE id = ?",
+			s3Key, size, now, id,
+		)
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "SQLITE_BUSY") && !strings.Contains(err.Error(), "database is locked") {
+			return false, err
+		}
+		time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond)
+	}
 	if err != nil {
 		return false, err
 	}
