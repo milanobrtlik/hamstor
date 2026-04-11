@@ -40,7 +40,7 @@ func setupTest(t *testing.T) (*HamstorFS, string) {
 		t.Fatalf("create store: %v", err)
 	}
 
-	hfs := &HamstorFS{DB: database, Store: store}
+	hfs := &HamstorFS{DB: database, Store: store, UploadSem: make(chan struct{}, 8)}
 	t.Cleanup(func() { database.Close() })
 	return hfs, dbPath
 }

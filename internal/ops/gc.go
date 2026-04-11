@@ -43,6 +43,7 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 
 	cutoff := time.Now().Add(-gcGracePeriod)
 	result := &GCResult{}
+	var orphanKeys []string
 	for _, obj := range s3Objects {
 		excluded := false
 		for _, prefix := range excludePrefixes {
@@ -67,12 +68,15 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 			log.Printf("gc: orphan (dry-run): %s", obj.Key)
 			continue
 		}
+		orphanKeys = append(orphanKeys, obj.Key)
+	}
 
-		if err := store.Delete(ctx, obj.Key); err != nil {
-			log.Printf("gc: delete %s: %v", obj.Key, err)
-			result.Errors++
-		} else {
-			result.OrphansDeleted++
+	if len(orphanKeys) > 0 {
+		deleted, err := store.DeleteBatch(ctx, orphanKeys)
+		result.OrphansDeleted += deleted
+		if err != nil {
+			log.Printf("gc: batch delete: %v", err)
+			result.Errors += len(orphanKeys) - deleted
 		}
 	}
 
@@ -81,6 +85,9 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 	if err != nil {
 		return nil, fmt.Errorf("gc: find orphaned inodes: %w", err)
 	}
+
+	// Batch-delete S3 keys for DB orphans
+	var dbOrphanS3Keys []string
 	for _, meta := range orphanedInodes {
 		result.DBOrphans++
 		if dryRun {
@@ -88,17 +95,25 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 			continue
 		}
 		if meta.S3Key != "" {
-			if err := store.Delete(ctx, meta.S3Key); err != nil {
-				log.Printf("gc: delete orphan s3 %s: %v", meta.S3Key, err)
-				result.Errors++
-				continue
-			}
+			dbOrphanS3Keys = append(dbOrphanS3Keys, meta.S3Key)
 		}
-		if err := database.DeleteInode(meta.ID); err != nil {
-			log.Printf("gc: delete orphan inode %d: %v", meta.ID, err)
-			result.Errors++
-		} else {
-			result.OrphansDeleted++
+	}
+	if len(dbOrphanS3Keys) > 0 {
+		if _, err := store.DeleteBatch(ctx, dbOrphanS3Keys); err != nil {
+			log.Printf("gc: batch delete db orphan s3 keys: %v", err)
+			result.Errors += len(dbOrphanS3Keys)
+		}
+	}
+
+	// Delete DB inode rows
+	if !dryRun {
+		for _, meta := range orphanedInodes {
+			if err := database.DeleteInode(meta.ID); err != nil {
+				log.Printf("gc: delete orphan inode %d: %v", meta.ID, err)
+				result.Errors++
+			} else {
+				result.OrphansDeleted++
+			}
 		}
 	}
 

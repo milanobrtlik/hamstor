@@ -234,6 +234,51 @@ func (s *Store) Copy(ctx context.Context, srcKey, dstKey string) error {
 	})
 }
 
+// DeleteBatch deletes up to len(keys) objects using S3 multi-object delete.
+// Returns the number of successfully deleted objects.
+func (s *Store) DeleteBatch(ctx context.Context, keys []string) (int, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	const batchSize = 1000
+	deleted := 0
+	for i := 0; i < len(keys); i += batchSize {
+		end := i + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[i:end]
+		objects := make([]types.ObjectIdentifier, len(batch))
+		for j, key := range batch {
+			objects[j] = types.ObjectIdentifier{Key: aws.String(key)}
+		}
+		var batchDeleted int
+		err := retry(ctx, fmt.Sprintf("delete-batch (%d objects)", len(batch)), func() error {
+			out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(s.bucket),
+				Delete: &types.Delete{
+					Objects: objects,
+					Quiet:   aws.Bool(true),
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("s3store: delete batch: %w", err)
+			}
+			if len(out.Errors) > 0 {
+				return fmt.Errorf("s3store: delete batch: %d errors, first: %s: %s",
+					len(out.Errors), aws.ToString(out.Errors[0].Key), aws.ToString(out.Errors[0].Message))
+			}
+			batchDeleted = len(batch)
+			return nil
+		})
+		if err != nil {
+			return deleted, err
+		}
+		deleted += batchDeleted
+	}
+	return deleted, nil
+}
+
 func (s *Store) Delete(ctx context.Context, key string) error {
 	return retry(ctx, "delete "+key, func() error {
 		_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{

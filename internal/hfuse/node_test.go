@@ -23,6 +23,7 @@ func setupDBOnly(t *testing.T) *HamstorFS {
 		DB:         database,
 		DefaultUid: 1000,
 		DefaultGid: 1000,
+		UploadSem:  make(chan struct{}, 8),
 		ThumbSem:   make(chan struct{}, 4),
 	}
 	t.Cleanup(func() { database.Close() })

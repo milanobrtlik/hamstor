@@ -577,8 +577,15 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		return 0
 	}
 
+	// Acquire upload slot before copying data to bound memory usage.
+	// Blocks if max concurrent uploads are already in progress.
+	h.mu.Unlock()
+	h.hfs.UploadSem <- struct{}{}
+	h.mu.Lock()
+
 	meta, err := h.hfs.DB.GetInode(h.inodeID)
 	if err != nil {
+		<-h.hfs.UploadSem
 		return toErrno(err)
 	}
 	oldKey := meta.S3Key
@@ -593,6 +600,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		bufSize = h.spillSize
 		plainBuf = make([]byte, bufSize)
 		if _, err := h.spillFile.ReadAt(plainBuf, 0); err != nil && err != io.EOF {
+			<-h.hfs.UploadSem
 			return syscall.EIO
 		}
 	} else {
@@ -606,6 +614,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		encrypted, encErr := h.hfs.Encryptor.Encrypt(plainBuf)
 		if encErr != nil {
 			log.Printf("hamstor: encrypt failed for inode %d: %v", h.inodeID, encErr)
+			<-h.hfs.UploadSem
 			return syscall.EIO
 		}
 		uploadData = encrypted
@@ -622,6 +631,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	go func() {
 		defer hfs.InflightUploads.Done()
 		defer close(h.uploadDone)
+		defer func() { <-hfs.UploadSem }()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("hamstor: async upload panic: %v", r)
@@ -694,6 +704,8 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		}
 	}()
 
+	h.buf = nil
+	h.loaded = false
 	h.dirty = false
 	h.isNew = false
 	return 0
