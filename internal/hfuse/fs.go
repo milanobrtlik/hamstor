@@ -6,6 +6,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
@@ -16,6 +17,13 @@ type HamstorFS struct {
 	Store      *s3store.Store
 	Mountpoint string
 	Encryptor  *crypto.Encryptor // nil means no encryption
+	Cache      *cache.DiskCache  // nil means no caching
+	DefaultUid uint32
+	DefaultGid uint32
+
+	// Streaming mode config for multimedia files
+	StreamRate   int // MB/s rate limit (0 = disabled)
+	StreamBuffer int // MB memory buffer for recent chunks
 
 	// TestCrashBeforeCommit, when non-nil, is called after S3 upload
 	// but before SQLite commit. Tests use this to simulate a crash
