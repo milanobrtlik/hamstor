@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/creds"
@@ -146,6 +147,10 @@ func main() {
 		log.Printf("gc: %d s3 orphans, %d db orphans, %d deleted, %d errors", result.OrphansFound, result.DBOrphans, result.OrphansDeleted, result.Errors)
 		database.Close()
 		return
+	case "purge-s3":
+		database.Close()
+		runPurgeS3(ctx, store, *dbPath)
+		return
 	}
 
 	// Default: mount mode
@@ -217,7 +222,9 @@ func main() {
 
 	database.Close()
 	if rep != nil {
-		if err := rep.Stop(ctx); err != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stopCancel()
+		if err := rep.Stop(stopCtx); err != nil {
 			log.Printf("litestream stop: %v", err)
 		}
 	}
@@ -318,6 +325,33 @@ func runCacheCmd(cacheDir string, cacheSizeGB int, args []string) {
 		fmt.Println("cache cleared")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown cache subcommand: %s (use: stats, clear)\n", subcmd)
+		os.Exit(1)
+	}
+}
+
+func runPurgeS3(ctx context.Context, store *s3store.Store, dbPath string) {
+	keys, err := store.List(ctx, "")
+	if err != nil {
+		log.Fatalf("purge-s3: list S3 objects: %v", err)
+	}
+	log.Printf("purge-s3: deleting %d S3 objects...", len(keys))
+	deleted, errs := 0, 0
+	for _, key := range keys {
+		if err := store.Delete(ctx, key); err != nil {
+			log.Printf("purge-s3: delete %s: %v", key, err)
+			errs++
+		} else {
+			deleted++
+		}
+	}
+
+	// Remove local DB and WAL/SHM files
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		os.Remove(dbPath + suffix)
+	}
+
+	log.Printf("purge-s3: done (%d objects deleted, %d errors)", deleted, errs)
+	if errs > 0 {
 		os.Exit(1)
 	}
 }
