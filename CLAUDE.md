@@ -63,6 +63,15 @@ internal/creds/            Build-time embedded credentials via ldflags
 - **UID/GID:** Stored in DB, set to caller's identity on creation, modifiable via chown.
 - **Symlinks:** Stored as inodes with `symlink_target` column, mode `S_IFLNK`.
 - **Extended attributes:** Stored in `xattrs` table (inode_id, name, value).
-- **FUSE error mapping:** `sql.ErrNoRows` → `ENOENT`, other errors → `EIO`.
-- **SQLite uses modernc.org/sqlite** (pure Go, no CGO). WAL mode, busy timeout 5s.
+- **FUSE error mapping:** `sql.ErrNoRows` → `ENOENT`, SQLite UNIQUE constraint → `EEXIST`, other errors → `EIO`.
+- **SQLite uses modernc.org/sqlite** (pure Go, no CGO). WAL mode, busy timeout 5s. Foreign key on `xattrs.inode_id` with CASCADE delete.
 - **Litestream** runs embedded (not as a separate process), replicating to `litestream/` prefix in the same S3 bucket.
+- **Graceful shutdown:** On SIGINT/SIGTERM, waits for all in-flight async uploads before closing the database.
+- **GC safety:** Garbage collection skips S3 objects younger than 10 minutes to avoid race with in-flight async uploads.
+- **Download limit:** S3 downloads are capped at 2 GB to prevent OOM from corrupted or malicious objects.
+
+## Known Limitations
+
+- **Async Flush:** `Flush` (triggered by `close()`) launches the S3 upload asynchronously and returns success immediately. This means `close()` does **not** guarantee data durability. To ensure data is persisted to S3, call `fsync()` before `close()`. Standard tools like `cp` do not call `fsync`, so a failed upload after `cp` will only be logged, not reported to the user. `Fsync` waits for the upload and propagates errors.
+- **No hard links:** S3 has no concept of hard links. `link()` returns `ENOTSUP`. Use symlinks instead.
+- **Single-writer:** Concurrent writes to the same file from different handles use last-writer-wins semantics. There is no conflict detection.

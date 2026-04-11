@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	maxRetries    = 3
-	retryBaseWait = 500 * time.Millisecond
+	maxRetries      = 3
+	retryBaseWait   = 500 * time.Millisecond
+	MaxDownloadSize = 2 << 30 // 2 GB — safety limit for in-memory downloads
 )
 
 type Store struct {
@@ -106,7 +107,9 @@ func (s *Store) Upload(ctx context.Context, key string, data []byte) error {
 // multipart uploads automatically for large files.
 func (s *Store) UploadReader(ctx context.Context, key string, r io.ReadSeeker, size int64) error {
 	return retry(ctx, "upload "+key, func() error {
-		r.Seek(0, io.SeekStart)
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("s3store: seek before upload %s: %w", key, err)
+		}
 		uploader := manager.NewUploader(s.client)
 		_, err := uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket:        aws.String(s.bucket),
@@ -132,9 +135,13 @@ func (s *Store) Download(ctx context.Context, key string) ([]byte, error) {
 			return fmt.Errorf("s3store: download %s: %w", key, err)
 		}
 		defer out.Body.Close()
-		data, err := io.ReadAll(out.Body)
+		limited := io.LimitReader(out.Body, MaxDownloadSize+1)
+		data, err := io.ReadAll(limited)
 		if err != nil {
 			return fmt.Errorf("s3store: read body %s: %w", key, err)
+		}
+		if int64(len(data)) > MaxDownloadSize {
+			return fmt.Errorf("s3store: download %s: object exceeds %d byte limit", key, MaxDownloadSize)
 		}
 		result = data
 		return nil
@@ -182,6 +189,35 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 		}
 	}
 	return keys, nil
+}
+
+// S3Object holds key and metadata from a listing.
+type S3Object struct {
+	Key          string
+	LastModified time.Time
+}
+
+// ListObjects returns keys with timestamps. Used by GC for grace period filtering.
+func (s *Store) ListObjects(ctx context.Context, prefix string) ([]S3Object, error) {
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+	var objects []S3Object
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3store: list prefix %q: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			var lastMod time.Time
+			if obj.LastModified != nil {
+				lastMod = *obj.LastModified
+			}
+			objects = append(objects, S3Object{Key: *obj.Key, LastModified: lastMod})
+		}
+	}
+	return objects, nil
 }
 
 func (s *Store) Copy(ctx context.Context, srcKey, dstKey string) error {

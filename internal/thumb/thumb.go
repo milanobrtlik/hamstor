@@ -31,7 +31,14 @@ func IsImageExt(name string) bool {
 	return imageExts[ext]
 }
 
+// maxImageBytes is the limit for image decoding to prevent decompression bombs.
+const maxImageBytes = 100 << 20 // 100 MB
+
 func Generate(mountpoint, relPath string, mtimeSec int64, imgData []byte) {
+	if len(imgData) > maxImageBytes {
+		log.Printf("thumb: %s too large (%d bytes), skipping", relPath, len(imgData))
+		return
+	}
 	img, _, err := image.Decode(bytes.NewReader(imgData))
 	if err != nil {
 		log.Printf("thumb: decode %s: %v", relPath, err)

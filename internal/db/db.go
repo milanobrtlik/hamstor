@@ -98,17 +98,86 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("db schema: %w", err)
 	}
 
-	// Run migrations (ignore errors for already-applied changes)
+	// Run migrations (ignore "duplicate column" and "already exists" errors)
 	for _, m := range migrations {
-		sqldb.Exec(m)
+		if _, err := sqldb.Exec(m); err != nil {
+			errStr := err.Error()
+			if !strings.Contains(errStr, "duplicate column") && !strings.Contains(errStr, "already exists") {
+				sqldb.Close()
+				return nil, fmt.Errorf("db migration %q: %w", m[:min(len(m), 50)], err)
+			}
+		}
 	}
 
 	d := &DB{db: sqldb}
+
+	// Versioned migrations (tracked in config table to run only once)
+	if err := d.runVersionedMigrations(); err != nil {
+		sqldb.Close()
+		return nil, err
+	}
+
 	if err := d.seedRoot(); err != nil {
 		sqldb.Close()
 		return nil, err
 	}
 	return d, nil
+}
+
+func (d *DB) runVersionedMigrations() error {
+	type versionedMigration struct {
+		key string
+		fn  func() error
+	}
+
+	migrations := []versionedMigration{
+		{
+			key: "xattrs_fk_v1",
+			fn: func() error {
+				tx, err := d.db.Begin()
+				if err != nil {
+					return err
+				}
+				defer tx.Rollback()
+				stmts := []string{
+					`CREATE TABLE xattrs_new (
+						inode_id INTEGER NOT NULL REFERENCES inodes(id) ON DELETE CASCADE,
+						name     TEXT NOT NULL,
+						value    BLOB NOT NULL,
+						PRIMARY KEY (inode_id, name)
+					)`,
+					"INSERT OR IGNORE INTO xattrs_new SELECT * FROM xattrs",
+					"DROP TABLE xattrs",
+					"ALTER TABLE xattrs_new RENAME TO xattrs",
+				}
+				for _, s := range stmts {
+					if _, err := tx.Exec(s); err != nil {
+						return fmt.Errorf("migration xattrs_fk: %w", err)
+					}
+				}
+				return tx.Commit()
+			},
+		},
+	}
+
+	for _, m := range migrations {
+		// Check if already applied
+		var applied int
+		err := d.db.QueryRow("SELECT COUNT(*) FROM config WHERE key = ?", "migration_"+m.key).Scan(&applied)
+		if err != nil {
+			return fmt.Errorf("check migration %s: %w", m.key, err)
+		}
+		if applied > 0 {
+			continue
+		}
+		if err := m.fn(); err != nil {
+			return fmt.Errorf("run migration %s: %w", m.key, err)
+		}
+		if _, err := d.db.Exec("INSERT INTO config (key, value) VALUES (?, ?)", "migration_"+m.key, "done"); err != nil {
+			return fmt.Errorf("record migration %s: %w", m.key, err)
+		}
+	}
+	return nil
 }
 
 func (d *DB) Close() error {
@@ -261,10 +330,18 @@ func (d *DB) CommitInode(id int64, s3Key string, size int64) (bool, error) {
 }
 
 func (d *DB) DeleteInode(id int64) error {
-	// Delete xattrs first
-	d.db.Exec("DELETE FROM xattrs WHERE inode_id = ?", id)
-	_, err := d.db.Exec("DELETE FROM inodes WHERE id = ?", id)
-	return err
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM xattrs WHERE inode_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM inodes WHERE id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) RenameInode(id int64, newParentID int64, newName string) error {
@@ -287,9 +364,13 @@ func (d *DB) GetPending() ([]InodeMeta, error) {
 }
 
 func (d *DB) InodePath(id int64) (string, error) {
+	const maxDepth = 1000
 	var parts []string
 	current := id
 	for current > 1 {
+		if len(parts) >= maxDepth {
+			return "", fmt.Errorf("inode path: depth limit exceeded (cycle?)")
+		}
 		m, err := d.GetInode(current)
 		if err != nil {
 			return "", err
@@ -367,23 +448,28 @@ func (d *DB) SetConfig(key string, value []byte) error {
 }
 
 func (d *DB) SetAttr(id int64, size *int64, mode *uint32, mtimeNs *int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	now := time.Now().UnixNano()
 	if size != nil {
-		if _, err := d.db.Exec("UPDATE inodes SET size = ?, mtime_ns = ? WHERE id = ?", *size, now, id); err != nil {
+		if _, err := tx.Exec("UPDATE inodes SET size = ?, mtime_ns = ? WHERE id = ?", *size, now, id); err != nil {
 			return err
 		}
 	}
 	if mode != nil {
-		if _, err := d.db.Exec("UPDATE inodes SET mode = ?, ctime_ns = ? WHERE id = ?", *mode, now, id); err != nil {
+		if _, err := tx.Exec("UPDATE inodes SET mode = ?, ctime_ns = ? WHERE id = ?", *mode, now, id); err != nil {
 			return err
 		}
 	}
 	if mtimeNs != nil {
-		if _, err := d.db.Exec("UPDATE inodes SET mtime_ns = ? WHERE id = ?", *mtimeNs, id); err != nil {
+		if _, err := tx.Exec("UPDATE inodes SET mtime_ns = ? WHERE id = ?", *mtimeNs, id); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // FixDefaultOwnership updates all inodes with uid=0 AND gid=0 to the given values.
@@ -397,18 +483,23 @@ func (d *DB) FixDefaultOwnership(uid, gid uint32) (int64, error) {
 
 // SetOwner updates uid and/or gid for an inode.
 func (d *DB) SetOwner(id int64, uid *uint32, gid *uint32) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	now := time.Now().UnixNano()
 	if uid != nil {
-		if _, err := d.db.Exec("UPDATE inodes SET uid = ?, ctime_ns = ? WHERE id = ?", *uid, now, id); err != nil {
+		if _, err := tx.Exec("UPDATE inodes SET uid = ?, ctime_ns = ? WHERE id = ?", *uid, now, id); err != nil {
 			return err
 		}
 	}
 	if gid != nil {
-		if _, err := d.db.Exec("UPDATE inodes SET gid = ?, ctime_ns = ? WHERE id = ?", *gid, now, id); err != nil {
+		if _, err := tx.Exec("UPDATE inodes SET gid = ?, ctime_ns = ? WHERE id = ?", *gid, now, id); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // --- Extended attributes ---
@@ -488,12 +579,20 @@ type FsckResult struct {
 
 func (d *DB) Fsck() (*FsckResult, error) {
 	r := &FsckResult{}
-	d.db.QueryRow("SELECT COUNT(*) FROM inodes").Scan(&r.TotalInodes)
-	d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)").Scan(&r.OrphanedInodes)
-	d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE status = 'pending'").Scan(&r.PendingInodes)
-	d.db.QueryRow(
-		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND mode & ? = 0 AND mode & ? = 0 AND id > 1",
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM inodes").Scan(&r.TotalInodes); err != nil {
+		return nil, fmt.Errorf("fsck total: %w", err)
+	}
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)").Scan(&r.OrphanedInodes); err != nil {
+		return nil, fmt.Errorf("fsck orphans: %w", err)
+	}
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE status = 'pending'").Scan(&r.PendingInodes); err != nil {
+		return nil, fmt.Errorf("fsck pending: %w", err)
+	}
+	if err := d.db.QueryRow(
+		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND mode & ? = 0 AND mode & ? = 0 AND id > 1 AND size > 0",
 		uint32(syscall.S_IFDIR), uint32(syscall.S_IFLNK),
-	).Scan(&r.MissingS3Keys)
+	).Scan(&r.MissingS3Keys); err != nil {
+		return nil, fmt.Errorf("fsck missing keys: %w", err)
+	}
 	return r, nil
 }

@@ -6,6 +6,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/s3"
@@ -63,8 +64,11 @@ func (r *Replicator) Restore(ctx context.Context) error {
 	opts.OutputPath = r.config.DBPath
 
 	if err := r.replica.Restore(ctx, opts); err != nil {
-		log.Printf("litestream: restore failed (first run?): %v", err)
-		return nil
+		if strings.Contains(err.Error(), "no backups found") || strings.Contains(err.Error(), "no generations found") {
+			log.Printf("litestream: no backup available (first run)")
+			return nil
+		}
+		return fmt.Errorf("litestream restore: %w", err)
 	}
 
 	log.Println("litestream: restored DB from S3")

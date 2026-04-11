@@ -114,8 +114,15 @@ func TestIsEncrypted(t *testing.T) {
 	if IsEncrypted([]byte{0x00, 0x01}) {
 		t.Fatal("version 0x00 should not be encrypted")
 	}
-	if !IsEncrypted([]byte{Version1, 0x01}) {
-		t.Fatal("version 0x01 should be encrypted")
+	// Minimum valid encrypted data: version(1) + nonce(12) + tag(16) = 29 bytes
+	validEncrypted := make([]byte, 1+NonceLen+16)
+	validEncrypted[0] = Version1
+	if !IsEncrypted(validEncrypted) {
+		t.Fatal("valid encrypted data should be detected")
+	}
+	// Too short: version byte present but not enough data for nonce+tag
+	if IsEncrypted([]byte{Version1, 0x01}) {
+		t.Fatal("too-short data should not be detected as encrypted")
 	}
 }
 
