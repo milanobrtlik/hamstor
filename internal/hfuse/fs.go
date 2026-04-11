@@ -33,6 +33,9 @@ type HamstorFS struct {
 	// InflightUploads tracks async upload goroutines for graceful shutdown.
 	InflightUploads sync.WaitGroup
 
+	// UploadSem limits concurrent async S3 uploads.
+	UploadSem chan struct{}
+
 	// ThumbSem limits concurrent thumbnail operations.
 	ThumbSem chan struct{}
 

@@ -199,6 +199,7 @@ func main() {
 		Encryptor: enc, Cache: diskCache,
 		DefaultUid: defaultUid, DefaultGid: defaultGid,
 		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
+		UploadSem: make(chan struct{}, 32),
 		ThumbSem: make(chan struct{}, 4),
 		SpillDir: spillDir,
 	}
@@ -335,14 +336,9 @@ func runPurgeS3(ctx context.Context, store *s3store.Store, dbPath string) {
 		log.Fatalf("purge-s3: list S3 objects: %v", err)
 	}
 	log.Printf("purge-s3: deleting %d S3 objects...", len(keys))
-	deleted, errs := 0, 0
-	for _, key := range keys {
-		if err := store.Delete(ctx, key); err != nil {
-			log.Printf("purge-s3: delete %s: %v", key, err)
-			errs++
-		} else {
-			deleted++
-		}
+	deleted, err := store.DeleteBatch(ctx, keys)
+	if err != nil {
+		log.Printf("purge-s3: batch delete error: %v", err)
 	}
 
 	// Remove local DB and WAL/SHM files
@@ -350,8 +346,8 @@ func runPurgeS3(ctx context.Context, store *s3store.Store, dbPath string) {
 		os.Remove(dbPath + suffix)
 	}
 
-	log.Printf("purge-s3: done (%d objects deleted, %d errors)", deleted, errs)
-	if errs > 0 {
+	log.Printf("purge-s3: done (%d objects deleted)", deleted)
+	if err != nil {
 		os.Exit(1)
 	}
 }

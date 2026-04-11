@@ -74,23 +74,10 @@ type DB struct {
 }
 
 func Open(path string) (*DB, error) {
-	dsn := fmt.Sprintf("file:%s?_txlock=immediate", path)
+	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)", path)
 	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("db open: %w", err)
-	}
-
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA busy_timeout=10000",
-		"PRAGMA synchronous=NORMAL",
-	}
-	for _, p := range pragmas {
-		if _, err := sqldb.Exec(p); err != nil {
-			sqldb.Close()
-			return nil, fmt.Errorf("db pragma %q: %w", p, err)
-		}
 	}
 
 	if _, err := sqldb.Exec(schema); err != nil {
@@ -240,7 +227,7 @@ func (d *DB) GetInode(id int64) (*InodeMeta, error) {
 
 func (d *DB) LookupChild(parentID int64, name string) (*InodeMeta, error) {
 	return scanInode(d.db.QueryRow(
-		"SELECT "+inodeCols+" FROM inodes WHERE parent_id = ? AND name = ?",
+		"SELECT "+inodeCols+" FROM inodes WHERE parent_id = ? AND name = ? AND status = 'committed'",
 		parentID, name,
 	))
 }
