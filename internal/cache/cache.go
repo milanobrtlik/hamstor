@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,6 +19,10 @@ type DiskCache struct {
 	dir      string
 	maxBytes int64
 	mu       sync.RWMutex
+
+	// approxSize tracks approximate total cache size to avoid full directory
+	// scans on every Put. Recalibrated when evictLRU actually runs.
+	approxSize atomic.Int64
 }
 
 // New creates a DiskCache at the given directory with a size limit in bytes.
@@ -25,7 +30,29 @@ func New(dir string, maxBytes int64) (*DiskCache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &DiskCache{dir: dir, maxBytes: maxBytes}, nil
+	c := &DiskCache{dir: dir, maxBytes: maxBytes}
+	c.initApproxSize()
+	return c, nil
+}
+
+// initApproxSize scans the cache directory to initialize the approximate size counter.
+func (c *DiskCache) initApproxSize() {
+	var total int64
+	filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	c.approxSize.Store(total)
 }
 
 // path returns the on-disk path for a cache entry.
@@ -97,7 +124,10 @@ func (c *DiskCache) Put(s3Key string, data []byte) error {
 		return err
 	}
 
-	c.evictLRU()
+	c.approxSize.Add(int64(len(data)))
+	if c.approxSize.Load() > c.maxBytes {
+		c.evictLRU()
+	}
 	return nil
 }
 
@@ -124,6 +154,12 @@ func (c *DiskCache) PutReader(s3Key string, r io.Reader) error {
 		return err
 	}
 
+	// Stat the temp file to get written size before renaming
+	var written int64
+	if info, statErr := os.Stat(tmpName); statErr == nil {
+		written = info.Size()
+	}
+
 	c.mu.Lock()
 	err = os.Rename(tmpName, p)
 	c.mu.Unlock()
@@ -133,15 +169,38 @@ func (c *DiskCache) PutReader(s3Key string, r io.Reader) error {
 		return err
 	}
 
-	c.evictLRU()
+	c.approxSize.Add(written)
+	if c.approxSize.Load() > c.maxBytes {
+		c.evictLRU()
+	}
 	return nil
 }
 
 // Evict removes a specific cache entry.
 func (c *DiskCache) Evict(s3Key string) {
+	p := c.path(s3Key)
+	var size int64
+	if info, err := os.Stat(p); err == nil {
+		if info.IsDir() {
+			filepath.WalkDir(p, func(_ string, d os.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				if fi, e := d.Info(); e == nil {
+					size += fi.Size()
+				}
+				return nil
+			})
+		} else {
+			size = info.Size()
+		}
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	os.RemoveAll(c.path(s3Key))
+	os.RemoveAll(p)
+	c.mu.Unlock()
+	if size > 0 {
+		c.approxSize.Add(-size)
+	}
 }
 
 // Size returns the total size of cached data in bytes and the number of entries.
@@ -177,6 +236,7 @@ func (c *DiskCache) Clear() error {
 	for _, e := range entries {
 		os.RemoveAll(filepath.Join(c.dir, e.Name()))
 	}
+	c.approxSize.Store(0)
 	return nil
 }
 
@@ -233,7 +293,10 @@ func (c *DiskCache) PutChunk(s3Key string, index int64, data []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	c.evictLRU()
+	c.approxSize.Add(int64(len(data)))
+	if c.approxSize.Load() > c.maxBytes {
+		c.evictLRU()
+	}
 	return nil
 }
 
@@ -306,6 +369,9 @@ func (c *DiskCache) evictLRU() {
 		}
 	}
 
+	// Recalibrate approxSize from actual disk scan
+	c.approxSize.Store(totalSize)
+
 	if totalSize <= c.maxBytes {
 		return
 	}
@@ -326,4 +392,5 @@ func (c *DiskCache) evictLRU() {
 			totalSize -= e.size
 		}
 	}
+	c.approxSize.Store(totalSize)
 }

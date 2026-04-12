@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,7 +29,7 @@ import (
 var version = "dev"
 
 func main() {
-	debug.SetMemoryLimit(256 << 20)
+	debug.SetMemoryLimit(150 << 20)
 
 	mountpoint := flag.String("mount", "", "mount point (required for mount mode)")
 	dbPath := flag.String("db", "data/hamstor.db", "SQLite database path")
@@ -43,6 +45,8 @@ func main() {
 	ownerGid := flag.Int("gid", os.Getgid(), "default file owner GID")
 	streamRate := flag.Int("stream-rate", 5, "streaming rate limit in MB/s for multimedia (0 to disable)")
 	streamBuffer := flag.Int("stream-buffer", 16, "streaming memory buffer in MB")
+	entryTimeout := flag.Duration("entry-timeout", 60*time.Second, "FUSE entry/attr cache timeout")
+	pprofAddr := flag.String("pprof", "", "pprof listen address (e.g. :6060, empty to disable)")
 	flag.Parse()
 
 	subcmd := ""
@@ -202,13 +206,24 @@ func main() {
 		Encryptor: enc, Cache: diskCache,
 		DefaultUid: defaultUid, DefaultGid: defaultGid,
 		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
-		UploadSem: make(chan struct{}, 32),
-		ThumbSem: make(chan struct{}, 4),
-		SpillDir: spillDir,
+		UploadSem:    make(chan struct{}, 32),
+		ThumbSem:     make(chan struct{}, 4),
+		SpillDir:     spillDir,
+		EntryTimeout: *entryTimeout,
+		AttrTimeout:  *entryTimeout,
 	}
 	server, err := hfuse.Mount(*mountpoint, hfs)
 	if err != nil {
 		log.Fatalf("mount: %v", err)
+	}
+
+	if *pprofAddr != "" {
+		go func() {
+			log.Printf("hamstor: pprof listening on %s", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Printf("hamstor: pprof: %v", err)
+			}
+		}()
 	}
 
 	log.Printf("hamstor %s: mounted on %s", version, *mountpoint)
