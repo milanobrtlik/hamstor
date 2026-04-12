@@ -24,8 +24,9 @@ const (
 )
 
 type Store struct {
-	client *s3.Client
-	bucket string
+	client   *s3.Client
+	uploader *manager.Uploader
+	bucket   string
 }
 
 func New(ctx context.Context, bucket, endpoint, accessKey, secretKey, region string) (*Store, error) {
@@ -52,9 +53,11 @@ func New(ctx context.Context, bucket, endpoint, accessKey, secretKey, region str
 		})
 	}
 
+	client := s3.NewFromConfig(cfg, opts...)
 	return &Store{
-		client: s3.NewFromConfig(cfg, opts...),
-		bucket: bucket,
+		client:   client,
+		uploader: manager.NewUploader(client),
+		bucket:   bucket,
 	}, nil
 }
 
@@ -90,8 +93,7 @@ func retry(ctx context.Context, op string, fn func() error) error {
 
 func (s *Store) Upload(ctx context.Context, key string, data []byte) error {
 	return retry(ctx, "upload "+key, func() error {
-		uploader := manager.NewUploader(s.client)
-		_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		_, err := s.uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(s.bucket),
 			Key:    aws.String(key),
 			Body:   bytes.NewReader(data),
@@ -110,8 +112,7 @@ func (s *Store) UploadReader(ctx context.Context, key string, r io.ReadSeeker, s
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("s3store: seek before upload %s: %w", key, err)
 		}
-		uploader := manager.NewUploader(s.client)
-		_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		_, err := s.uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket:        aws.String(s.bucket),
 			Key:           aws.String(key),
 			Body:          r,

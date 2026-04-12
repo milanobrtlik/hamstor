@@ -648,6 +648,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		} else {
 			uploadErr = hfs.Store.Upload(uploadCtx, newKey, uploadData)
 		}
+		uploadData = nil // free upload data immediately after S3 transfer
 		if uploadErr != nil {
 			log.Printf("hamstor: async upload failed: %v", uploadErr)
 			h.uploadErr = uploadErr
@@ -691,17 +692,20 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		}
 
 		if thumb.IsImageExt(fileName) {
+			thumbData := plainBuf // separate reference for thumb goroutine
+			plainBuf = nil
 			if relPath, pathErr := hfs.DB.InodePath(inodeID); pathErr == nil {
 				updated, err2 := hfs.DB.GetInode(inodeID)
 				if err2 == nil {
 					go func() {
 						hfs.ThumbSem <- struct{}{}
 						defer func() { <-hfs.ThumbSem }()
-						thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, plainBuf)
+						thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, thumbData)
 					}()
 				}
 			}
 		}
+		plainBuf = nil // free after cache put and thumb handoff
 	}()
 
 	h.buf = nil
