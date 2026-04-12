@@ -66,6 +66,8 @@ func (c *DiskCache) Open(s3Key string) (*os.File, error) {
 // Put stores data in the cache. Writes to a temp file and renames atomically.
 func (c *DiskCache) Put(s3Key string, data []byte) error {
 	p := c.path(s3Key)
+	// Remove chunk directory if it exists (Put stores whole file, not chunks)
+	os.RemoveAll(p)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
@@ -139,7 +141,7 @@ func (c *DiskCache) PutReader(s3Key string, r io.Reader) error {
 func (c *DiskCache) Evict(s3Key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	os.Remove(c.path(s3Key))
+	os.RemoveAll(c.path(s3Key))
 }
 
 // Size returns the total size of cached data in bytes and the number of entries.
@@ -202,6 +204,11 @@ func (c *DiskCache) GetChunk(s3Key string, index int64) ([]byte, error) {
 // PutChunk stores a single chunk in the cache.
 func (c *DiskCache) PutChunk(s3Key string, index int64, data []byte) error {
 	p := c.chunkPath(s3Key, index)
+	// Remove whole-file cache if it exists (PutChunk stores chunks in a directory)
+	keyPath := filepath.Join(c.dir, s3Key)
+	if info, err := os.Lstat(keyPath); err == nil && !info.IsDir() {
+		os.Remove(keyPath)
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
@@ -245,31 +252,59 @@ type cacheEntry struct {
 }
 
 // evictLRU removes oldest entries until total size is under maxBytes.
-// Uses a write lock internally to avoid holding it during the walk.
+// Entries are collected at the S3 key level (prefix/uuid) so that both
+// whole-file caches and chunk directories are evicted as complete units.
 func (c *DiskCache) evictLRU() {
-	// Phase 1: scan without lock (filesystem stat is safe, and stale data is acceptable)
+	// Phase 1: scan at S3 key level (2 levels deep: prefix/uuid)
 	var entries []cacheEntry
 	var totalSize int64
 
-	filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
+	prefixes, _ := os.ReadDir(c.dir)
+	for _, prefix := range prefixes {
+		if !prefix.IsDir() {
+			continue
 		}
-		if strings.HasPrefix(d.Name(), ".") {
-			return nil
+		prefixPath := filepath.Join(c.dir, prefix.Name())
+		keys, _ := os.ReadDir(prefixPath)
+		for _, key := range keys {
+			if strings.HasPrefix(key.Name(), ".") {
+				continue
+			}
+			keyPath := filepath.Join(prefixPath, key.Name())
+			var size int64
+			var modTime int64
+			if key.IsDir() {
+				// Chunk directory: sum up chunk sizes
+				filepath.WalkDir(keyPath, func(path string, d os.DirEntry, err error) error {
+					if err != nil || d.IsDir() {
+						return nil
+					}
+					info, err := d.Info()
+					if err != nil {
+						return nil
+					}
+					size += info.Size()
+					if t := info.ModTime().UnixNano(); t > modTime {
+						modTime = t
+					}
+					return nil
+				})
+			} else {
+				info, err := key.Info()
+				if err != nil {
+					continue
+				}
+				size = info.Size()
+				modTime = info.ModTime().UnixNano()
+			}
+			entries = append(entries, cacheEntry{
+				path:    keyPath,
+				size:    size,
+				modTime: modTime,
+			})
+			totalSize += size
 		}
-		info, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		entries = append(entries, cacheEntry{
-			path:    path,
-			size:    info.Size(),
-			modTime: info.ModTime().UnixNano(),
-		})
-		totalSize += info.Size()
-		return nil
-	})
+	}
 
 	if totalSize <= c.maxBytes {
 		return
@@ -279,13 +314,13 @@ func (c *DiskCache) evictLRU() {
 		return entries[i].modTime < entries[j].modTime
 	})
 
-	// Phase 2: delete with lock, one file at a time
+	// Phase 2: delete with lock, one entry at a time
 	for _, e := range entries {
 		if totalSize <= c.maxBytes {
 			break
 		}
 		c.mu.Lock()
-		err := os.Remove(e.path)
+		err := os.RemoveAll(e.path)
 		c.mu.Unlock()
 		if err == nil {
 			totalSize -= e.size
