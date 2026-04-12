@@ -79,6 +79,7 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("db open: %w", err)
 	}
+	sqldb.SetMaxOpenConns(8)
 
 	if _, err := sqldb.Exec(schema); err != nil {
 		sqldb.Close()

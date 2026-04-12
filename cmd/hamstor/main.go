@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -26,6 +27,8 @@ import (
 var version = "dev"
 
 func main() {
+	debug.SetMemoryLimit(256 << 20)
+
 	mountpoint := flag.String("mount", "", "mount point (required for mount mode)")
 	dbPath := flag.String("db", "data/hamstor.db", "SQLite database path")
 	bucket := flag.String("bucket", "", "S3 bucket name (required)")
