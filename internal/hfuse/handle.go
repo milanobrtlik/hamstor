@@ -2,20 +2,24 @@ package hfuse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/crypto"
+	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/ratelimit"
 	"github.com/milan/hamstor/internal/s3store"
 	"github.com/milan/hamstor/internal/thumb"
+	"github.com/milan/hamstor/internal/volume"
 )
 
 const readAheadChunks = 3 // prefetch 3 chunks ahead (~6 MB)
@@ -89,6 +93,52 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	if err != nil {
 		return toErrno(err)
 	}
+	if meta.VolS3Key != "" {
+		return h.loadFromVolume(ctx, meta)
+	}
+
+	// File staged locally, not yet packed into a volume
+	if meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 && h.hfs.VolumeBuilder != nil {
+		stagePath := h.hfs.VolumeBuilder.StagePath(h.inodeID)
+		data, err := os.ReadFile(stagePath)
+		if err != nil {
+			// Builder (.packing) or Fsync (.flushing) may have claimed the file.
+			// Try reading from the claimed path — the data is identical and
+			// reading is safe (the claimer only reads, never modifies).
+			for _, suffix := range []string{".packing", ".flushing"} {
+				if d, e := os.ReadFile(stagePath + suffix); e == nil {
+					data = d
+					err = nil
+					break
+				}
+			}
+		}
+		if err != nil {
+			// Staging file may have been packed by the builder between
+			// GetInode and ReadFile. Re-read metadata and retry.
+			meta2, err2 := h.hfs.DB.GetInode(h.inodeID)
+			if err2 != nil {
+				return toErrno(err2)
+			}
+			if meta2.VolS3Key != "" {
+				return h.loadFromVolume(ctx, meta2)
+			}
+			log.Printf("hamstor: staged file read failed for inode %d: %v", h.inodeID, err)
+			return syscall.EIO
+		}
+		if h.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+			data, err = h.hfs.Encryptor.Decrypt(data)
+			if err != nil {
+				log.Printf("hamstor: staged file decrypt failed for inode %d: %v", h.inodeID, err)
+				return syscall.EIO
+			}
+		}
+		h.buf = data
+		h.loaded = true
+		h.fileSize = meta.Size
+		return 0
+	}
+
 	if meta.S3Key == "" {
 		h.buf = []byte{}
 		h.loaded = true
@@ -124,6 +174,51 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 			log.Printf("hamstor: cache put failed for %s: %v", meta.S3Key, putErr)
 		} else if !h.dirty {
 			if f, openErr := h.hfs.Cache.Open(meta.S3Key); openErr == nil {
+				h.cacheFile = f
+				h.loaded = true
+				return 0
+			}
+		}
+	}
+
+	h.buf = data
+	h.loaded = true
+	return 0
+}
+
+// loadFromVolume loads a file packed in a volume S3 object into the handle.
+func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) syscall.Errno {
+	cacheKey := fmt.Sprintf("vol/%s/%d/%d", meta.VolS3Key, meta.VolOffset, meta.VolSize)
+	h.fileSize = meta.Size
+
+	// Try cache first
+	if h.hfs.Cache != nil && !h.dirty {
+		if f, cacheErr := h.hfs.Cache.Open(cacheKey); cacheErr == nil {
+			h.cacheFile = f
+			h.loaded = true
+			return 0
+		}
+	}
+
+	data, err := h.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
+	if err != nil {
+		log.Printf("hamstor: volume read failed for inode %d (vol %s offset %d): %v",
+			h.inodeID, meta.VolS3Key, meta.VolOffset, err)
+		return toErrno(err)
+	}
+	if h.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+		data, err = h.hfs.Encryptor.Decrypt(data)
+		if err != nil {
+			log.Printf("hamstor: volume decrypt failed for inode %d: %v", h.inodeID, err)
+			return syscall.EIO
+		}
+	}
+
+	if h.hfs.Cache != nil {
+		if putErr := h.hfs.Cache.Put(cacheKey, data); putErr != nil {
+			log.Printf("hamstor: cache put failed for vol needle %s: %v", cacheKey, putErr)
+		} else if !h.dirty {
+			if f, openErr := h.hfs.Cache.Open(cacheKey); openErr == nil {
 				h.cacheFile = f
 				h.loaded = true
 				return 0
@@ -583,6 +678,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	// only a file path, not data.
 	var uploadFile *os.File
 	var bufSize int64
+	canVolumePack := h.hfs.VolumeBuilder != nil
 
 	if h.spillFile != nil {
 		// Already on disk — just take ownership
@@ -591,17 +687,21 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		h.spillFile = nil
 	} else if len(h.buf) > 0 {
 		bufSize = int64(len(h.buf))
-		sf, sfErr := os.CreateTemp(h.hfs.SpillDir, "hamstor-spill-*")
-		if sfErr != nil {
-			return syscall.EIO
+		if bufSize <= int64(volume.MaxNeedleSize) && canVolumePack {
+			// Small file going to volume staging — keep buf, skip temp spill
+		} else {
+			sf, sfErr := os.CreateTemp(h.hfs.SpillDir, "hamstor-spill-*")
+			if sfErr != nil {
+				return syscall.EIO
+			}
+			if _, sfErr = sf.Write(h.buf); sfErr != nil {
+				sf.Close()
+				os.Remove(sf.Name())
+				return syscall.EIO
+			}
+			uploadFile = sf
+			h.buf = nil // free memory immediately — data is on disk now
 		}
-		if _, sfErr = sf.Write(h.buf); sfErr != nil {
-			sf.Close()
-			os.Remove(sf.Name())
-			return syscall.EIO
-		}
-		uploadFile = sf
-		h.buf = nil // free memory immediately — data is on disk now
 	} else {
 		// Empty file
 		bufSize = 0
@@ -610,6 +710,81 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	h.loaded = false
 	h.dirty = false
 	h.isNew = false
+
+	// Small files: stage to disk, commit immediately, volume builder packs later.
+	if bufSize > 0 && bufSize <= int64(volume.MaxNeedleSize) && canVolumePack {
+		// Clean up old storage references before overwriting
+		if oldMeta, metaErr := h.hfs.DB.GetInode(h.inodeID); metaErr == nil {
+			if oldMeta.VolS3Key != "" {
+				if markErr := h.hfs.DB.MarkNeedleDead(h.inodeID, oldMeta.VolS3Key); markErr != nil {
+					log.Printf("hamstor: stage overwrite mark needle dead inode %d: %v", h.inodeID, markErr)
+				}
+			}
+			if oldMeta.S3Key != "" {
+				if delErr := h.hfs.Store.Delete(context.Background(), oldMeta.S3Key); delErr != nil {
+					log.Printf("hamstor: stage overwrite delete old key %s: %v", oldMeta.S3Key, delErr)
+				}
+				if h.hfs.Cache != nil {
+					h.hfs.Cache.Evict(oldMeta.S3Key)
+				}
+			}
+		}
+
+		var stageData []byte
+		if uploadFile != nil {
+			// Data already on disk (spill file from large Write that was truncated)
+			stageData = make([]byte, bufSize)
+			if _, err := uploadFile.ReadAt(stageData, 0); err != nil && err != io.EOF {
+				uploadFile.Close()
+				os.Remove(uploadFile.Name())
+				return syscall.EIO
+			}
+			uploadFile.Close()
+			os.Remove(uploadFile.Name())
+		} else if h.buf != nil {
+			// Data still in memory — use directly, skip temp file round-trip
+			stageData = h.buf
+			h.buf = nil
+		}
+		if stageData == nil {
+			return syscall.EIO
+		}
+
+		// Encrypt before staging (per-needle encryption)
+		if h.hfs.Encryptor != nil && len(stageData) > 0 {
+			encrypted, encErr := h.hfs.Encryptor.Encrypt(stageData)
+			if encErr != nil {
+				log.Printf("hamstor: stage encrypt failed for inode %d: %v", h.inodeID, encErr)
+				return syscall.EIO
+			}
+			stageData = encrypted
+		}
+
+		// Write to staging file atomically (tmp + rename) so the builder
+		// goroutine never reads a partially-written file.
+		stagePath := h.hfs.VolumeBuilder.StagePath(h.inodeID)
+		tmpPath := stagePath + ".tmp"
+		if err := os.WriteFile(tmpPath, stageData, 0o600); err != nil {
+			os.Remove(tmpPath)
+			log.Printf("hamstor: stage write failed for inode %d: %v", h.inodeID, err)
+			return syscall.EIO
+		}
+		if err := os.Rename(tmpPath, stagePath); err != nil {
+			os.Remove(tmpPath)
+			log.Printf("hamstor: stage rename failed for inode %d: %v", h.inodeID, err)
+			return syscall.EIO
+		}
+
+		// Commit immediately — file is visible right away
+		if _, err := h.hfs.DB.CommitInode(h.inodeID, "", bufSize); err != nil {
+			os.Remove(stagePath)
+			return toErrno(err)
+		}
+
+		// Notify builder that new staged file is available
+		h.hfs.VolumeBuilder.NotifyStaged()
+		return 0
+	}
 
 	// Now wait for upload slot — this goroutine holds no file data in RAM.
 	h.mu.Unlock()
@@ -626,6 +801,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		return toErrno(err)
 	}
 	oldKey := meta.S3Key
+	oldVolS3Key := meta.VolS3Key
 	fileName := meta.Name
 
 	newKey := s3store.NewKey()
@@ -702,6 +878,13 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			hfs.TestCrashBeforeCommit()
 		}
 
+		// Clean up old volume reference before CommitInode clears vol columns
+		if oldVolS3Key != "" {
+			if markErr := hfs.DB.MarkNeedleDead(inodeID, oldVolS3Key); markErr != nil {
+				log.Printf("hamstor: async upload mark needle dead inode %d: %v", inodeID, markErr)
+			}
+		}
+
 		committed, err := hfs.DB.CommitInode(inodeID, newKey, bufSize)
 		if err != nil {
 			log.Printf("hamstor: async commit failed: %v", err)
@@ -774,6 +957,33 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 			return syscall.EIO
 		}
 	}
+
+	// Ensure S3 durability for staged files not yet packed into a volume
+	if h.hfs.VolumeBuilder != nil {
+		meta, err := h.hfs.DB.GetInode(h.inodeID)
+		if err == nil && meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 {
+			if err := h.hfs.VolumeBuilder.FlushInode(h.inodeID); err != nil {
+				// If the builder is actively packing this file, wait and retry.
+				if errors.Is(err, volume.ErrBeingPacked) {
+					backoff := 200 * time.Millisecond
+					for attempt := 0; attempt < 10; attempt++ {
+						time.Sleep(backoff)
+						m, dbErr := h.hfs.DB.GetInode(h.inodeID)
+						if dbErr == nil && (m.VolS3Key != "" || m.S3Key != "") {
+							return 0 // builder finished
+						}
+						backoff *= 2
+						if backoff > 2*time.Second {
+							backoff = 2 * time.Second
+						}
+					}
+				}
+				log.Printf("hamstor: fsync flush inode %d: %v", h.inodeID, err)
+				return syscall.EIO
+			}
+		}
+	}
+
 	return 0
 }
 

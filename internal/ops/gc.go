@@ -86,12 +86,12 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 		return nil, fmt.Errorf("gc: find orphaned inodes: %w", err)
 	}
 
-	// Batch-delete S3 keys for DB orphans
+	// Batch-delete S3 keys for DB orphans, then atomically remove inode+volume stats
 	var dbOrphanS3Keys []string
 	for _, meta := range orphanedInodes {
 		result.DBOrphans++
 		if dryRun {
-			log.Printf("gc: db orphan (dry-run): inode %d %q s3_key=%s", meta.ID, meta.Name, meta.S3Key)
+			log.Printf("gc: db orphan (dry-run): inode %d %q s3_key=%s vol_s3_key=%s", meta.ID, meta.Name, meta.S3Key, meta.VolS3Key)
 			continue
 		}
 		if meta.S3Key != "" {
@@ -105,16 +105,42 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 		}
 	}
 
-	// Delete DB inode rows
+	// Delete DB inode rows (atomically with volume stats update)
 	if !dryRun {
 		for _, meta := range orphanedInodes {
-			if err := database.DeleteInode(meta.ID); err != nil {
+			if err := database.DeleteInodeWithVolume(meta.ID, meta.VolS3Key); err != nil {
 				log.Printf("gc: delete orphan inode %d: %v", meta.ID, err)
 				result.Errors++
 			} else {
 				result.OrphansDeleted++
 			}
 		}
+	}
+
+	// Phase 3: delete empty volumes (all needles deleted, older than grace period)
+	graceNs := int64(gcGracePeriod / time.Nanosecond)
+	emptyVols, err := database.GetEmptyVolumes(graceNs)
+	if err != nil {
+		log.Printf("gc: get empty volumes: %v", err)
+	}
+	for _, vol := range emptyVols {
+		result.OrphansFound++
+		if dryRun {
+			log.Printf("gc: empty volume (dry-run): %s", vol.S3Key)
+			continue
+		}
+		if err := store.Delete(ctx, vol.S3Key); err != nil {
+			log.Printf("gc: delete empty volume %s: %v", vol.S3Key, err)
+			result.Errors++
+			continue
+		}
+		if err := database.DeleteVolume(vol.S3Key); err != nil {
+			log.Printf("gc: delete empty volume row %s: %v", vol.S3Key, err)
+			result.Errors++
+			continue
+		}
+		result.OrphansDeleted++
+		log.Printf("gc: deleted empty volume: %s", vol.S3Key)
 	}
 
 	return result, nil

@@ -24,6 +24,7 @@ import (
 	"github.com/milan/hamstor/internal/ops"
 	"github.com/milan/hamstor/internal/replicate"
 	"github.com/milan/hamstor/internal/s3store"
+	"github.com/milan/hamstor/internal/volume"
 )
 
 var version = "dev"
@@ -47,6 +48,8 @@ func main() {
 	streamBuffer := flag.Int("stream-buffer", 16, "streaming memory buffer in MB")
 	entryTimeout := flag.Duration("entry-timeout", 60*time.Second, "FUSE entry/attr cache timeout")
 	pprofAddr := flag.String("pprof", "", "pprof listen address (e.g. :6060, empty to disable)")
+	volumePacking := flag.Bool("volume-packing", true, "pack small files (<256KB) into volume S3 objects")
+	compactRatio := flag.Float64("compact-ratio", 0.5, "dead space ratio threshold for volume compaction")
 	flag.Parse()
 
 	subcmd := ""
@@ -154,6 +157,15 @@ func main() {
 		log.Printf("gc: %d s3 orphans, %d db orphans, %d deleted, %d errors", result.OrphansFound, result.DBOrphans, result.OrphansDeleted, result.Errors)
 		database.Close()
 		return
+	case "compact":
+		result, err := ops.Compact(ctx, database, store, *compactRatio, *dryRun)
+		if err != nil {
+			log.Fatalf("compact: %v", err)
+		}
+		log.Printf("compact: scanned %d volumes, compacted %d, moved %d needles, reclaimed %d bytes, %d errors",
+			result.VolumesScanned, result.VolumesCompacted, result.NeedlesMoved, result.BytesReclaimed, result.Errors)
+		database.Close()
+		return
 	case "purge-s3":
 		database.Close()
 		runPurgeS3(ctx, store, *dbPath)
@@ -161,8 +173,18 @@ func main() {
 	}
 
 	// Default: mount mode
+	// Order matters: CleanupVolumes removes incomplete volume records,
+	// Cleanup deletes pending inodes (and their staging files become orphans),
+	// CleanupStagingDir removes orphaned staging files last.
+	if err := hfuse.CleanupVolumes(database, store); err != nil {
+		log.Printf("hamstor: volume cleanup: %v", err)
+	}
 	if err := hfuse.Cleanup(database, store); err != nil {
 		log.Fatalf("cleanup: %v", err)
+	}
+	stagingDir := filepath.Join(filepath.Dir(*dbPath), "staging")
+	if err := hfuse.CleanupStagingDir(database, stagingDir); err != nil {
+		log.Printf("hamstor: staging cleanup: %v", err)
 	}
 
 	// Fix ownership of root inode and any legacy uid=0/gid=0 inodes
@@ -212,6 +234,23 @@ func main() {
 		EntryTimeout: *entryTimeout,
 		AttrTimeout:  *entryTimeout,
 	}
+	if *volumePacking {
+		if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+			log.Printf("hamstor: staging dir: %v (volume packing disabled)", err)
+		} else {
+			hfs.VolumeBuilder = volume.NewBuilder(database, store, stagingDir)
+			log.Println("hamstor: volume packing enabled (files <256KB packed into volumes)")
+		}
+	} else {
+		// Drain any staged files left from a previous run with packing enabled.
+		// Close() triggers a final scanAndSeal(true) that packs everything.
+		if entries, dirErr := os.ReadDir(stagingDir); dirErr == nil && len(entries) > 0 {
+			log.Printf("hamstor: volume packing disabled but %d staged files found, draining...", len(entries))
+			drainBuilder := volume.NewBuilder(database, store, stagingDir)
+			drainBuilder.Close()
+			log.Println("hamstor: staged files drained into volumes")
+		}
+	}
 	server, err := hfuse.Mount(*mountpoint, hfs)
 	if err != nil {
 		log.Fatalf("mount: %v", err)
@@ -238,6 +277,12 @@ func main() {
 
 	log.Println("hamstor: waiting for in-flight uploads...")
 	hfs.InflightUploads.Wait()
+
+	if hfs.VolumeBuilder != nil {
+		if err := hfs.VolumeBuilder.Close(); err != nil {
+			log.Printf("hamstor: volume builder close: %v", err)
+		}
+	}
 
 	database.Close()
 	if rep != nil {
@@ -303,16 +348,26 @@ func runFsck(dbPath string) {
 	}
 
 	fmt.Printf("fsck results:\n")
-	fmt.Printf("  total inodes:    %d\n", result.TotalInodes)
-	fmt.Printf("  orphaned inodes: %d\n", result.OrphanedInodes)
-	fmt.Printf("  pending inodes:  %d\n", result.PendingInodes)
-	fmt.Printf("  missing S3 keys: %d\n", result.MissingS3Keys)
+	fmt.Printf("  total inodes:       %d\n", result.TotalInodes)
+	fmt.Printf("  orphaned inodes:    %d\n", result.OrphanedInodes)
+	fmt.Printf("  pending inodes:     %d\n", result.PendingInodes)
+	fmt.Printf("  staged files:       %d\n", result.StagedFiles)
+	fmt.Printf("  sealed volumes:     %d\n", result.VolumeCount)
+	fmt.Printf("  volume mismatches:  %d\n", result.VolumeMismatches)
 
-	if result.OrphanedInodes > 0 || result.PendingInodes > 0 || result.MissingS3Keys > 0 {
+	if result.OrphanedInodes > 0 || result.PendingInodes > 0 {
 		fmt.Println("  status: ISSUES FOUND (run gc to clean up)")
 		os.Exit(1)
 	}
-	fmt.Println("  status: OK")
+	if result.VolumeMismatches > 0 {
+		fmt.Println("  status: ISSUES FOUND (volume stats inconsistent)")
+		os.Exit(1)
+	}
+	if result.StagedFiles > 0 {
+		fmt.Println("  status: OK (staged files will be packed into volumes)")
+	} else {
+		fmt.Println("  status: OK")
+	}
 }
 
 func runCacheCmd(cacheDir string, cacheSizeGB int, args []string) {

@@ -13,6 +13,7 @@ import (
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
+	"github.com/milan/hamstor/internal/volume"
 )
 
 type HamstorFS struct {
@@ -49,6 +50,10 @@ type HamstorFS struct {
 
 	// uploadCount tracks completed uploads for periodic FreeOSMemory calls.
 	uploadCount atomic.Int64
+
+	// VolumeBuilder packs small files into volume S3 objects.
+	// nil means volume packing is disabled.
+	VolumeBuilder *volume.Builder
 
 	// TestCrashBeforeCommit, when non-nil, is called after S3 upload
 	// but before SQLite commit. Tests use this to simulate a crash
