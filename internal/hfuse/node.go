@@ -254,14 +254,16 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		fileSize: meta.Size,
 	}
 
-	// Enable streaming mode for multimedia files opened read-only
+	// Preload data for files opened in write mode
 	writeFlags := uint32(syscall.O_WRONLY | syscall.O_RDWR | syscall.O_APPEND | syscall.O_TRUNC)
-	if flags&writeFlags != 0 && meta.S3Key != "" {
+	hasData := meta.S3Key != "" || meta.VolS3Key != "" ||
+		(meta.Size > 0 && n.hfs.VolumeBuilder != nil)
+	if flags&writeFlags != 0 && hasData {
 		if flags&uint32(syscall.O_TRUNC) != 0 {
 			handle.buf = []byte{}
 			handle.loaded = true
 			handle.dirty = true
-		} else {
+		} else if meta.S3Key != "" {
 			// Try cache first for write preload
 			var data []byte
 			if n.hfs.Cache != nil {
@@ -308,10 +310,33 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 				handle.buf = data
 			}
 			handle.loaded = true
+		} else if meta.VolS3Key != "" {
+			// Preload from volume (file is packed in a volume S3 object)
+			data, dlErr := n.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
+			if dlErr != nil {
+				return nil, 0, toErrno(dlErr)
+			}
+			if n.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+				data, dlErr = n.hfs.Encryptor.Decrypt(data)
+				if dlErr != nil {
+					log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, dlErr)
+					return nil, 0, syscall.EIO
+				}
+			}
+			handle.buf = data
+			handle.loaded = true
+		} else if n.hfs.VolumeBuilder != nil {
+			// Preload from staging dir (file staged but not yet packed)
+			data, dlErr := n.openPreloadStaged(ctx)
+			if dlErr != 0 {
+				return nil, 0, dlErr
+			}
+			handle.buf = data
+			handle.loaded = true
 		}
 	}
 
-	// Enable streaming mode for multimedia files opened read-only
+	// Enable streaming mode for multimedia files opened read-only (separate from write block above)
 	if flags&writeFlags == 0 && media.IsMediaExt(meta.Name) && n.hfs.StreamRate > 0 {
 		rateBps := float64(n.hfs.StreamRate) * (1 << 20) // MB/s to bytes/s
 		burstBytes := float64(n.hfs.StreamBuffer) * (1 << 20)
@@ -324,6 +349,47 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 	}
 
 	return handle, fuse.FOPEN_DIRECT_IO, 0
+}
+
+// openPreloadStaged loads data from a staging file for write preloading.
+// Falls back to volume if the builder packed the file between GetInode and read.
+func (n *HamstorNode) openPreloadStaged(ctx context.Context) ([]byte, syscall.Errno) {
+	stagePath := n.hfs.VolumeBuilder.StagePath(n.inodeID)
+	data, err := os.ReadFile(stagePath)
+	if err != nil {
+		// Builder (.packing) or Fsync (.flushing) may have claimed the file.
+		for _, suffix := range []string{".packing", ".flushing"} {
+			if d, e := os.ReadFile(stagePath + suffix); e == nil {
+				data = d
+				err = nil
+				break
+			}
+		}
+	}
+	if err != nil {
+		// Staging file may have been packed by the builder. Re-read metadata.
+		meta2, metaErr := n.hfs.DB.GetInode(n.inodeID)
+		if metaErr != nil {
+			return nil, toErrno(metaErr)
+		}
+		if meta2.VolS3Key != "" {
+			data, err = n.hfs.Store.DownloadRange(ctx, meta2.VolS3Key, meta2.VolOffset, meta2.VolSize)
+			if err != nil {
+				return nil, toErrno(err)
+			}
+		} else {
+			log.Printf("hamstor: staged file read failed for inode %d: %v", n.inodeID, err)
+			return nil, syscall.EIO
+		}
+	}
+	if n.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+		data, err = n.hfs.Encryptor.Decrypt(data)
+		if err != nil {
+			log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, err)
+			return nil, syscall.EIO
+		}
+	}
+	return data, 0
 }
 
 func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
@@ -349,9 +415,12 @@ func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		if err := n.hfs.Store.Delete(ctx, meta.S3Key); err != nil {
 			log.Printf("hamstor: unlink s3 delete %s: %v", meta.S3Key, err)
 		}
+	} else if meta.VolS3Key == "" && meta.Size > 0 && n.hfs.VolumeBuilder != nil {
+		// File staged but not yet packed — remove staging file
+		os.Remove(n.hfs.VolumeBuilder.StagePath(meta.ID))
 	}
 
-	if err := n.hfs.DB.DeleteInode(meta.ID); err != nil {
+	if err := n.hfs.DB.DeleteInodeWithVolume(meta.ID, meta.VolS3Key); err != nil {
 		return toErrno(err)
 	}
 	return 0
@@ -396,6 +465,8 @@ func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 				if err := hfs.Store.Delete(ctx, child.S3Key); err != nil {
 					log.Printf("hamstor: rmdir delete s3 %s: %v", child.S3Key, err)
 				}
+			} else if child.VolS3Key == "" && child.Size > 0 && hfs.VolumeBuilder != nil {
+				os.Remove(hfs.VolumeBuilder.StagePath(child.ID))
 			}
 			if thumb.IsImageExt(child.Name) {
 				if relPath, pathErr := hfs.DB.InodePath(child.ID); pathErr == nil {
@@ -406,7 +477,7 @@ func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 					}()
 				}
 			}
-			if err := hfs.DB.DeleteInode(child.ID); err != nil {
+			if err := hfs.DB.DeleteInodeWithVolume(child.ID, child.VolS3Key); err != nil {
 				return err
 			}
 		}
@@ -508,8 +579,10 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 			if delErr := n.hfs.Store.Delete(ctx, existing.S3Key); delErr != nil {
 				log.Printf("hamstor: rename delete old s3 %s: %v", existing.S3Key, delErr)
 			}
+		} else if existing.VolS3Key == "" && existing.Size > 0 && n.hfs.VolumeBuilder != nil {
+			os.Remove(n.hfs.VolumeBuilder.StagePath(existing.ID))
 		}
-		if delErr := n.hfs.DB.DeleteInode(existing.ID); delErr != nil {
+		if delErr := n.hfs.DB.DeleteInodeWithVolume(existing.ID, existing.VolS3Key); delErr != nil {
 			return toErrno(delErr)
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {

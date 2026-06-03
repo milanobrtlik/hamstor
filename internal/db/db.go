@@ -50,9 +50,12 @@ var migrations = []string{
 		value    BLOB NOT NULL,
 		PRIMARY KEY (inode_id, name)
 	)`,
+	"ALTER TABLE inodes ADD COLUMN vol_s3_key TEXT",
+	"ALTER TABLE inodes ADD COLUMN vol_offset INTEGER",
+	"ALTER TABLE inodes ADD COLUMN vol_size INTEGER",
 }
 
-const inodeCols = "id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns, uid, gid, symlink_target"
+const inodeCols = "id, parent_id, name, mode, size, s3_key, status, mtime_ns, ctime_ns, uid, gid, symlink_target, vol_s3_key, vol_offset, vol_size"
 
 type InodeMeta struct {
 	ID            int64
@@ -67,6 +70,20 @@ type InodeMeta struct {
 	Uid           uint32
 	Gid           uint32
 	SymlinkTarget string
+	VolS3Key      string
+	VolOffset     int64
+	VolSize       int64
+}
+
+// VolumeRecord holds metadata for a volume S3 object.
+type VolumeRecord struct {
+	S3Key       string
+	TotalSize   int64
+	LiveSize    int64
+	NeedleCount int
+	LiveCount   int
+	Status      string
+	CreatedNs   int64
 }
 
 type DB struct {
@@ -120,6 +137,21 @@ func (d *DB) runVersionedMigrations() error {
 
 	migrations := []versionedMigration{
 		{
+			key: "volumes_table_v1",
+			fn: func() error {
+				_, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS volumes (
+					s3_key       TEXT PRIMARY KEY,
+					total_size   INTEGER NOT NULL,
+					live_size    INTEGER NOT NULL,
+					needle_count INTEGER NOT NULL,
+					live_count   INTEGER NOT NULL,
+					status       TEXT NOT NULL DEFAULT 'open',
+					created_ns   INTEGER NOT NULL
+				)`)
+				return err
+			},
+		},
+		{
 			key: "xattrs_fk_v1",
 			fn: func() error {
 				tx, err := d.db.Begin()
@@ -144,6 +176,13 @@ func (d *DB) runVersionedMigrations() error {
 					}
 				}
 				return tx.Commit()
+			},
+		},
+		{
+			key: "idx_vol_s3_key_v1",
+			fn: func() error {
+				_, err := d.db.Exec("CREATE INDEX IF NOT EXISTS idx_inodes_vol_s3_key ON inodes(vol_s3_key)")
+				return err
 			},
 		},
 	}
@@ -198,13 +237,20 @@ func scanInode(scanner interface{ Scan(...any) error }) (*InodeMeta, error) {
 	m := &InodeMeta{}
 	var s3key sql.NullString
 	var symlinkTarget sql.NullString
+	var volS3Key sql.NullString
+	var volOffset sql.NullInt64
+	var volSize sql.NullInt64
 	err := scanner.Scan(&m.ID, &m.ParentID, &m.Name, &m.Mode, &m.Size,
-		&s3key, &m.Status, &m.MtimeNs, &m.CtimeNs, &m.Uid, &m.Gid, &symlinkTarget)
+		&s3key, &m.Status, &m.MtimeNs, &m.CtimeNs, &m.Uid, &m.Gid, &symlinkTarget,
+		&volS3Key, &volOffset, &volSize)
 	if err != nil {
 		return nil, err
 	}
 	m.S3Key = s3key.String
 	m.SymlinkTarget = symlinkTarget.String
+	m.VolS3Key = volS3Key.String
+	m.VolOffset = volOffset.Int64
+	m.VolSize = volSize.Int64
 	return m, nil
 }
 
@@ -310,7 +356,7 @@ func (d *DB) CommitInode(id int64, s3Key string, size int64) (bool, error) {
 	var err error
 	for attempt := range 5 {
 		res, err = d.db.Exec(
-			"UPDATE inodes SET s3_key = ?, size = ?, status = 'committed', mtime_ns = ? WHERE id = ?",
+			"UPDATE inodes SET s3_key = ?, size = ?, status = 'committed', mtime_ns = ?, vol_s3_key = NULL, vol_offset = NULL, vol_size = NULL WHERE id = ?",
 			s3Key, size, now, id,
 		)
 		if err == nil {
@@ -421,7 +467,239 @@ func (d *DB) AllS3KeySet() (map[string]struct{}, error) {
 		}
 		set[key] = struct{}{}
 	}
-	return set, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Include volume S3 keys
+	vrows, err := d.db.Query("SELECT s3_key FROM volumes")
+	if err != nil {
+		return nil, err
+	}
+	defer vrows.Close()
+	for vrows.Next() {
+		var key string
+		if err := vrows.Scan(&key); err != nil {
+			return nil, err
+		}
+		set[key] = struct{}{}
+	}
+	return set, vrows.Err()
+}
+
+// --- Volume packing ---
+
+// InsertVolume creates a new volume record.
+func (d *DB) InsertVolume(s3Key string, totalSize int64, liveSize int64, needleCount int, liveCount int, status string) error {
+	now := time.Now().UnixNano()
+	_, err := d.db.Exec(
+		"INSERT INTO volumes (s3_key, total_size, live_size, needle_count, live_count, status, created_ns) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		s3Key, totalSize, liveSize, needleCount, liveCount, status, now,
+	)
+	return err
+}
+
+// SetVolumeStatus updates the status of a volume.
+func (d *DB) SetVolumeStatus(s3Key string, status string) error {
+	_, err := d.db.Exec("UPDATE volumes SET status = ? WHERE s3_key = ?", status, s3Key)
+	return err
+}
+
+
+// GetOpenVolumes returns all volumes with status 'open'.
+func (d *DB) GetOpenVolumes() ([]VolumeRecord, error) {
+	return d.queryVolumes("SELECT s3_key, total_size, live_size, needle_count, live_count, status, created_ns FROM volumes WHERE status = 'open'")
+}
+
+// GetCompactingVolumes returns all volumes with status 'compacting' (stuck from a crash).
+func (d *DB) GetCompactingVolumes() ([]VolumeRecord, error) {
+	return d.queryVolumes("SELECT s3_key, total_size, live_size, needle_count, live_count, status, created_ns FROM volumes WHERE status = 'compacting'")
+}
+
+// GetEmptyVolumes returns sealed volumes with no live needles that are older
+// than the grace period. The age check provides defense in depth against
+// premature deletion if live_count is momentarily incorrect.
+func (d *DB) GetEmptyVolumes(graceNs int64) ([]VolumeRecord, error) {
+	cutoff := time.Now().UnixNano() - graceNs
+	return d.queryVolumes(
+		"SELECT s3_key, total_size, live_size, needle_count, live_count, status, created_ns FROM volumes WHERE status = 'sealed' AND live_count = 0 AND created_ns < ?",
+		cutoff,
+	)
+}
+
+// GetVolumesForCompaction returns sealed volumes where the dead space ratio exceeds the threshold.
+func (d *DB) GetVolumesForCompaction(deadRatio float64) ([]VolumeRecord, error) {
+	return d.queryVolumes(
+		"SELECT s3_key, total_size, live_size, needle_count, live_count, status, created_ns FROM volumes WHERE status = 'sealed' AND total_size > 0 AND CAST(total_size - live_size AS REAL) / total_size > ?",
+		deadRatio,
+	)
+}
+
+func (d *DB) queryVolumes(query string, args ...any) ([]VolumeRecord, error) {
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []VolumeRecord
+	for rows.Next() {
+		var v VolumeRecord
+		if err := rows.Scan(&v.S3Key, &v.TotalSize, &v.LiveSize, &v.NeedleCount, &v.LiveCount, &v.Status, &v.CreatedNs); err != nil {
+			return nil, err
+		}
+		result = append(result, v)
+	}
+	return result, rows.Err()
+}
+
+// NeedlesInVolume returns all committed inodes stored in the given volume.
+func (d *DB) NeedlesInVolume(volS3Key string) ([]InodeMeta, error) {
+	rows, err := d.db.Query(
+		"SELECT "+inodeCols+" FROM inodes WHERE vol_s3_key = ? AND status = 'committed'",
+		volS3Key,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return scanInodeRows(rows)
+}
+
+// MarkNeedleDead updates volume stats when a needle is deleted.
+// Must be called before DeleteInode.
+func (d *DB) MarkNeedleDead(inodeID int64, volS3Key string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var volSize int64
+	err = tx.QueryRow("SELECT COALESCE(vol_size, 0) FROM inodes WHERE id = ?", inodeID).Scan(&volSize)
+	if err != nil {
+		return fmt.Errorf("mark needle dead: get vol_size: %w", err)
+	}
+
+	_, err = tx.Exec(
+		"UPDATE volumes SET live_size = MAX(live_size - ?, 0), live_count = MAX(live_count - 1, 0) WHERE s3_key = ?",
+		volSize, volS3Key,
+	)
+	if err != nil {
+		return fmt.Errorf("mark needle dead: update volume: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// DeleteInodeWithVolume atomically decrements volume stats and deletes the inode
+// in a single transaction. This prevents crashes between MarkNeedleDead and
+// DeleteInode from corrupting volume live_count.
+func (d *DB) DeleteInodeWithVolume(id int64, volS3Key string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if volS3Key != "" {
+		var volSize int64
+		err = tx.QueryRow("SELECT COALESCE(vol_size, 0) FROM inodes WHERE id = ?", id).Scan(&volSize)
+		if err != nil {
+			return fmt.Errorf("delete inode with volume: get vol_size: %w", err)
+		}
+		_, err = tx.Exec(
+			"UPDATE volumes SET live_size = MAX(live_size - ?, 0), live_count = MAX(live_count - 1, 0) WHERE s3_key = ?",
+			volSize, volS3Key,
+		)
+		if err != nil {
+			return fmt.Errorf("delete inode with volume: update volume: %w", err)
+		}
+	}
+
+	if _, err := tx.Exec("DELETE FROM xattrs WHERE inode_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM inodes WHERE id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteVolume removes a volume record from the database.
+func (d *DB) DeleteVolume(s3Key string) error {
+	_, err := d.db.Exec("DELETE FROM volumes WHERE s3_key = ?", s3Key)
+	return err
+}
+
+// CommitNeedlesToVolume atomically commits multiple inodes to a volume and seals it.
+// When onlyUnpacked is true, only updates inodes that have no existing S3 key or
+// volume reference (used by the builder to avoid overwriting superseded data).
+// onlyUnpacked and expectedVolKey are mutually exclusive — using both produces
+// a contradictory query that matches zero rows.
+// Returns the list of inode IDs that were actually committed.
+func (d *DB) CommitNeedlesToVolume(volS3Key string, totalSize int64, needles []NeedleCommit, onlyUnpacked bool, expectedVolKey string) ([]int64, error) {
+	if onlyUnpacked && expectedVolKey != "" {
+		return nil, fmt.Errorf("CommitNeedlesToVolume: onlyUnpacked and expectedVolKey are mutually exclusive")
+	}
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	query := "UPDATE inodes SET vol_s3_key = ?, vol_offset = ?, vol_size = ? WHERE id = ? AND status = 'committed'"
+	if onlyUnpacked {
+		query += " AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '')"
+	}
+
+	liveSize := int64(0)
+	committed := 0
+	var committedIDs []int64
+
+	for _, n := range needles {
+		q := query
+		args := []any{volS3Key, n.Offset, n.Size, n.InodeID}
+		if expectedVolKey != "" {
+			q += " AND vol_s3_key = ?"
+			args = append(args, expectedVolKey)
+		}
+		if n.MtimeNs > 0 {
+			q += " AND mtime_ns = ?"
+			args = append(args, n.MtimeNs)
+		}
+		var res sql.Result
+		res, err = tx.Exec(q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("commit needle inode %d: %w", n.InodeID, err)
+		}
+		rows, _ := res.RowsAffected()
+		if rows > 0 {
+			liveSize += n.Size
+			committed++
+			committedIDs = append(committedIDs, n.InodeID)
+		}
+	}
+
+	_, err = tx.Exec(
+		"UPDATE volumes SET status = 'sealed', total_size = ?, live_size = ?, needle_count = ?, live_count = ? WHERE s3_key = ?",
+		totalSize, liveSize, committed, committed, volS3Key,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("seal volume: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return committedIDs, nil
+}
+
+// NeedleCommit holds the data needed to commit one needle to a volume.
+type NeedleCommit struct {
+	InodeID int64
+	Offset  int64
+	Size    int64 // encrypted (on-disk) size of the needle
+	MtimeNs int64 // expected mtime_ns at claim time; 0 means skip check
 }
 
 func (d *DB) UpdateS3Key(id int64, newKey string) error {
@@ -570,10 +848,12 @@ func (d *DB) GetFSStats() (*FSStats, error) {
 
 // FsckResult holds the results of a consistency check.
 type FsckResult struct {
-	OrphanedInodes int
-	PendingInodes  int
-	MissingS3Keys  int // inodes with status=committed but empty s3_key (non-dir, non-symlink)
-	TotalInodes    int
+	OrphanedInodes   int
+	PendingInodes    int
+	StagedFiles      int // committed files with data in staging dir (not yet in S3)
+	TotalInodes      int
+	VolumeCount      int // sealed volumes
+	VolumeMismatches int // volumes where live_count != actual committed needle count
 }
 
 func (d *DB) Fsck() (*FsckResult, error) {
@@ -587,11 +867,40 @@ func (d *DB) Fsck() (*FsckResult, error) {
 	if err := d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE status = 'pending'").Scan(&r.PendingInodes); err != nil {
 		return nil, fmt.Errorf("fsck pending: %w", err)
 	}
+	// Staged files: committed but data still in staging dir (not yet packed into a volume)
 	if err := d.db.QueryRow(
-		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND mode & ? = 0 AND mode & ? = 0 AND id > 1 AND size > 0",
+		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '') AND mode & ? = 0 AND mode & ? = 0 AND id > 1 AND size > 0",
 		uint32(syscall.S_IFDIR), uint32(syscall.S_IFLNK),
-	).Scan(&r.MissingS3Keys); err != nil {
-		return nil, fmt.Errorf("fsck missing keys: %w", err)
+	).Scan(&r.StagedFiles); err != nil {
+		return nil, fmt.Errorf("fsck staged: %w", err)
 	}
+
+	// Volume consistency: compare tracked live_count with actual needle count
+	volRows, err := d.db.Query("SELECT s3_key, live_count FROM volumes WHERE status = 'sealed'")
+	if err != nil {
+		return nil, fmt.Errorf("fsck volumes: %w", err)
+	}
+	defer volRows.Close()
+	for volRows.Next() {
+		var s3Key string
+		var liveCount int
+		if err := volRows.Scan(&s3Key, &liveCount); err != nil {
+			return nil, fmt.Errorf("fsck volume scan: %w", err)
+		}
+		r.VolumeCount++
+		var actualCount int
+		if err := d.db.QueryRow(
+			"SELECT COUNT(*) FROM inodes WHERE vol_s3_key = ? AND status = 'committed'", s3Key,
+		).Scan(&actualCount); err != nil {
+			return nil, fmt.Errorf("fsck volume count %s: %w", s3Key, err)
+		}
+		if actualCount != liveCount {
+			r.VolumeMismatches++
+		}
+	}
+	if err := volRows.Err(); err != nil {
+		return nil, fmt.Errorf("fsck volumes iter: %w", err)
+	}
+
 	return r, nil
 }
