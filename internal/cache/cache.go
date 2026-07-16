@@ -23,7 +23,16 @@ type DiskCache struct {
 	// approxSize tracks approximate total cache size to avoid full directory
 	// scans on every Put. Recalibrated when evictLRU actually runs.
 	approxSize atomic.Int64
+
+	// evicting guards against many concurrent Put/PutChunk callers each
+	// launching a full directory rescan when the size crosses maxBytes.
+	evicting atomic.Bool
 }
+
+// evictLowWaterRatio is the fraction of maxBytes that evictLRU evicts down to.
+// Leaving headroom below maxBytes prevents the expensive full rescan from
+// re-triggering on every subsequent Put once the cache sits near its limit.
+const evictLowWaterRatio = 90
 
 // New creates a DiskCache at the given directory with a size limit in bytes.
 func New(dir string, maxBytes int64) (*DiskCache, error) {
@@ -314,10 +323,17 @@ type cacheEntry struct {
 	modTime int64
 }
 
-// evictLRU removes oldest entries until total size is under maxBytes.
-// Entries are collected at the S3 key level (prefix/uuid) so that both
-// whole-file caches and chunk directories are evicted as complete units.
+// evictLRU removes oldest entries until total size is under a low-water mark
+// below maxBytes. Entries are collected at the S3 key level (prefix/uuid) so
+// that both whole-file caches and chunk directories are evicted as complete
+// units. A single eviction runs at a time: concurrent Put/PutChunk callers that
+// also cross the threshold skip launching a redundant full-tree rescan.
 func (c *DiskCache) evictLRU() {
+	if !c.evicting.CompareAndSwap(false, true) {
+		return // another eviction is already scanning/deleting
+	}
+	defer c.evicting.Store(false)
+
 	// Phase 1: scan at S3 key level (2 levels deep: prefix/uuid)
 	var entries []cacheEntry
 	var totalSize int64
@@ -380,9 +396,13 @@ func (c *DiskCache) evictLRU() {
 		return entries[i].modTime < entries[j].modTime
 	})
 
+	// Evict down to a low-water mark below maxBytes so the next batch of Puts
+	// does not immediately re-cross the threshold and re-trigger a full rescan.
+	target := c.maxBytes / 100 * evictLowWaterRatio
+
 	// Phase 2: delete with lock, one entry at a time
 	for _, e := range entries {
-		if totalSize <= c.maxBytes {
+		if totalSize <= target {
 			break
 		}
 		c.mu.Lock()
