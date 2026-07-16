@@ -164,13 +164,27 @@ func insertTextChunks(pngData []byte, kvs map[string]string) []byte {
 
 	// Find first IDAT chunk offset
 	offset := sigLen
+	found := false
 	for offset+8 <= len(pngData) {
 		chunkLen := int(binary.BigEndian.Uint32(pngData[offset : offset+4]))
 		chunkType := string(pngData[offset+4 : offset+8])
 		if chunkType == "IDAT" {
+			found = true
 			break
 		}
-		offset += 12 + chunkLen // 4 len + 4 type + data + 4 crc
+		// Guard against a corrupt/overflowing chunk length walking us past the
+		// buffer (the splice below would otherwise slice out of range).
+		next := offset + 12 + chunkLen
+		if chunkLen < 0 || next <= offset || next > len(pngData) {
+			break
+		}
+		offset = next
+	}
+	// No IDAT found (truncated/non-standard PNG): return the input unchanged
+	// rather than splicing tEXt chunks past the end and producing a malformed
+	// file (or panicking on the out-of-range slice).
+	if !found {
+		return pngData
 	}
 
 	// Build tEXt chunks
