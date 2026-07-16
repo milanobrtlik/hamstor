@@ -573,9 +573,15 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 	// RENAME_NOREPLACE must fail with EEXIST if the target exists instead of
 	// silently overwriting it. Returning non-zero also makes go-fuse skip its
 	// post-op ExchangeChild, keeping the kernel tree consistent.
+	//
+	// EXCHANGE must refuse with EINVAL, not ENOSYS: on ENOSYS the kernel latches
+	// fc->no_rename2 for the whole connection and answers EVERY later renameat2
+	// with flags itself, so a single EXCHANGE attempt would silently break
+	// RENAME_NOREPLACE mount-wide for the rest of its lifetime. EINVAL is also
+	// what rename(2) documents for a flag the filesystem does not support.
 	const renameNoreplace = 0x1 // unix.RENAME_NOREPLACE
 	if flags&fs.RENAME_EXCHANGE != 0 {
-		return syscall.ENOSYS
+		return syscall.EINVAL
 	}
 	if flags&renameNoreplace != 0 {
 		if _, lerr := n.hfs.DB.LookupChild(newParentNode.inodeID, newName); lerr == nil {
