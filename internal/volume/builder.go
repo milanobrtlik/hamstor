@@ -81,6 +81,26 @@ func (b *Builder) StagePath(inodeID int64) string {
 	return filepath.Join(b.stagingDir, strconv.FormatInt(inodeID, 10))
 }
 
+// restoreClaim returns a claimed staging file (claimPath, e.g. "<id>.packing"
+// or "<id>.flushing") to its original path, UNLESS a newer staging file already
+// exists there. A concurrent overwrite Flush writes a fresh staging file at
+// origPath (tmp+rename) and bumps the inode's mtime; blindly renaming the stale
+// claim back over it would clobber the newer data while the DB advertises the
+// new mtime/size — a silent lost write. In that case the stale claim is dropped
+// instead. (A small TOCTOU window remains between the stat and the rename, but
+// the mtime guard in CommitNeedlesToVolume rejects any residual stale commit.)
+func restoreClaim(claimPath, origPath string) {
+	if _, statErr := os.Stat(origPath); statErr == nil {
+		if err := os.Remove(claimPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("hamstor: volume builder drop stale claim %s: %v", claimPath, err)
+		}
+		return
+	}
+	if err := os.Rename(claimPath, origPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("hamstor: volume builder restore %s: %v", claimPath, err)
+	}
+}
+
 // NotifyStaged signals the builder that a new file has been staged.
 func (b *Builder) NotifyStaged() {
 	select {
@@ -128,13 +148,13 @@ func (b *Builder) FlushInode(inodeID int64) error {
 	// CommitNeedlesToVolume detects concurrent Flush modifications.
 	meta, metaErr := b.db.GetInode(inodeID)
 	if metaErr != nil {
-		os.Rename(claimPath, path)
+		restoreClaim(claimPath, path)
 		return nil // inode deleted, ok
 	}
 
 	data, err := os.ReadFile(claimPath)
 	if err != nil {
-		os.Rename(claimPath, path) // put back for builder to retry
+		restoreClaim(claimPath, path) // put back for builder to retry
 		return fmt.Errorf("flush inode %d: read staging: %w", inodeID, err)
 	}
 
@@ -142,26 +162,38 @@ func (b *Builder) FlushInode(inodeID int64) error {
 	needle := db.NeedleCommit{InodeID: inodeID, Offset: 0, Size: int64(len(data)), MtimeNs: meta.MtimeNs}
 
 	if err := b.db.InsertVolume(volKey, 0, 0, 0, 0, "open"); err != nil {
-		os.Rename(claimPath, path)
+		restoreClaim(claimPath, path)
 		return fmt.Errorf("flush inode %d: insert volume: %w", inodeID, err)
 	}
 
 	if err := b.store.Upload(b.ctx, volKey, data); err != nil {
 		b.db.DeleteVolume(volKey)
-		os.Rename(claimPath, path)
+		restoreClaim(claimPath, path)
 		return fmt.Errorf("flush inode %d: upload: %w", inodeID, err)
 	}
 
-	if _, err := b.db.CommitNeedlesToVolume(volKey, int64(len(data)), []db.NeedleCommit{needle}, true, ""); err != nil {
+	committedIDs, err := b.db.CommitNeedlesToVolume(volKey, int64(len(data)), []db.NeedleCommit{needle}, true, "")
+	if err != nil {
 		b.db.DeleteVolume(volKey)
 		b.store.Delete(b.ctx, volKey)
-		os.Rename(claimPath, path) // restore for retry
+		restoreClaim(claimPath, path) // restore for retry
 		return fmt.Errorf("flush inode %d: commit: %w", inodeID, err)
 	}
-	// Always remove the claimed file. If no needles were committed (inode already
-	// packed or deleted), the uploaded S3 volume is orphaned and GC will clean it.
+	// Remove the claimed file. If no needles were committed, the uploaded S3
+	// volume is orphaned and GC will clean it.
 	if err := os.Remove(claimPath); err != nil && !os.IsNotExist(err) {
 		log.Printf("hamstor: volume builder remove flushing %s: %v", claimPath, err)
+	}
+	// Zero needles committed means this flush did NOT make the current data
+	// durable: either the inode was already packed (durable elsewhere) or it was
+	// superseded by a concurrent overwrite whose fresh staging file now sits at
+	// `path` and has not yet been packed. Only report success in the former case;
+	// otherwise signal ErrBeingPacked so Fsync keeps waiting for the new data to
+	// be packed rather than falsely reporting durability.
+	if len(committedIDs) == 0 {
+		if m, dbErr := b.db.GetInode(inodeID); dbErr == nil && m.VolS3Key == "" && m.S3Key == "" && m.Size > 0 {
+			return ErrBeingPacked
+		}
 	}
 	return nil
 }
@@ -187,8 +219,17 @@ func (b *Builder) run() {
 	for {
 		select {
 		case <-b.done:
-			// Final sweep: seal everything remaining
-			b.scanAndSeal(true)
+			// Final sweep: drain the ENTIRE staging directory. scanAndSeal caps
+			// each pass at maxBatchEntries for memory safety, so a single call
+			// would leave any backlog (>64 files, common after a bulk copy)
+			// stranded as committed inodes with no S3 backing. Loop until a pass
+			// seals nothing more. The bound guards against a pathological
+			// non-draining file (e.g. an inode that keeps failing to commit).
+			for i := 0; i < 1<<20; i++ {
+				if b.scanAndSeal(true) == 0 {
+					break
+				}
+			}
 			return
 		case <-b.notify:
 			b.scanAndSeal(false)
@@ -208,10 +249,13 @@ type stagedFile struct {
 
 // scanAndSeal reads staged files and packs them into volumes.
 // If forceSmall is true, it seals even if total size is below TargetVolumeSize.
-func (b *Builder) scanAndSeal(forceSmall bool) {
+// Returns the number of staged files it sealed into volumes this pass (0 if it
+// found nothing, or restored everything because the batch was too small and not
+// forced), so the shutdown drain loop knows when the directory is exhausted.
+func (b *Builder) scanAndSeal(forceSmall bool) int {
 	entries, err := os.ReadDir(b.stagingDir)
 	if err != nil || len(entries) == 0 {
-		return
+		return 0
 	}
 
 	var staged []stagedFile
@@ -240,10 +284,15 @@ func (b *Builder) scanAndSeal(forceSmall bool) {
 		// the mtime check will detect the mismatch and skip the needle.
 		// Reading after the claim would risk capturing a NEW mtime while
 		// holding OLD data, causing stale data to pass the mtime check.
-		var mtimeNs int64
-		if meta, metaErr := b.db.GetInode(inodeID); metaErr == nil {
-			mtimeNs = meta.MtimeNs
+		// If the mtime cannot be read, skip this file rather than sealing it
+		// with mtimeNs=0 (which would disable the mtime guard entirely and let
+		// stale claimed data overwrite a concurrent re-stage). The file is left
+		// in place for a later scan. Done before the claim, so no restore needed.
+		meta, metaErr := b.db.GetInode(inodeID)
+		if metaErr != nil {
+			continue
 		}
+		mtimeNs := meta.MtimeNs
 
 		// Atomically claim the staging file so a concurrent Flush cannot
 		// overwrite it between our read and the eventual commit+remove.
@@ -273,22 +322,21 @@ func (b *Builder) scanAndSeal(forceSmall bool) {
 	}
 
 	if len(staged) == 0 {
-		return
+		return 0
 	}
 
 	// Wait for more files unless forced (ticker/shutdown) or enough data
 	if !forceSmall && totalSize < TargetVolumeSize {
-		// Put claimed files back so the next scan can pick them up
+		// Put claimed files back so the next scan can pick them up, unless a
+		// concurrent overwrite already wrote a newer staging file at the path.
 		for _, sf := range staged {
-			orig := strings.TrimSuffix(sf.path, ".packing")
-			if err := os.Rename(sf.path, orig); err != nil && !os.IsNotExist(err) {
-				log.Printf("hamstor: volume builder restore %s: %v", sf.path, err)
-			}
+			restoreClaim(sf.path, strings.TrimSuffix(sf.path, ".packing"))
 		}
-		return
+		return 0
 	}
 
 	b.sealBatch(staged)
+	return len(staged)
 }
 
 // sealBatch packs staged files into volumes, splitting at TargetVolumeSize boundaries.
@@ -299,10 +347,7 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 
 	restorePaths := func(paths []string) {
 		for _, p := range paths {
-			orig := strings.TrimSuffix(p, ".packing")
-			if err := os.Rename(p, orig); err != nil && !os.IsNotExist(err) {
-				log.Printf("hamstor: volume builder restore %s: %v", p, err)
-			}
+			restoreClaim(p, strings.TrimSuffix(p, ".packing"))
 		}
 	}
 
@@ -364,18 +409,10 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 					log.Printf("hamstor: volume builder remove orphaned %s: %v", p, err)
 				}
 			} else {
-				// Needle not committed (superseded by a new Flush).
-				// Check if a new staging file exists at the original path
-				// before restoring — restorePaths would overwrite it.
-				orig := strings.TrimSuffix(p, ".packing")
-				if _, statErr := os.Stat(orig); statErr == nil {
-					// New staging file exists — delete our stale .packing
-					if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-						log.Printf("hamstor: volume builder remove stale %s: %v", p, err)
-					}
-				} else {
-					restorePaths([]string{p})
-				}
+				// Needle not committed (superseded by a new Flush). Restore the
+				// claim for a later pass unless a newer staging file already
+				// exists at the original path.
+				restoreClaim(p, strings.TrimSuffix(p, ".packing"))
 			}
 		}
 
@@ -400,4 +437,3 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 	// Seal remaining (tail batch)
 	flush()
 }
-
