@@ -750,13 +750,14 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		// volume needle (if any) is accounted for atomically by CommitInode
 		// below, which decrements the previously-referenced volume in the same
 		// transaction that clears the inode's vol columns.
-		if oldMeta, metaErr := h.hfs.DB.GetInode(h.inodeID); metaErr == nil {
-			if oldMeta.S3Key != "" {
-				if delErr := h.hfs.Store.Delete(context.Background(), oldMeta.S3Key); delErr != nil {
-					log.Printf("hamstor: stage overwrite delete old key %s: %v", oldMeta.S3Key, delErr)
+		stageMeta, stageMetaErr := h.hfs.DB.GetInode(h.inodeID)
+		if stageMetaErr == nil {
+			if stageMeta.S3Key != "" {
+				if delErr := h.hfs.Store.Delete(context.Background(), stageMeta.S3Key); delErr != nil {
+					log.Printf("hamstor: stage overwrite delete old key %s: %v", stageMeta.S3Key, delErr)
 				}
 				if h.hfs.Cache != nil {
-					h.hfs.Cache.Evict(oldMeta.S3Key)
+					h.hfs.Cache.Evict(stageMeta.S3Key)
 				}
 			}
 		}
@@ -779,6 +780,32 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		}
 		if stageData == nil {
 			return syscall.EIO
+		}
+
+		// Capture a plaintext thumbnail source before stageData is replaced by
+		// its ciphertext below. Unlike the spill path there is no plaintext file
+		// on disk to reuse here, so an image costs one extra write of at most
+		// MaxNeedleSize; the staged file itself cannot be used because it may be
+		// encrypted and the builder may pack and delete it at any moment.
+		var stageThumbSrc string
+		defer func() {
+			if stageThumbSrc != "" {
+				os.Remove(stageThumbSrc)
+			}
+		}()
+		if stageMetaErr == nil && thumb.IsImageExt(stageMeta.Name) {
+			if tf, tErr := os.CreateTemp(h.hfs.SpillDir, "hamstor-thumb-*"); tErr == nil {
+				_, wErr := tf.Write(stageData)
+				tf.Close()
+				if wErr == nil {
+					stageThumbSrc = tf.Name()
+				} else {
+					os.Remove(tf.Name())
+					log.Printf("hamstor: thumb source write for inode %d: %v", h.inodeID, wErr)
+				}
+			} else {
+				log.Printf("hamstor: thumb source create for inode %d: %v", h.inodeID, tErr)
+			}
 		}
 
 		// Encrypt before staging (per-needle encryption)
@@ -814,6 +841,10 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 
 		// Notify builder that new staged file is available
 		h.hfs.VolumeBuilder.NotifyStaged()
+
+		// Ownership of the thumbnail source passes to scheduleThumb.
+		h.hfs.scheduleThumb(h.inodeID, stageMeta.Name, stageThumbSrc)
+		stageThumbSrc = ""
 		return 0
 	}
 
@@ -871,6 +902,20 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		var plainBuf []byte
 		var uploadData []byte
 
+		// thumbSrc is the on-disk plaintext a thumbnail is built from. The spill
+		// file already holds exactly that, so for images it is handed to the
+		// thumbnailer instead of being deleted here — no second copy, and no
+		// image kept on the heap while the job waits for a ThumbSem slot.
+		// Ownership passes to scheduleThumb; until then this defer covers every
+		// early return.
+		var thumbSrc string
+		defer func() {
+			if thumbSrc != "" {
+				os.Remove(thumbSrc)
+			}
+		}()
+		keepThumbSrc := thumb.IsImageExt(fileName)
+
 		if uploadFile != nil && hfs.Encryptor != nil {
 			plainBuf = make([]byte, bufSize)
 			if _, err := uploadFile.ReadAt(plainBuf, 0); err != nil && err != io.EOF {
@@ -881,7 +926,11 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 				return
 			}
 			uploadFile.Close()
-			os.Remove(uploadFile.Name())
+			if keepThumbSrc {
+				thumbSrc = uploadFile.Name()
+			} else {
+				os.Remove(uploadFile.Name())
+			}
 			uploadFile = nil
 
 			encrypted, encErr := hfs.Encryptor.Encrypt(plainBuf)
@@ -893,11 +942,10 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			uploadData = encrypted
 			// Release the plaintext buffer now that the ciphertext exists, so
 			// peak heap during an encrypted upload is ~one full-size buffer
-			// instead of two (plaintext + ciphertext held simultaneously). The
-			// plaintext is only retained for image thumbnail generation; for
-			// non-images the best-effort cache-after-write is skipped and the
-			// data is re-cached on the next read.
-			if !thumb.IsImageExt(fileName) {
+			// instead of two (plaintext + ciphertext held simultaneously). It is
+			// kept only when an update is about to be re-cached below; thumbnails
+			// no longer need it, they read thumbSrc from disk.
+			if hfs.Cache == nil || oldKey == "" {
 				plainBuf = nil
 			}
 		}
@@ -908,7 +956,11 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			uploadFile.Seek(0, io.SeekStart)
 			uploadErr = hfs.Store.UploadReader(uploadCtx, newKey, uploadFile, bufSize)
 			uploadFile.Close()
-			os.Remove(uploadFile.Name())
+			if keepThumbSrc {
+				thumbSrc = uploadFile.Name()
+			} else {
+				os.Remove(uploadFile.Name())
+			}
 			uploadFile = nil
 		} else if uploadData != nil {
 			uploadErr = hfs.Store.Upload(uploadCtx, newKey, uploadData)
@@ -968,21 +1020,12 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			}
 		}
 
-		if plainBuf != nil && thumb.IsImageExt(fileName) {
-			thumbData := plainBuf // separate reference for thumb goroutine
-			plainBuf = nil
-			if relPath, pathErr := hfs.DB.InodePath(inodeID); pathErr == nil {
-				updated, err2 := hfs.DB.GetInode(inodeID)
-				if err2 == nil {
-					go func() {
-						hfs.ThumbSem <- struct{}{}
-						defer func() { <-hfs.ThumbSem }()
-						thumb.Generate(hfs.Mountpoint, relPath, updated.MtimeNs/1e9, thumbData)
-					}()
-				}
-			}
-		}
-		plainBuf = nil // free after cache put and thumb handoff
+		plainBuf = nil // free after cache put; thumbnails read thumbSrc from disk
+
+		// Hand the plaintext spill file to the thumbnailer, which removes it when
+		// done. Clearing thumbSrc transfers ownership away from the defer above.
+		hfs.scheduleThumb(inodeID, fileName, thumbSrc)
+		thumbSrc = ""
 
 		// Periodically return freed pages to the OS to reduce RSS.
 		hfs.MaybeFreeMem()
