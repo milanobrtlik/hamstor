@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"syscall"
@@ -27,24 +28,24 @@ type HamstorNode struct {
 }
 
 var (
-	_ fs.NodeGetattrer   = (*HamstorNode)(nil)
-	_ fs.NodeSetattrer   = (*HamstorNode)(nil)
-	_ fs.NodeLookuper    = (*HamstorNode)(nil)
-	_ fs.NodeReaddirer   = (*HamstorNode)(nil)
-	_ fs.NodeMkdirer     = (*HamstorNode)(nil)
-	_ fs.NodeCreater     = (*HamstorNode)(nil)
-	_ fs.NodeOpener      = (*HamstorNode)(nil)
-	_ fs.NodeUnlinker    = (*HamstorNode)(nil)
-	_ fs.NodeRmdirer     = (*HamstorNode)(nil)
-	_ fs.NodeRenamer     = (*HamstorNode)(nil)
-	_ fs.NodeStatfser    = (*HamstorNode)(nil)
-	_ fs.NodeSymlinker   = (*HamstorNode)(nil)
-	_ fs.NodeReadlinker  = (*HamstorNode)(nil)
-	_ fs.NodeGetxattrer  = (*HamstorNode)(nil)
-	_ fs.NodeSetxattrer  = (*HamstorNode)(nil)
+	_ fs.NodeGetattrer     = (*HamstorNode)(nil)
+	_ fs.NodeSetattrer     = (*HamstorNode)(nil)
+	_ fs.NodeLookuper      = (*HamstorNode)(nil)
+	_ fs.NodeReaddirer     = (*HamstorNode)(nil)
+	_ fs.NodeMkdirer       = (*HamstorNode)(nil)
+	_ fs.NodeCreater       = (*HamstorNode)(nil)
+	_ fs.NodeOpener        = (*HamstorNode)(nil)
+	_ fs.NodeUnlinker      = (*HamstorNode)(nil)
+	_ fs.NodeRmdirer       = (*HamstorNode)(nil)
+	_ fs.NodeRenamer       = (*HamstorNode)(nil)
+	_ fs.NodeStatfser      = (*HamstorNode)(nil)
+	_ fs.NodeSymlinker     = (*HamstorNode)(nil)
+	_ fs.NodeReadlinker    = (*HamstorNode)(nil)
+	_ fs.NodeGetxattrer    = (*HamstorNode)(nil)
+	_ fs.NodeSetxattrer    = (*HamstorNode)(nil)
 	_ fs.NodeRemovexattrer = (*HamstorNode)(nil)
-	_ fs.NodeListxattrer = (*HamstorNode)(nil)
-	_ fs.NodeLinker       = (*HamstorNode)(nil)
+	_ fs.NodeListxattrer   = (*HamstorNode)(nil)
+	_ fs.NodeLinker        = (*HamstorNode)(nil)
 )
 
 func toErrno(err error) syscall.Errno {
@@ -102,7 +103,8 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 		s := int64(sz)
 		sizePtr = &s
 
-		// Truncate the buffer of the active file handle if one is provided
+		// Truncate the active file handle's data if one is provided, so the
+		// resize is captured and re-uploaded on Flush.
 		if fh, ok := f.(*HamstorHandle); ok {
 			fh.mu.Lock()
 			if fh.spillFile != nil {
@@ -113,14 +115,32 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 				}
 				fh.spillSize = s
 				fh.dirty = true
-			} else if fh.loaded && fh.cacheFile == nil {
-				if s < int64(len(fh.buf)) {
-					fh.buf = fh.buf[:s]
-				} else if s > int64(len(fh.buf)) {
-					fh.buf = append(fh.buf, make([]byte, s-int64(len(fh.buf)))...)
+			} else {
+				// A cache-backed (read) handle holds no mutable buffer. Materialize
+				// it into buf so the truncation is durable on the next Flush
+				// instead of only changing the DB size while storage keeps the old
+				// bytes (which a later rewrite/append would then resurrect).
+				if fh.cacheFile != nil {
+					if info, statErr := fh.cacheFile.Stat(); statErr == nil {
+						b := make([]byte, info.Size())
+						if _, rerr := fh.cacheFile.ReadAt(b, 0); rerr == nil || rerr == io.EOF {
+							fh.buf = b
+							fh.cacheFile.Close()
+							fh.cacheFile = nil
+							fh.loaded = true
+						}
+					}
 				}
-				fh.dirty = true
+				if fh.loaded && fh.cacheFile == nil {
+					if s < int64(len(fh.buf)) {
+						fh.buf = fh.buf[:s]
+					} else if s > int64(len(fh.buf)) {
+						fh.buf = append(fh.buf, make([]byte, s-int64(len(fh.buf)))...)
+					}
+					fh.dirty = true
+				}
 			}
+			fh.fileSize = s
 			fh.mu.Unlock()
 		}
 	}
@@ -334,10 +354,31 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			handle.buf = data
 			handle.loaded = true
 		}
+
+		// If the stored object is longer than the inode's logical size — e.g. a
+		// prior truncate() shrank the file without rewriting storage — clamp the
+		// preloaded data to meta.Size so a subsequent rewrite or append does not
+		// resurrect the truncated tail. (Not applied for O_TRUNC, which loads an
+		// empty buffer.)
+		if handle.loaded && flags&uint32(syscall.O_TRUNC) == 0 {
+			if handle.spillFile != nil {
+				if handle.spillSize > meta.Size {
+					if err := handle.spillFile.Truncate(meta.Size); err == nil {
+						handle.spillSize = meta.Size
+					}
+				}
+			} else if int64(len(handle.buf)) > meta.Size {
+				handle.buf = handle.buf[:meta.Size]
+			}
+		}
 	}
 
-	// Enable streaming mode for multimedia files opened read-only (separate from write block above)
-	if flags&writeFlags == 0 && media.IsMediaExt(meta.Name) && n.hfs.StreamRate > 0 {
+	// Enable streaming mode for multimedia files opened read-only (separate from
+	// write block above). Disabled under encryption: stored objects are a single
+	// whole-file AES-256-GCM blob, so a byte-range slice is undecryptable
+	// ciphertext. Encrypted media instead falls through to the full-download +
+	// decrypt path in ensureLoaded.
+	if flags&writeFlags == 0 && n.hfs.Encryptor == nil && media.IsMediaExt(meta.Name) && n.hfs.StreamRate > 0 {
 		rateBps := float64(n.hfs.StreamRate) * (1 << 20) // MB/s to bytes/s
 		burstBytes := float64(n.hfs.StreamBuffer) * (1 << 20)
 		handle.streaming = true
@@ -401,10 +442,10 @@ func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	if thumb.IsImageExt(meta.Name) {
 		if relPath, err := n.hfs.DB.InodePath(meta.ID); err == nil {
 			go func() {
-						n.hfs.ThumbSem <- struct{}{}
-						defer func() { <-n.hfs.ThumbSem }()
-						thumb.RemoveThumbnails(n.hfs.Mountpoint, relPath)
-					}()
+				n.hfs.ThumbSem <- struct{}{}
+				defer func() { <-n.hfs.ThumbSem }()
+				thumb.RemoveThumbnails(n.hfs.Mountpoint, relPath)
+			}()
 		}
 	}
 
@@ -524,6 +565,25 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 	}
 
 	newParentNode := newParent.EmbeddedInode().Operations().(*HamstorNode)
+
+	// Honor renameat2 flags. RENAME_EXCHANGE requires an atomic two-inode swap,
+	// which the DB layer does not implement — refuse it rather than fall through
+	// to the unconditional destroy-then-rename path below (which would delete the
+	// target's data and leave the kernel inode tree inconsistent with the DB).
+	// RENAME_NOREPLACE must fail with EEXIST if the target exists instead of
+	// silently overwriting it. Returning non-zero also makes go-fuse skip its
+	// post-op ExchangeChild, keeping the kernel tree consistent.
+	const renameNoreplace = 0x1 // unix.RENAME_NOREPLACE
+	if flags&fs.RENAME_EXCHANGE != 0 {
+		return syscall.ENOSYS
+	}
+	if flags&renameNoreplace != 0 {
+		if _, lerr := n.hfs.DB.LookupChild(newParentNode.inodeID, newName); lerr == nil {
+			return syscall.EEXIST
+		} else if !errors.Is(lerr, sql.ErrNoRows) {
+			return toErrno(lerr)
+		}
+	}
 
 	// Prevent moving a directory into itself or a descendant (cycle detection)
 	if meta.Mode&syscall.S_IFDIR != 0 && newParentNode.inodeID != n.inodeID {
