@@ -105,6 +105,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Take an exclusive advisory lock on the DB so a mount and a mutating
+	// subcommand (gc/compact/migrate/purge-s3/restore) cannot run against the
+	// same database/bucket concurrently — which would let one delete S3 volume
+	// objects out from under the other. fsck/cache/version returned earlier and
+	// do not take the lock.
+	lockFile, lockErr := acquireDBLock(*dbPath)
+	if lockErr != nil {
+		log.Fatalf("hamstor: another instance is using %s (lock: %v)", *dbPath, lockErr)
+	}
+	defer lockFile.Close()
+
 	// Litestream: restore DB from S3 if local file missing, then start replication
 	var rep *replicate.Replicator
 	if *enableReplication {
@@ -193,10 +204,20 @@ func main() {
 	if err := database.SetOwner(1, &defaultUid, &defaultGid); err != nil {
 		log.Printf("hamstor: set root owner: %v", err)
 	}
-	if fixed, err := database.FixDefaultOwnership(defaultUid, defaultGid); err != nil {
-		log.Printf("hamstor: fix default ownership: %v", err)
-	} else if fixed > 0 {
-		log.Printf("hamstor: fixed ownership on %d inodes", fixed)
+	// Normalize legacy uid=0/gid=0 inodes to the configured owner ONCE, tracked
+	// in the config table. Running this every boot would silently re-clobber any
+	// file a user/root has since legitimately chown'd to root:root.
+	if _, cfgErr := database.GetConfig("default_ownership_normalized"); errors.Is(cfgErr, sql.ErrNoRows) {
+		if fixed, err := database.FixDefaultOwnership(defaultUid, defaultGid); err != nil {
+			log.Printf("hamstor: fix default ownership: %v", err)
+		} else {
+			if fixed > 0 {
+				log.Printf("hamstor: normalized ownership on %d legacy inodes", fixed)
+			}
+			if setErr := database.SetConfig("default_ownership_normalized", []byte("1")); setErr != nil {
+				log.Printf("hamstor: record ownership normalization: %v", setErr)
+			}
+		}
 	}
 
 	enc := setupEncryption(database, *passphrase)
@@ -294,6 +315,22 @@ func main() {
 	}
 
 	log.Println("hamstor: stopped")
+}
+
+// acquireDBLock takes a non-blocking exclusive advisory lock on "<dbPath>.lock".
+// The returned file must stay open for the process lifetime to hold the lock;
+// the OS releases it automatically on exit. Returns an error if another process
+// already holds the lock.
+func acquireDBLock(dbPath string) (*os.File, error) {
+	f, err := os.OpenFile(dbPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func setupEncryption(database *db.DB, passphrase string) *crypto.Encryptor {
