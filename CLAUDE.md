@@ -57,7 +57,8 @@ internal/testutil/         Test helper: RequireS3 (config + reachability probe, 
 
 - **S3 keys** are prefixed: `{first-2-hex}/{uuid}` (e.g., `a1/a1b2c3d4-...`). Legacy unprefixed keys can be migrated via `--migrate`.
 - **Encryption** is optional (passphrase from flag > env > embedded). Format: `[version byte][12-byte nonce][ciphertext+tag]`. `IsEncrypted()` checks the version byte.
-- **Async uploads:** `Flush` launches a goroutine for S3 upload, updates DB on completion. This enables parallel file copies.
+- **Async uploads:** `Flush` launches a goroutine for S3 upload, updates DB on completion. This enables parallel file copies. Because a file's size only lands at `CommitInode`, the async path must invalidate the kernel's cached attributes afterwards (`inode.NotifyContent(-1, 0)` — a negative offset means attributes only, leaving the page cache alone). Without it `ls -l` reports 0 bytes for up to `--entry-timeout` (60s) after a `cp`.
+- **Thumbnails** are generated from the plaintext *on disk* (the spill file, or a temp copy for staged small files), never from a heap buffer, and a bounded worker pool reads each source only after taking a slot. Holding the image in a queued goroutine instead puts one full-size buffer per pending file in RAM. Generation is gated on that path existing — do not re-gate it on an in-memory buffer, which is how it silently broke for unencrypted mounts once uploads started streaming from disk.
 - **Disk cache:** Downloaded/decrypted files are cached on local disk (`--cache-dir`). Keyed by S3 key (changes per version = automatic invalidation). LRU eviction with `--cache-size` limit.
 - **Range requests:** For unencrypted files not yet in cache, reads use S3 Range headers instead of downloading the entire file. A background goroutine warms the cache.
 - **Spill to disk:** Writes larger than 64 MB use a temp file instead of in-memory buffer, avoiding OOM on large files.

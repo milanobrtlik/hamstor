@@ -30,6 +30,10 @@ const spillThreshold = 64 << 20 // 64 MB
 type HamstorHandle struct {
 	hfs     *HamstorFS
 	inodeID int64
+	// inode is the kernel-facing inode, used to invalidate cached attributes
+	// once an async upload commits the real size. nil in tests that build a
+	// handle without a mounted tree; the notify is then skipped.
+	inode *fs.Inode
 	mu      sync.Mutex
 	buf     []byte // in-memory write buffer (small files)
 	dirty   bool
@@ -882,6 +886,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	}
 	h.uploadDone = make(chan struct{})
 	h.uploadErr = nil
+	inode := h.inode
 	hfs.InflightUploads.Add(1)
 
 	go func() {
@@ -1007,6 +1012,22 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		if oldKey != "" && oldKey != newKey {
 			if err := hfs.Store.Delete(uploadCtx, oldKey); err != nil {
 				log.Printf("hamstor: flush delete old key %s: %v", oldKey, err)
+			}
+		}
+
+		// The size only becomes real at CommitInode above, but the kernel has
+		// almost certainly cached this inode's attributes already — the lookup
+		// behind the caller's open/stat ran while the upload was still in flight
+		// and saw size 0. Nothing refreshes that for AttrTimeout (60s by
+		// default), so `ls -l` straight after `cp` reports a large file as 0
+		// bytes. Drop the cached attributes so the next stat re-reads them.
+		//
+		// A negative offset invalidates attributes ONLY: the kernel skips the
+		// page-cache range when off < 0, which is what we want — the data was
+		// always correct, only the size was stale.
+		if inode != nil {
+			if errno := inode.NotifyContent(-1, 0); errno != 0 && errno != syscall.ENOSYS {
+				log.Printf("hamstor: attr invalidate for inode %d: %v", inodeID, errno)
 			}
 		}
 
