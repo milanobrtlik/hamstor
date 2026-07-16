@@ -24,7 +24,7 @@ go vet ./...            # Lint
 
 Build embeds S3 credentials and passphrase via ldflags from `.env` (see `.env.example`).
 
-Tests requiring S3 (upload, download) need credentials from `.env.test` (`source .env.test` before `go test`). Without it, S3-dependent tests skip gracefully.
+Tests requiring S3 (upload, download, GC, range reads) need credentials from `.env.test` (`source .env.test` before `go test`) and a reachable S3 endpoint — by default a local Garage on `http://localhost:3900` with the `hamstor` bucket. `testutil.RequireS3` probes both and calls `t.Skip` when either is missing, so an unconfigured checkout skips those tests in milliseconds instead of failing after ~30s of SDK retries.
 
 ## Architecture
 
@@ -48,7 +48,9 @@ internal/crypto/           Optional AES-256-GCM encryption with Argon2id key der
 internal/replicate/        Litestream integration for DB replication to S3
 internal/ops/              GC (orphan cleanup) and S3 key migration
 internal/thumb/            Freedesktop thumbnail generation for images
+internal/volume/           Packs small files into volume objects (builder + staging dir)
 internal/creds/            Build-time embedded credentials via ldflags
+internal/testutil/         Test helper: RequireS3 (config + reachability probe, skips when absent)
 ```
 
 ## Key Patterns
@@ -68,10 +70,16 @@ internal/creds/            Build-time embedded credentials via ldflags
 - **Litestream** runs embedded (not as a separate process), replicating to `litestream/` prefix in the same S3 bucket.
 - **Graceful shutdown:** On SIGINT/SIGTERM, waits for all in-flight async uploads before closing the database.
 - **GC safety:** Garbage collection skips S3 objects younger than 10 minutes to avoid race with in-flight async uploads.
+- **Single instance:** `main` takes an exclusive `flock` on `<dbPath>.lock` before mounting or running a mutating subcommand (`gc`/`compact`/`migrate`/`purge-s3`/`restore`), so two processes cannot delete S3 objects out from under each other. `fsck`/`cache`/`version` return before the lock is taken.
+- **Volume accounting is self-derived:** `CommitInode` and `DeleteInodeWithVolume` re-read the inode's `vol_s3_key`/`vol_size` *inside* their own transaction rather than trusting a caller-supplied snapshot, and decrement the volume in that same transaction. This is what keeps a crash from leaving a still-referenced volume at `live_count=0` for GC to delete, and prevents a double decrement when a concurrent overwrite already moved the needle. Do not reintroduce a separate "mark dead then commit" step.
+- **Staging claims:** The volume builder claims a staging file by renaming it to `<id>.packing` (or `.flushing`). Restoring a claim always goes through `restoreClaim`, which drops the stale claim instead of renaming it back when a concurrent overwrite has already staged newer data at the original path — a bare `os.Rename` there is a silent lost write.
+- **Ownership normalization** of legacy `uid=0/gid=0` inodes runs **once**, guarded by the `default_ownership_normalized` key in the config table. Running it every boot would re-clobber files legitimately chown'd to root.
 - **Download limit:** S3 downloads are capped at 2 GB to prevent OOM from corrupted or malicious objects.
 
 ## Known Limitations
 
 - **Async Flush:** `Flush` (triggered by `close()`) launches the S3 upload asynchronously and returns success immediately. This means `close()` does **not** guarantee data durability. To ensure data is persisted to S3, call `fsync()` before `close()`. Standard tools like `cp` do not call `fsync`, so a failed upload after `cp` will only be logged, not reported to the user. `Fsync` waits for the upload and propagates errors.
 - **No hard links:** S3 has no concept of hard links. `link()` returns `ENOTSUP`. Use symlinks instead.
+- **No range reads or streaming under encryption:** A stored object is a single whole-file AES-256-GCM blob, so a byte-range slice is undecryptable ciphertext. Streaming mode is therefore disabled when an encryptor is configured, and encrypted media falls back to full download + decrypt. Restoring range reads for encrypted files needs chunked/segmented encryption (per-chunk nonces) — a format change.
+- **`renameat2` flags:** `RENAME_EXCHANGE` returns `ENOSYS` (an atomic two-inode swap is not implemented in the DB layer). `RENAME_NOREPLACE` is honored and returns `EEXIST`. Other flags fall through to the normal replace path.
 - **Single-writer:** Concurrent writes to the same file from different handles use last-writer-wins semantics. There is no conflict detection.

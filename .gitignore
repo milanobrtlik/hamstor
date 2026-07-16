@@ -1,6 +1,7 @@
 .env
 .env.test
 .claude/
+.mcp.json
 .idea/
 data/
 /hamstor
