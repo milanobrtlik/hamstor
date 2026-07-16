@@ -2,6 +2,8 @@ package hfuse
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,7 @@ import (
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
+	"github.com/milan/hamstor/internal/thumb"
 	"github.com/milan/hamstor/internal/volume"
 )
 
@@ -67,6 +70,51 @@ const FreeOSMemoryInterval = 50
 
 // MaybeFreeMem increments the upload counter and periodically calls
 // debug.FreeOSMemory() to reduce RSS after bulk operations.
+// scheduleThumb generates a thumbnail for inodeID from srcPath, which must hold
+// the file's plaintext bytes. Ownership of srcPath transfers to this call: it is
+// removed once the thumbnail is done, or straight away if one is not wanted.
+//
+// The bytes are read only AFTER ThumbSem is acquired, so at most cap(ThumbSem)
+// images sit on the heap at once. Handing the image itself to a queued goroutine
+// instead would put one full-size buffer per pending file in RAM — with a bulk
+// copy of a photo library that is thousands of buffers waiting on 4 slots, which
+// is why the plaintext is passed as a path on disk rather than a []byte.
+func (hfs *HamstorFS) scheduleThumb(inodeID int64, fileName, srcPath string) {
+	if srcPath == "" {
+		return
+	}
+	if !thumb.IsImageExt(fileName) || hfs.Mountpoint == "" {
+		os.Remove(srcPath)
+		return
+	}
+	// Resolve path and mtime up front: both are cheap DB reads, and doing them
+	// here keeps the queued goroutine holding nothing but a few strings.
+	relPath, err := hfs.DB.InodePath(inodeID)
+	if err != nil {
+		os.Remove(srcPath)
+		return
+	}
+	meta, err := hfs.DB.GetInode(inodeID)
+	if err != nil {
+		os.Remove(srcPath)
+		return
+	}
+	mtimeSec := meta.MtimeNs / 1e9
+
+	go func() {
+		defer os.Remove(srcPath)
+		hfs.ThumbSem <- struct{}{}
+		defer func() { <-hfs.ThumbSem }()
+
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			log.Printf("hamstor: thumb source read for inode %d: %v", inodeID, err)
+			return
+		}
+		thumb.Generate(hfs.Mountpoint, relPath, mtimeSec, data)
+	}()
+}
+
 func (hfs *HamstorFS) MaybeFreeMem() {
 	if hfs.uploadCount.Add(1)%FreeOSMemoryInterval == 0 {
 		debug.FreeOSMemory()
