@@ -39,7 +39,8 @@ func main() {
 	region := flag.String("region", "", "S3 region (for Garage/MinIO)")
 	passphrase := flag.String("passphrase", "", "encryption passphrase (or set HAMSTOR_PASSPHRASE)")
 	enableReplication := flag.Bool("replicate", true, "enable SQLite replication to S3")
-	dryRun := flag.Bool("dry-run", false, "dry-run mode for gc subcommand")
+	dryRun := flag.Bool("dry-run", false, "dry-run mode for gc and purge-s3 subcommands")
+	assumeYes := flag.Bool("yes", false, "skip the purge-s3 confirmation prompt (for scripts)")
 	cacheDir := flag.String("cache-dir", "/var/lib/hamstor/cache", "local disk cache directory")
 	cacheSizeGB := flag.Int("cache-size", 10, "max cache size in GB (0 to disable)")
 	ownerUid := flag.Int("uid", os.Getuid(), "default file owner UID")
@@ -203,7 +204,7 @@ func main() {
 		return
 	case "purge-s3":
 		database.Close()
-		runPurgeS3(ctx, store, *dbPath)
+		runPurgeS3(ctx, store, *dbPath, *bucket, *endpoint, *dryRun, *assumeYes)
 		return
 	}
 
@@ -464,11 +465,40 @@ func runCacheCmd(cacheDir string, cacheSizeGB int, args []string) {
 	}
 }
 
-func runPurgeS3(ctx context.Context, store *s3store.Store, dbPath string) {
+// runPurgeS3 deletes every object in the bucket and the local DB. It is the one
+// irreversible command here and there is no undo, so it asks before doing it:
+// the bucket name must be typed back. Production and test buckets are commonly
+// named alike and differ only by endpoint, so a purge aimed at the wrong
+// endpoint destroys everything without the prompt to catch it. --yes skips the
+// prompt for scripts; --dry-run reports and changes nothing.
+func runPurgeS3(ctx context.Context, store *s3store.Store, dbPath, bucket, endpoint string, dryRun, assumeYes bool) {
 	keys, err := store.List(ctx, "")
 	if err != nil {
 		log.Fatalf("purge-s3: list S3 objects: %v", err)
 	}
+
+	target := bucket
+	if endpoint != "" {
+		target = fmt.Sprintf("%s (%s)", bucket, endpoint)
+	}
+
+	if dryRun {
+		log.Printf("purge-s3: would delete %d S3 objects from %s and remove %s — dry run, nothing changed", len(keys), target, dbPath)
+		return
+	}
+
+	if !assumeYes {
+		fmt.Fprintf(os.Stderr, "purge-s3: about to permanently delete ALL %d objects in bucket %s\n"+
+			"and remove the local database %s. This cannot be undone.\n"+
+			"Type the bucket name to confirm: ", len(keys), target, dbPath)
+		var answer string
+		// A non-interactive stdin yields an error here and aborts, which is the
+		// safe direction: never purge because nobody was there to say no.
+		if _, err := fmt.Scanln(&answer); err != nil || answer != bucket {
+			log.Fatalf("purge-s3: aborted (bucket name not confirmed)")
+		}
+	}
+
 	log.Printf("purge-s3: deleting %d S3 objects...", len(keys))
 	deleted, err := store.DeleteBatch(ctx, keys)
 	if err != nil {

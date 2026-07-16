@@ -18,8 +18,11 @@ go vet ./...            # Lint
 ./hamstor fsck          # Check filesystem consistency
 ./hamstor cache stats   # Show cache statistics
 ./hamstor cache clear   # Clear disk cache
-./hamstor gc            # Garbage collect orphaned S3 objects
+./hamstor gc            # Garbage collect orphaned S3 objects (--dry-run to preview)
+./hamstor compact       # Rewrite volumes with high dead space (--compact-ratio)
+./hamstor migrate       # Migrate legacy unprefixed S3 keys to {2-hex}/{uuid}
 ./hamstor restore       # Restore DB from S3 via Litestream
+./hamstor purge-s3      # DESTRUCTIVE: delete every object in the bucket + local DB
 ```
 
 Flags work on either side of the subcommand (`hamstor gc --bucket x` and `hamstor --bucket x gc` are equivalent) — `main` re-parses around each positional word, because Go's `flag` package otherwise stops at the subcommand and silently ignores everything after it.
@@ -74,6 +77,7 @@ internal/testutil/         Test helper: RequireS3 (config + reachability probe, 
 - **Graceful shutdown:** On SIGINT/SIGTERM, waits for all in-flight async uploads before closing the database.
 - **GC safety:** Garbage collection skips S3 objects younger than 10 minutes to avoid race with in-flight async uploads.
 - **Single instance:** `main` takes an exclusive `flock` on `<dbPath>.lock` before mounting or running a mutating subcommand (`gc`/`compact`/`migrate`/`purge-s3`/`restore`), so two processes cannot delete S3 objects out from under each other. `fsck`/`cache`/`version` return before the lock is taken.
+- **`purge-s3` is the one irreversible command:** it deletes every object in the bucket and the local DB. It requires the bucket name typed back at a prompt (`--yes` skips it, `--dry-run` previews), and aborts on non-interactive stdin. Keep that guard: test and production buckets are commonly named alike and differ only by `--endpoint`, so an unguarded purge aimed at the wrong endpoint is total, silent data loss.
 - **Volume accounting is self-derived:** `CommitInode` and `DeleteInodeWithVolume` re-read the inode's `vol_s3_key`/`vol_size` *inside* their own transaction rather than trusting a caller-supplied snapshot, and decrement the volume in that same transaction. This is what keeps a crash from leaving a still-referenced volume at `live_count=0` for GC to delete, and prevents a double decrement when a concurrent overwrite already moved the needle. Do not reintroduce a separate "mark dead then commit" step.
 - **Staging claims:** The volume builder claims a staging file by renaming it to `<id>.packing` (or `.flushing`). Restoring a claim always goes through `restoreClaim`, which drops the stale claim instead of renaming it back when a concurrent overwrite has already staged newer data at the original path — a bare `os.Rename` there is a silent lost write.
 - **Ownership normalization** of legacy `uid=0/gid=0` inodes runs **once**, guarded by the `default_ownership_normalized` key in the config table. Running it every boot would re-clobber files legitimately chown'd to root.
