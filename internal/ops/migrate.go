@@ -15,7 +15,7 @@ func Migrate(ctx context.Context, database *db.DB, store *s3store.Store) error {
 		return fmt.Errorf("migrate: load keys: %w", err)
 	}
 
-	var migrated, skipped int
+	var migrated, skipped, errorCount int
 	for _, r := range records {
 		if s3store.IsPrefixed(r.S3Key) {
 			skipped++
@@ -23,11 +23,21 @@ func Migrate(ctx context.Context, database *db.DB, store *s3store.Store) error {
 		}
 
 		newKey := r.S3Key[:2] + "/" + r.S3Key
+		// Copy succeeds only after S3 confirms the destination object exists, so
+		// the source is deleted only after both the copy and the DB pointer
+		// update succeed. On any per-object failure, log and continue rather than
+		// aborting the whole run — one bad object must not strand the rest. The
+		// source is never deleted when the copy or DB update failed, so a
+		// re-run (idempotent: prefixed keys are skipped) recovers cleanly.
 		if err := store.Copy(ctx, r.S3Key, newKey); err != nil {
-			return fmt.Errorf("migrate: copy %s: %w", r.S3Key, err)
+			log.Printf("migrate: copy %s: %v (skipping)", r.S3Key, err)
+			errorCount++
+			continue
 		}
 		if err := database.UpdateS3Key(r.ID, newKey); err != nil {
-			return fmt.Errorf("migrate: update db for %s: %w", r.S3Key, err)
+			log.Printf("migrate: update db for %s: %v (skipping; source kept)", r.S3Key, err)
+			errorCount++
+			continue
 		}
 		if err := store.Delete(ctx, r.S3Key); err != nil {
 			log.Printf("migrate: delete old key %s: %v", r.S3Key, err)
@@ -39,6 +49,9 @@ func Migrate(ctx context.Context, database *db.DB, store *s3store.Store) error {
 		}
 	}
 
-	log.Printf("migrate: done — %d migrated, %d already prefixed", migrated, skipped)
+	log.Printf("migrate: done — %d migrated, %d already prefixed, %d errors", migrated, skipped, errorCount)
+	if errorCount > 0 {
+		return fmt.Errorf("migrate: completed with %d errors", errorCount)
+	}
 	return nil
 }
