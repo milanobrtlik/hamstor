@@ -250,6 +250,7 @@ func (n *HamstorNode) Create(ctx context.Context, name string, flags uint32, mod
 	handle := &HamstorHandle{
 		hfs:     n.hfs,
 		inodeID: newID,
+		inode:   node,
 		isNew:   true,
 	}
 
@@ -270,6 +271,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 	handle := &HamstorHandle{
 		hfs:      n.hfs,
 		inodeID:  n.inodeID,
+		inode:    &n.Inode,
 		s3Key:    meta.S3Key,
 		fileSize: meta.Size,
 	}
