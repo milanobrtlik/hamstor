@@ -52,13 +52,37 @@ func main() {
 	compactRatio := flag.Float64("compact-ratio", 0.5, "dead space ratio threshold for volume compaction")
 	flag.Parse()
 
+	// Accept flags on either side of the subcommand. Go's flag package stops at
+	// the first non-flag argument, so `hamstor gc --bucket x` used to parse no
+	// flags at all: --bucket was silently ignored and the run died on an empty
+	// bucket with a bare usage dump. Only --dry-run worked there, via a special
+	// case, which made the trap worse — one flag appeared to work, implying the
+	// rest did too. Re-parse whatever follows the subcommand so both orders mean
+	// the same thing.
+	// Collect the subcommand words, parsing flags wherever they appear. Go's
+	// flag package stops at the first non-flag argument, so each positional word
+	// ("cache", then "stats") ends a parse and the rest must be handed back in.
+	// Without this, `hamstor gc --bucket x` parsed no flags at all: --bucket was
+	// silently ignored and the run died on an empty bucket with a bare usage
+	// dump. Only --dry-run worked, via a special case, which made the trap worse
+	// — one flag appearing to work implies the rest do.
 	subcmd := ""
-	if args := flag.Args(); len(args) > 0 {
-		subcmd = args[0]
-		for _, a := range args[1:] {
-			if a == "--dry-run" || a == "-dry-run" {
-				*dryRun = true
-			}
+	subArgs := []string{}
+	for rest := flag.Args(); len(rest) > 0; rest = flag.Args() {
+		if subcmd == "" {
+			subcmd = rest[0]
+		} else {
+			subArgs = append(subArgs, rest[0])
+		}
+		rest = rest[1:]
+		if len(rest) == 0 {
+			break
+		}
+		// Parse consumes any flags now at the front and stops at the next
+		// positional word, which the loop then takes. ExitOnError: an unknown
+		// flag reports itself instead of being dropped.
+		if err := flag.CommandLine.Parse(rest); err != nil {
+			log.Fatalf("hamstor: %v", err)
 		}
 	}
 
@@ -74,7 +98,7 @@ func main() {
 		case "fsck":
 			runFsck(*dbPath)
 		case "cache":
-			runCacheCmd(*cacheDir, *cacheSizeGB, flag.Args()[1:])
+			runCacheCmd(*cacheDir, *cacheSizeGB, subArgs)
 		}
 		return
 	}

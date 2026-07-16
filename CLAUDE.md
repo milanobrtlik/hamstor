@@ -22,6 +22,8 @@ go vet ./...            # Lint
 ./hamstor restore       # Restore DB from S3 via Litestream
 ```
 
+Flags work on either side of the subcommand (`hamstor gc --bucket x` and `hamstor --bucket x gc` are equivalent) — `main` re-parses around each positional word, because Go's `flag` package otherwise stops at the subcommand and silently ignores everything after it.
+
 Build embeds S3 credentials and passphrase via ldflags from `.env` (see `.env.example`).
 
 Tests requiring S3 (upload, download, GC, range reads) need credentials from `.env.test` (`source .env.test` before `go test`) and a reachable S3 endpoint — by default a local Garage on `http://localhost:3900` with the `hamstor` bucket. `testutil.RequireS3` probes both and calls `t.Skip` when either is missing, so an unconfigured checkout skips those tests in milliseconds instead of failing after ~30s of SDK retries.
