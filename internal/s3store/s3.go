@@ -151,7 +151,14 @@ func (s *Store) Download(ctx context.Context, key string) ([]byte, error) {
 }
 
 // DownloadRange downloads a byte range from S3 using the Range header.
+// It requires the response to contain exactly `length` bytes: a short read
+// (range partially past EOF, a truncating proxy/CDN, or an object shorter than
+// the DB-recorded needle bounds) is treated as a retryable error rather than
+// silently serving or persisting truncated data.
 func (s *Store) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	if length <= 0 {
+		return nil, nil
+	}
 	rangeStr := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 	var result []byte
 	err := retry(ctx, "download-range "+key, func() error {
@@ -167,6 +174,9 @@ func (s *Store) DownloadRange(ctx context.Context, key string, offset, length in
 		data, err := io.ReadAll(out.Body)
 		if err != nil {
 			return fmt.Errorf("s3store: read range body %s: %w", key, err)
+		}
+		if int64(len(data)) != length {
+			return fmt.Errorf("s3store: short range read %s [%s]: got %d want %d", key, rangeStr, len(data), length)
 		}
 		result = data
 		return nil
