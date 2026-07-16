@@ -50,8 +50,9 @@ type HamstorHandle struct {
 	released bool
 
 	// Chunk prefetch coordination
-	prefetching   sync.Map     // int64 -> bool: chunks currently being fetched
-	prefetchSem   chan struct{} // limits concurrent prefetch goroutines
+	prefetching    sync.Map           // int64 -> bool: chunks currently being fetched
+	prefetchSem    chan struct{}      // limits concurrent prefetch goroutines
+	prefetchCtx    context.Context    // shared context for all prefetch goroutines
 	cancelPrefetch context.CancelFunc // cancels background prefetch goroutines
 
 	// Streaming mode (multimedia files)
@@ -347,18 +348,19 @@ func (h *HamstorHandle) prefetchChunks(startIndex int64, count int) {
 	hfs := h.hfs
 	fileSize := h.fileSize
 
-	// Lazy init semaphore and cancel context (max 2 concurrent prefetches)
+	// Lazy init semaphore and cancel context (max 2 concurrent prefetches).
+	// The context is created ONCE per handle and reused for every prefetch
+	// batch, so Release()'s single cancelPrefetch() call reliably aborts every
+	// in-flight prefetch goroutine the handle ever launched. (Previously a fresh
+	// context+cancel was created on every read, dropping earlier CancelFuncs and
+	// leaking goroutines that could no longer be cancelled.)
 	if h.prefetchSem == nil {
 		h.prefetchSem = make(chan struct{}, 2)
 	}
-	var prefetchCtx context.Context
 	if h.cancelPrefetch == nil {
-		prefetchCtx, h.cancelPrefetch = context.WithCancel(context.Background())
-	} else {
-		// Recreate context from existing cancel (it may be cancelled already)
-		prefetchCtx, h.cancelPrefetch = context.WithCancel(context.Background())
+		h.prefetchCtx, h.cancelPrefetch = context.WithCancel(context.Background())
 	}
-	ctx := prefetchCtx
+	ctx := h.prefetchCtx
 
 	for i := 0; i < count; i++ {
 		ci := startIndex + int64(i)
@@ -398,6 +400,26 @@ func (h *HamstorHandle) prefetchChunks(startIndex int64, count int) {
 }
 
 func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	// Clamp clean (non-dirty) reads to the logical size. A truncate that shrank
+	// the inode may not have rewritten the backing object (e.g. truncate() on a
+	// path with no open write handle), so the cache file / buffer can hold stale
+	// bytes past EOF; clamping here serves the correct truncated view. For dirty
+	// handles the buffer/spill length is authoritative (writes may have extended
+	// past fileSize), so no clamp is applied.
+	clampLen := func(n int) int {
+		if h.dirty {
+			return n
+		}
+		avail := h.fileSize - off
+		if avail < 0 {
+			avail = 0 // read starts past EOF — return nothing
+		}
+		if int64(n) > avail {
+			return int(avail)
+		}
+		return n
+	}
+
 	// Read from spill file
 	if h.spillFile != nil {
 		if off >= h.spillSize {
@@ -410,7 +432,7 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 		if err != nil && err != io.EOF {
 			return nil, syscall.EIO
 		}
-		return fuse.ReadResultData(dest[:n]), 0
+		return fuse.ReadResultData(dest[:clampLen(n)]), 0
 	}
 
 	// Read from cache file
@@ -423,7 +445,7 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 			log.Printf("hamstor: cache read failed for inode %d: %v", h.inodeID, err)
 			return nil, syscall.EIO
 		}
-		return fuse.ReadResultData(dest[:n]), 0
+		return fuse.ReadResultData(dest[:clampLen(n)]), 0
 	}
 
 	// Read from in-memory buffer
@@ -434,7 +456,18 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 	if end > int64(len(h.buf)) {
 		end = int64(len(h.buf))
 	}
-	return fuse.ReadResultData(h.buf[off:end]), 0
+	if !h.dirty && h.fileSize >= 0 && end > h.fileSize {
+		end = h.fileSize
+	}
+	if end <= off {
+		return fuse.ReadResultData(nil), 0
+	}
+	// Return a copy, not a slice aliasing h.buf: go-fuse copies the bytes out
+	// after Read releases h.mu, which could race a concurrent Write that
+	// reallocates or mutates h.buf and tear the in-flight read.
+	out := make([]byte, end-off)
+	copy(out, h.buf[off:end])
+	return fuse.ReadResultData(out), 0
 }
 
 // --- Streaming mode (multimedia) ---
@@ -713,13 +746,11 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 
 	// Small files: stage to disk, commit immediately, volume builder packs later.
 	if bufSize > 0 && bufSize <= int64(volume.MaxNeedleSize) && canVolumePack {
-		// Clean up old storage references before overwriting
+		// Clean up the old standalone S3 object before overwriting. The old
+		// volume needle (if any) is accounted for atomically by CommitInode
+		// below, which decrements the previously-referenced volume in the same
+		// transaction that clears the inode's vol columns.
 		if oldMeta, metaErr := h.hfs.DB.GetInode(h.inodeID); metaErr == nil {
-			if oldMeta.VolS3Key != "" {
-				if markErr := h.hfs.DB.MarkNeedleDead(h.inodeID, oldMeta.VolS3Key); markErr != nil {
-					log.Printf("hamstor: stage overwrite mark needle dead inode %d: %v", h.inodeID, markErr)
-				}
-			}
 			if oldMeta.S3Key != "" {
 				if delErr := h.hfs.Store.Delete(context.Background(), oldMeta.S3Key); delErr != nil {
 					log.Printf("hamstor: stage overwrite delete old key %s: %v", oldMeta.S3Key, delErr)
@@ -801,7 +832,6 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		return toErrno(err)
 	}
 	oldKey := meta.S3Key
-	oldVolS3Key := meta.VolS3Key
 	fileName := meta.Name
 
 	newKey := s3store.NewKey()
@@ -809,7 +839,18 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	hfs := h.hfs
 	inodeID := h.inodeID
 
+	// Serialize per-handle uploads: if a previous Flush launched an upload that
+	// is still running, wait for it before reusing the shared uploadDone/uploadErr
+	// fields. Otherwise two goroutines race on those fields (lost error, premature
+	// channel reuse). The upload goroutine never takes h.mu, so releasing it here
+	// to wait cannot deadlock.
+	if prev := h.uploadDone; prev != nil {
+		h.mu.Unlock()
+		<-prev
+		h.mu.Lock()
+	}
 	h.uploadDone = make(chan struct{})
+	h.uploadErr = nil
 	hfs.InflightUploads.Add(1)
 
 	go func() {
@@ -850,6 +891,15 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 				return
 			}
 			uploadData = encrypted
+			// Release the plaintext buffer now that the ciphertext exists, so
+			// peak heap during an encrypted upload is ~one full-size buffer
+			// instead of two (plaintext + ciphertext held simultaneously). The
+			// plaintext is only retained for image thumbnail generation; for
+			// non-images the best-effort cache-after-write is skipped and the
+			// data is re-cached on the next read.
+			if !thumb.IsImageExt(fileName) {
+				plainBuf = nil
+			}
 		}
 
 		var uploadErr error
@@ -878,13 +928,11 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			hfs.TestCrashBeforeCommit()
 		}
 
-		// Clean up old volume reference before CommitInode clears vol columns
-		if oldVolS3Key != "" {
-			if markErr := hfs.DB.MarkNeedleDead(inodeID, oldVolS3Key); markErr != nil {
-				log.Printf("hamstor: async upload mark needle dead inode %d: %v", inodeID, markErr)
-			}
-		}
-
+		// CommitInode atomically decrements the volume the inode currently
+		// references (re-read inside its transaction) and clears the vol columns,
+		// so the old needle's accounting and the inode's new pointer commit or
+		// roll back together — no crash window can leave a referenced volume at
+		// live_count=0 for GC to delete.
 		committed, err := hfs.DB.CommitInode(inodeID, newKey, bufSize)
 		if err != nil {
 			log.Printf("hamstor: async commit failed: %v", err)
@@ -963,7 +1011,11 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 		meta, err := h.hfs.DB.GetInode(h.inodeID)
 		if err == nil && meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 {
 			if err := h.hfs.VolumeBuilder.FlushInode(h.inodeID); err != nil {
-				// If the builder is actively packing this file, wait and retry.
+				// If the builder is actively packing this file, wait for it to
+				// finish, then re-drive the flush ourselves. Returning EIO just
+				// because the builder happened to hold the .packing claim would
+				// wrongly report a durability failure for data that is in-flight
+				// and will succeed.
 				if errors.Is(err, volume.ErrBeingPacked) {
 					backoff := 200 * time.Millisecond
 					for attempt := 0; attempt < 10; attempt++ {
@@ -975,6 +1027,21 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 						backoff *= 2
 						if backoff > 2*time.Second {
 							backoff = 2 * time.Second
+						}
+					}
+					// Builder released the claim but the inode is still not
+					// durable (it was superseded by a concurrent overwrite, or
+					// the builder restored it). Re-drive the flush so we either
+					// pack it now or observe genuine durability.
+					if m, dbErr := h.hfs.DB.GetInode(h.inodeID); dbErr == nil && (m.VolS3Key != "" || m.S3Key != "") {
+						return 0
+					}
+					if err2 := h.hfs.VolumeBuilder.FlushInode(h.inodeID); err2 == nil {
+						return 0
+					} else if errors.Is(err2, volume.ErrBeingPacked) {
+						// Still racing the builder; the data is in-flight, not lost.
+						if m, dbErr := h.hfs.DB.GetInode(h.inodeID); dbErr == nil && (m.VolS3Key != "" || m.S3Key != "") {
+							return 0
 						}
 					}
 				}

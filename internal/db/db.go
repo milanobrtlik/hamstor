@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"syscall"
@@ -9,6 +10,15 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// isBusy reports whether err is a transient SQLite lock contention error.
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "SQLITE_BUSY") || strings.Contains(s, "database is locked")
+}
 
 const schema = `
 CREATE TABLE IF NOT EXISTS inodes (
@@ -303,7 +313,7 @@ func (d *DB) ListAllChildren(parentID int64) ([]InodeMeta, error) {
 
 func (d *DB) GetOrphanedInodes() ([]InodeMeta, error) {
 	rows, err := d.db.Query(
-		"SELECT "+inodeCols+" FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)",
+		"SELECT " + inodeCols + " FROM inodes WHERE parent_id > 0 AND parent_id NOT IN (SELECT id FROM inodes)",
 	)
 	if err != nil {
 		return nil, err
@@ -350,24 +360,67 @@ func (d *DB) InsertSymlink(parentID int64, name string, target string, uid, gid 
 	return res.LastInsertId()
 }
 
+// CommitInode marks an inode committed, pointing it at s3Key (which may be ""
+// for a staged needle) with the given size. If the inode currently references a
+// volume needle, that volume's live_size/live_count are decremented in the SAME
+// transaction so a crash can never leave a volume's live_count dropped while the
+// inode still references it (which GetEmptyVolumes + GC would otherwise treat as
+// deletable, destroying still-referenced data). The volume reference is re-read
+// inside the transaction rather than trusted from a caller snapshot, so it stays
+// correct even if the volume builder packed the inode during an async upload.
+// Returns whether the inode still existed (RowsAffected > 0).
 func (d *DB) CommitInode(id int64, s3Key string, size int64) (bool, error) {
 	now := time.Now().UnixNano()
-	var res sql.Result
+	var committed bool
 	var err error
 	for attempt := range 5 {
-		res, err = d.db.Exec(
-			"UPDATE inodes SET s3_key = ?, size = ?, status = 'committed', mtime_ns = ?, vol_s3_key = NULL, vol_offset = NULL, vol_size = NULL WHERE id = ?",
-			s3Key, size, now, id,
-		)
+		committed, err = d.commitInodeTx(id, s3Key, size, now)
 		if err == nil {
-			break
+			return committed, nil
 		}
-		if !strings.Contains(err.Error(), "SQLITE_BUSY") && !strings.Contains(err.Error(), "database is locked") {
+		if !isBusy(err) {
 			return false, err
 		}
 		time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond)
 	}
+	return false, err
+}
+
+func (d *DB) commitInodeTx(id int64, s3Key string, size, now int64) (bool, error) {
+	tx, err := d.db.Begin()
 	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	// Decrement whichever volume currently owns this needle (read inside the tx).
+	var curVolKey sql.NullString
+	var volSize int64
+	err = tx.QueryRow("SELECT vol_s3_key, COALESCE(vol_size, 0) FROM inodes WHERE id = ?", id).Scan(&curVolKey, &volSize)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Inode was deleted (e.g. unlinked during an async upload). Nothing to commit.
+		return false, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+	if curVolKey.Valid && curVolKey.String != "" {
+		if _, err := tx.Exec(
+			"UPDATE volumes SET live_size = MAX(live_size - ?, 0), live_count = MAX(live_count - 1, 0) WHERE s3_key = ?",
+			volSize, curVolKey.String,
+		); err != nil {
+			return false, err
+		}
+	}
+
+	res, err := tx.Exec(
+		"UPDATE inodes SET s3_key = ?, size = ?, status = 'committed', mtime_ns = ?, vol_s3_key = NULL, vol_offset = NULL, vol_size = NULL WHERE id = ?",
+		s3Key, size, now, id,
+	)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
@@ -400,7 +453,7 @@ func (d *DB) RenameInode(id int64, newParentID int64, newName string) error {
 
 func (d *DB) GetPending() ([]InodeMeta, error) {
 	rows, err := d.db.Query(
-		"SELECT "+inodeCols+" FROM inodes WHERE status = 'pending'",
+		"SELECT " + inodeCols + " FROM inodes WHERE status = 'pending'",
 	)
 	if err != nil {
 		return nil, err
@@ -505,7 +558,6 @@ func (d *DB) SetVolumeStatus(s3Key string, status string) error {
 	return err
 }
 
-
 // GetOpenVolumes returns all volumes with status 'open'.
 func (d *DB) GetOpenVolumes() ([]VolumeRecord, error) {
 	return d.queryVolumes("SELECT s3_key, total_size, live_size, needle_count, live_count, status, created_ns FROM volumes WHERE status = 'open'")
@@ -564,35 +616,13 @@ func (d *DB) NeedlesInVolume(volS3Key string) ([]InodeMeta, error) {
 	return scanInodeRows(rows)
 }
 
-// MarkNeedleDead updates volume stats when a needle is deleted.
-// Must be called before DeleteInode.
-func (d *DB) MarkNeedleDead(inodeID int64, volS3Key string) error {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	var volSize int64
-	err = tx.QueryRow("SELECT COALESCE(vol_size, 0) FROM inodes WHERE id = ?", inodeID).Scan(&volSize)
-	if err != nil {
-		return fmt.Errorf("mark needle dead: get vol_size: %w", err)
-	}
-
-	_, err = tx.Exec(
-		"UPDATE volumes SET live_size = MAX(live_size - ?, 0), live_count = MAX(live_count - 1, 0) WHERE s3_key = ?",
-		volSize, volS3Key,
-	)
-	if err != nil {
-		return fmt.Errorf("mark needle dead: update volume: %w", err)
-	}
-
-	return tx.Commit()
-}
-
 // DeleteInodeWithVolume atomically decrements volume stats and deletes the inode
-// in a single transaction. This prevents crashes between MarkNeedleDead and
-// DeleteInode from corrupting volume live_count.
+// in a single transaction. The volume reference and needle size are re-read from
+// the inode row INSIDE the transaction rather than trusted from the caller's
+// snapshot: a concurrent overwrite (CommitInode) may have already moved the
+// needle off this volume and decremented its stats, in which case the row now
+// has a NULL vol_s3_key and we must not decrement a second time. The volS3Key
+// parameter is retained for source compatibility but is intentionally ignored.
 func (d *DB) DeleteInodeWithVolume(id int64, volS3Key string) error {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -600,17 +630,21 @@ func (d *DB) DeleteInodeWithVolume(id int64, volS3Key string) error {
 	}
 	defer tx.Rollback()
 
-	if volS3Key != "" {
-		var volSize int64
-		err = tx.QueryRow("SELECT COALESCE(vol_size, 0) FROM inodes WHERE id = ?", id).Scan(&volSize)
-		if err != nil {
-			return fmt.Errorf("delete inode with volume: get vol_size: %w", err)
-		}
-		_, err = tx.Exec(
+	var curVolKey sql.NullString
+	var volSize int64
+	err = tx.QueryRow("SELECT vol_s3_key, COALESCE(vol_size, 0) FROM inodes WHERE id = ?", id).Scan(&curVolKey, &volSize)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Inode already gone — nothing to delete or decrement.
+		return tx.Commit()
+	}
+	if err != nil {
+		return fmt.Errorf("delete inode with volume: get vol ref: %w", err)
+	}
+	if curVolKey.Valid && curVolKey.String != "" {
+		if _, err = tx.Exec(
 			"UPDATE volumes SET live_size = MAX(live_size - ?, 0), live_count = MAX(live_count - 1, 0) WHERE s3_key = ?",
-			volSize, volS3Key,
-		)
-		if err != nil {
+			volSize, curVolKey.String,
+		); err != nil {
 			return fmt.Errorf("delete inode with volume: update volume: %w", err)
 		}
 	}
@@ -680,9 +714,11 @@ func (d *DB) CommitNeedlesToVolume(volS3Key string, totalSize int64, needles []N
 		}
 	}
 
+	// needle_count = physical needles written into the object (matches total_size,
+	// which counts all bytes including born-dead ones); live_count = still-live.
 	_, err = tx.Exec(
 		"UPDATE volumes SET status = 'sealed', total_size = ?, live_size = ?, needle_count = ?, live_count = ? WHERE s3_key = ?",
-		totalSize, liveSize, committed, committed, volS3Key,
+		totalSize, liveSize, len(needles), committed, volS3Key,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("seal volume: %w", err)
