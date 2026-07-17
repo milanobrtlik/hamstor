@@ -159,11 +159,11 @@ func TestDeleteInodeWithVolumeNoDoubleDecrement(t *testing.T) {
 func TestReadLoadedClampsToLogicalSize(t *testing.T) {
 	hfs := setupDBOnly(t)
 
-	h := &HamstorHandle{hfs: hfs, inodeID: 1}
-	h.buf = []byte("helloworld")
+	h := newHandle(hfs, 1, false)
+	h.st.buf = []byte("helloworld")
 	h.fileSize = 5 // logical size is smaller than the buffer
-	h.loaded = true
-	h.dirty = false
+	h.st.loaded = true
+	h.st.dirty = false
 
 	dest := make([]byte, 100)
 	res, errno := h.readLoaded(dest, 0)
@@ -187,7 +187,7 @@ func TestReadLoadedClampsToLogicalSize(t *testing.T) {
 
 	// A dirty handle is authoritative on its buffer length (writes may extend
 	// past fileSize), so no clamp is applied.
-	h.dirty = true
+	h.st.dirty = true
 	res, errno = h.readLoaded(dest, 0)
 	if errno != 0 {
 		t.Fatalf("dirty read errno %v", errno)
