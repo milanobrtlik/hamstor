@@ -161,7 +161,11 @@ func TestReadLoadedClampsToLogicalSize(t *testing.T) {
 
 	h := newHandle(hfs, 1, false)
 	h.st.buf = []byte("helloworld")
-	h.fileSize = 5 // logical size is smaller than the buffer
+	// The logical size is smaller than the buffer, and lives on the shared state:
+	// clamping to the handle's own fileSize would let a handle that opened when
+	// the file was shorter cut down what every other handle sees.
+	h.st.size = 5
+	h.fileSize = 5
 	h.st.loaded = true
 	h.st.dirty = false
 
@@ -185,8 +189,8 @@ func TestReadLoadedClampsToLogicalSize(t *testing.T) {
 		t.Fatalf("read past truncated EOF should be empty, got %q", string(got))
 	}
 
-	// A dirty handle is authoritative on its buffer length (writes may extend
-	// past fileSize), so no clamp is applied.
+	// A dirty state is authoritative on its buffer length (writes may extend
+	// past the stored size), so no clamp is applied.
 	h.st.dirty = true
 	res, errno = h.readLoaded(dest, 0)
 	if errno != 0 {

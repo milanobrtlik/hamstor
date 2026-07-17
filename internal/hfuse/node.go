@@ -267,11 +267,39 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		}
 	}()
 
+	writeFlags := uint32(syscall.O_WRONLY | syscall.O_RDWR | syscall.O_APPEND | syscall.O_TRUNC)
+
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
+	// The preload below reads from storage and clamps the SHARED buffer to
+	// meta.Size, so both must agree on which version of the file they mean. The
+	// meta read at the top of Open does not qualify: it was taken before the
+	// state was locked, and a sibling's flush in that window leaves it stale —
+	// short. The clamp then cuts the sibling's write off the end of the shared
+	// buffer, and the next append overwrites what is left of it. That is one
+	// silently lost line per race.
+	//
+	// So for write opens, settle the inode under the lock: wait out any in-flight
+	// upload (until it commits, the DB still names the key it is about to
+	// replace) and re-read. Once st.mu is held no sibling flush can intervene.
+	// Read-only opens skip this deliberately — they must not block behind an
+	// upload, and Read's streaming and chunked paths never touch the shared
+	// buffer anyway.
+	if flags&writeFlags != 0 {
+		if errno := st.awaitUpload(); errno != 0 {
+			return nil, 0, errno
+		}
+		m, err := n.hfs.DB.GetInode(n.inodeID)
+		if err != nil {
+			return nil, 0, toErrno(err)
+		}
+		meta = m
+		handle.s3Key = meta.S3Key
+		handle.fileSize = meta.Size
+	}
+
 	// Preload data for files opened in write mode
-	writeFlags := uint32(syscall.O_WRONLY | syscall.O_RDWR | syscall.O_APPEND | syscall.O_TRUNC)
 	hasData := meta.S3Key != "" || meta.VolS3Key != "" ||
 		(meta.Size > 0 && n.hfs.VolumeBuilder != nil)
 
@@ -299,6 +327,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		}
 		st.loaded = true
 		st.dirty = true
+		st.size = 0
 	} else if flags&writeFlags != 0 && hasData && !st.loaded {
 		if meta.S3Key != "" {
 			// Try cache first for write preload
@@ -387,6 +416,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			} else if int64(len(st.buf)) > meta.Size {
 				st.buf = st.buf[:meta.Size]
 			}
+			st.size = meta.Size
 		}
 	}
 
@@ -412,41 +442,36 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 
 // openPreloadStaged loads data from a staging file for write preloading.
 // Falls back to volume if the builder packed the file between GetInode and read.
+// openPreloadStaged loads a staged file's plaintext for the Open write preload.
+// Shares readStaged with ensureLoaded rather than repeating it: the staging file
+// moves under readers constantly and the retry logic that rides that out is
+// exactly what a second copy gets wrong.
 func (n *HamstorNode) openPreloadStaged(ctx context.Context) ([]byte, syscall.Errno) {
-	stagePath := n.hfs.VolumeBuilder.StagePath(n.inodeID)
-	data, err := os.ReadFile(stagePath)
-	if err != nil {
-		// Builder (.packing) or Fsync (.flushing) may have claimed the file.
-		for _, suffix := range []string{".packing", ".flushing"} {
-			if d, e := os.ReadFile(stagePath + suffix); e == nil {
-				data = d
-				err = nil
-				break
-			}
-		}
+	data, _, errno := n.hfs.readStaged(ctx, n.inodeID)
+	if errno != 0 {
+		return nil, errno
 	}
-	if err != nil {
-		// Staging file may have been packed by the builder. Re-read metadata.
-		meta2, metaErr := n.hfs.DB.GetInode(n.inodeID)
-		if metaErr != nil {
-			return nil, toErrno(metaErr)
-		}
-		if meta2.VolS3Key != "" {
-			data, err = n.hfs.Store.DownloadRange(ctx, meta2.VolS3Key, meta2.VolOffset, meta2.VolSize)
-			if err != nil {
-				return nil, toErrno(err)
-			}
-		} else {
-			log.Printf("hamstor: staged file read failed for inode %d: %v", n.inodeID, err)
-			return nil, syscall.EIO
-		}
-	}
-	if n.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
-		data, err = n.hfs.Encryptor.Decrypt(data)
+	if data == nil {
+		// Packed into a volume while we looked; read it back from there.
+		meta, err := n.hfs.DB.GetInode(n.inodeID)
 		if err != nil {
-			log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, err)
+			return nil, toErrno(err)
+		}
+		if meta.VolS3Key == "" {
 			return nil, syscall.EIO
 		}
+		d, dlErr := n.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
+		if dlErr != nil {
+			return nil, toErrno(dlErr)
+		}
+		if n.hfs.Encryptor != nil && crypto.IsEncrypted(d) {
+			d, dlErr = n.hfs.Encryptor.Decrypt(d)
+			if dlErr != nil {
+				log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, dlErr)
+				return nil, syscall.EIO
+			}
+		}
+		data = d
 	}
 	return data, 0
 }

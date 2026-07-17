@@ -1,11 +1,15 @@
 package hfuse
 
 import (
+	"context"
 	"io"
 	"log"
 	"os"
 	"sync"
 	"syscall"
+	"time"
+
+	"github.com/milan/hamstor/internal/crypto"
 )
 
 // uploadAttempt is one attempt to put an inode's contents into S3.
@@ -57,6 +61,18 @@ type inodeWrite struct {
 	loaded bool
 	isNew  bool
 
+	// size is the logical size of the loaded contents, and the only authority
+	// readLoaded may clamp a clean read to. The buffer or cache file can be
+	// longer than this — a truncate that shrank the inode does not rewrite the
+	// backing object — so the clamp cannot simply go away.
+	//
+	// It must live here rather than on the handle. HamstorHandle.fileSize is an
+	// open-time snapshot, and a handle that never loads the state itself (a
+	// sibling got there first) keeps that snapshot forever: reading through it
+	// would clamp everyone's contents down to whatever the file happened to be
+	// when it opened. Only meaningful while loaded is true.
+	size int64
+
 	// Spill file for large writes: when total size exceeds spillThreshold,
 	// contents live here instead of on the heap.
 	spillFile *os.File
@@ -99,6 +115,74 @@ type inodeWrite struct {
 	uploadRefs int // in-flight upload goroutines
 }
 
+// stagedReadAttempts bounds readStaged's retries. The transitions it rides out
+// are a rename and a DB commit apart, so a handful of short waits covers them;
+// beyond that something is genuinely wrong and EIO is the honest answer.
+const stagedReadAttempts = 5
+
+// readStaged reads a staged file's plaintext, returning it with the inode's
+// logical size. Returns (nil, 0, 0) when the file is no longer staged at all and
+// the caller should re-read the metadata — the builder has packed it into a
+// volume.
+//
+// The staging file moves under us constantly: the builder claims it by renaming
+// to <id>.packing (Fsync uses <id>.flushing), packs it, and removes the claim,
+// while a concurrent overwrite Flush writes a whole new file back at the
+// original path. Every one of those states is transient, so a single look that
+// misses is not evidence of anything — and giving up on it returns EIO for a
+// file whose data is sitting right there. Below TargetVolumeSize the builder
+// claims and restores on every notify, so an append-per-line workload runs this
+// gauntlet on every open.
+func (hfs *HamstorFS) readStaged(ctx context.Context, inodeID int64) ([]byte, int64, syscall.Errno) {
+	stagePath := hfs.VolumeBuilder.StagePath(inodeID)
+	var lastErr error
+	for attempt := 0; attempt < stagedReadAttempts; attempt++ {
+		meta, err := hfs.DB.GetInode(inodeID)
+		if err != nil {
+			return nil, 0, toErrno(err)
+		}
+		if meta.VolS3Key != "" || meta.S3Key != "" {
+			return nil, 0, 0 // no longer staged; caller re-reads and reloads
+		}
+		if meta.Size == 0 {
+			return []byte{}, 0, 0
+		}
+
+		// The bare path first: an overwrite that re-staged the file puts the
+		// newest data there, and it must win over any claim still lying around.
+		data, err := os.ReadFile(stagePath)
+		if err != nil {
+			// Claimed by the builder or by Fsync. Reading a claim is safe — the
+			// claimer only ever reads it.
+			for _, suffix := range []string{".packing", ".flushing"} {
+				if d, e := os.ReadFile(stagePath + suffix); e == nil {
+					data, err = d, nil
+					break
+				}
+			}
+		}
+		if err != nil {
+			// Nothing at any of the paths: the builder is mid-transition between
+			// removing its claim and committing the volume, or between our
+			// GetInode and an overwrite's rename. Both resolve in moments.
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Millisecond)
+			continue
+		}
+		if hfs.Encryptor != nil && crypto.IsEncrypted(data) {
+			data, err = hfs.Encryptor.Decrypt(data)
+			if err != nil {
+				log.Printf("hamstor: staged file decrypt failed for inode %d: %v", inodeID, err)
+				return nil, 0, syscall.EIO
+			}
+		}
+		return data, meta.Size, 0
+	}
+	log.Printf("hamstor: staged file read failed for inode %d after %d attempts: %v",
+		inodeID, stagedReadAttempts, lastErr)
+	return nil, 0, syscall.EIO
+}
+
 // truncateWriteState resizes an inode's shared contents to s, taking the lock
 // itself. A no-op when nothing is loaded: there is no buffer to correct, and the
 // DB size that Setattr writes is then the whole truth.
@@ -112,6 +196,7 @@ func truncateWriteState(st *inodeWrite, s int64) syscall.Errno {
 			return syscall.EIO
 		}
 		st.spillSize = s
+		st.size = s
 		st.dirty = true
 		return 0
 	}
@@ -138,6 +223,7 @@ func truncateWriteState(st *inodeWrite, s int64) syscall.Errno {
 			st.buf = append(st.buf, make([]byte, s-int64(len(st.buf)))...)
 		}
 		st.dirty = true
+		st.size = s
 	}
 	return 0
 }

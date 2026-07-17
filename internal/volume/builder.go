@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
 )
@@ -84,19 +86,48 @@ func (b *Builder) StagePath(inodeID int64) string {
 // restoreClaim returns a claimed staging file (claimPath, e.g. "<id>.packing"
 // or "<id>.flushing") to its original path, UNLESS a newer staging file already
 // exists there. A concurrent overwrite Flush writes a fresh staging file at
-// origPath (tmp+rename) and bumps the inode's mtime; blindly renaming the stale
-// claim back over it would clobber the newer data while the DB advertises the
-// new mtime/size — a silent lost write. In that case the stale claim is dropped
-// instead. (A small TOCTOU window remains between the stat and the rename, but
-// the mtime guard in CommitNeedlesToVolume rejects any residual stale commit.)
+// origPath (tmp+rename) and bumps the inode's mtime; renaming the stale claim
+// back over it would clobber the newer data while the DB advertises the new
+// mtime/size — a silent lost write. In that case the stale claim is dropped.
+//
+// The check and the rename MUST be one operation. A stat followed by a rename
+// leaves a window for the overwrite to land in between, and losing that race
+// costs real data: the stale claim replaces the newer staging file, the DB still
+// reports the newer size, and the next open reads a short buffer and appends
+// over the top of it. That is one silently lost write per race, and it is easy
+// to hit — a batch below TargetVolumeSize claims and restores every staged file
+// on every notify, so an append-per-line workload runs this constantly. The
+// mtime guard in CommitNeedlesToVolume is not a backstop for it: that guard
+// protects the volume commit, not the staging file.
+//
+// RENAME_NOREPLACE gives exactly the needed semantics atomically. If the kernel
+// or filesystem lacks it, fall back to stat+rename and accept the window rather
+// than strand the claim.
 func restoreClaim(claimPath, origPath string) {
-	if _, statErr := os.Stat(origPath); statErr == nil {
-		if err := os.Remove(claimPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("hamstor: volume builder drop stale claim %s: %v", claimPath, err)
+	err := unix.Renameat2(unix.AT_FDCWD, claimPath, unix.AT_FDCWD, origPath, unix.RENAME_NOREPLACE)
+	switch err {
+	case nil:
+		return
+	case unix.EEXIST, unix.ENOTEMPTY:
+		// A newer staging file is already there; our claim is stale.
+		if rmErr := os.Remove(claimPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("hamstor: volume builder drop stale claim %s: %v", claimPath, rmErr)
 		}
 		return
-	}
-	if err := os.Rename(claimPath, origPath); err != nil && !os.IsNotExist(err) {
+	case unix.ENOENT:
+		return // claim already gone
+	case unix.ENOSYS, unix.EINVAL:
+		// No RENAME_NOREPLACE here. Best effort, with the old window.
+		if _, statErr := os.Stat(origPath); statErr == nil {
+			if rmErr := os.Remove(claimPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("hamstor: volume builder drop stale claim %s: %v", claimPath, rmErr)
+			}
+			return
+		}
+		if rnErr := os.Rename(claimPath, origPath); rnErr != nil && !os.IsNotExist(rnErr) {
+			log.Printf("hamstor: volume builder restore %s: %v", claimPath, rnErr)
+		}
+	default:
 		log.Printf("hamstor: volume builder restore %s: %v", claimPath, err)
 	}
 }
