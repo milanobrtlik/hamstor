@@ -14,22 +14,24 @@ build:
 	go build -ldflags "$(LDFLAGS)" -o hamstor ./cmd/hamstor
 
 install: build
-	@printf '[Unit]\n\
-Description=Hamstor FUSE filesystem\n\
-After=network-online.target\n\
-Wants=network-online.target\n\
-\n\
-[Service]\n\
-Type=simple\n\
-ExecStartPre=-/bin/umount -l $(HAMSTOR_MOUNT)\n\
-ExecStartPre=/bin/mkdir -p $(HAMSTOR_MOUNT)\n\
-ExecStart=/usr/local/bin/hamstor --mount $(HAMSTOR_MOUNT) --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) --db /var/lib/hamstor/hamstor.db --uid $(shell id -u) --gid $(shell id -g)\n\
-ExecStop=/bin/umount $(HAMSTOR_MOUNT)\n\
-Restart=on-failure\n\
-RestartSec=5\n\
-\n\
-[Install]\n\
-WantedBy=multi-user.target\n' > hamstor.service
+	@{ \
+		printf '%s\n' '[Unit]'; \
+		printf '%s\n' 'Description=Hamstor FUSE filesystem'; \
+		printf '%s\n' 'After=network-online.target'; \
+		printf '%s\n' 'Wants=network-online.target'; \
+		printf '%s\n' ''; \
+		printf '%s\n' '[Service]'; \
+		printf '%s\n' 'Type=simple'; \
+		printf '%s\n' 'ExecStartPre=-/bin/umount -l $(HAMSTOR_MOUNT)'; \
+		printf '%s\n' 'ExecStartPre=/bin/mkdir -p $(HAMSTOR_MOUNT)'; \
+		printf '%s\n' 'ExecStart=/usr/local/bin/hamstor --mount $(HAMSTOR_MOUNT) --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) --db /var/lib/hamstor/hamstor.db --uid $(shell id -u) --gid $(shell id -g)'; \
+		printf '%s\n' 'ExecStop=/bin/umount $(HAMSTOR_MOUNT)'; \
+		printf '%s\n' 'Restart=on-failure'; \
+		printf '%s\n' 'RestartSec=5'; \
+		printf '%s\n' ''; \
+		printf '%s\n' '[Install]'; \
+		printf '%s\n' 'WantedBy=multi-user.target'; \
+	} > hamstor.service
 	sudo sh -c '\
 		systemctl stop hamstor 2>/dev/null; \
 		fusermount -uz $(HAMSTOR_MOUNT) 2>/dev/null; \
