@@ -80,7 +80,7 @@ func TestCrashBeforeCommit(t *testing.T) {
 	defer database2.Close()
 
 	// Run startup cleanup
-	if err := Cleanup(database2, hfs.Store); err != nil {
+	if err := Cleanup(database2, hfs.Store, ""); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 
@@ -144,7 +144,7 @@ func TestCrashHookInFlush(t *testing.T) {
 	}
 	defer database2.Close()
 
-	if err := Cleanup(database2, hfs.Store); err != nil {
+	if err := Cleanup(database2, hfs.Store, ""); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 

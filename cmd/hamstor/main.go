@@ -53,13 +53,6 @@ func main() {
 	compactRatio := flag.Float64("compact-ratio", 0.5, "dead space ratio threshold for volume compaction")
 	flag.Parse()
 
-	// Accept flags on either side of the subcommand. Go's flag package stops at
-	// the first non-flag argument, so `hamstor gc --bucket x` used to parse no
-	// flags at all: --bucket was silently ignored and the run died on an empty
-	// bucket with a bare usage dump. Only --dry-run worked there, via a special
-	// case, which made the trap worse — one flag appeared to work, implying the
-	// rest did too. Re-parse whatever follows the subcommand so both orders mean
-	// the same thing.
 	// Collect the subcommand words, parsing flags wherever they appear. Go's
 	// flag package stops at the first non-flag argument, so each positional word
 	// ("cache", then "stats") ends a parse and the rest must be handed back in.
@@ -208,14 +201,26 @@ func main() {
 		return
 	}
 
+	// pendingDir holds bytes from uploads that failed in an earlier run. Unlike
+	// spillDir it is never wiped: it is the only remaining copy of that data.
+	pendingDir := filepath.Join(filepath.Dir(*dbPath), "pending")
+	if err := os.MkdirAll(pendingDir, 0o755); err != nil {
+		log.Printf("hamstor: pending dir: %v (failed uploads will not be recoverable)", err)
+		pendingDir = ""
+	}
+
 	// Default: mount mode
 	// Order matters: CleanupVolumes removes incomplete volume records,
+	// RecoverPending re-uploads what it can BEFORE Cleanup deletes the rest,
 	// Cleanup deletes pending inodes (and their staging files become orphans),
 	// CleanupStagingDir removes orphaned staging files last.
 	if err := hfuse.CleanupVolumes(database, store); err != nil {
 		log.Printf("hamstor: volume cleanup: %v", err)
 	}
-	if err := hfuse.Cleanup(database, store); err != nil {
+	if err := hfuse.RecoverPending(database, store, pendingDir); err != nil {
+		log.Printf("hamstor: recover pending uploads: %v", err)
+	}
+	if err := hfuse.Cleanup(database, store, pendingDir); err != nil {
 		log.Fatalf("cleanup: %v", err)
 	}
 	stagingDir := filepath.Join(filepath.Dir(*dbPath), "staging")
@@ -277,6 +282,7 @@ func main() {
 		UploadSem:    make(chan struct{}, 32),
 		ThumbSem:     make(chan struct{}, 4),
 		SpillDir:     spillDir,
+		PendingDir:   pendingDir,
 		EntryTimeout: *entryTimeout,
 		AttrTimeout:  *entryTimeout,
 	}
