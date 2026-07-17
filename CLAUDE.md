@@ -37,7 +37,12 @@ Tests requiring S3 (upload, download, GC, range reads) need credentials from `.e
 
 **Read path:** Check disk cache → S3 range request (unencrypted) → full S3 download + decrypt → cache on disk.
 
-**Crash safety:** Files start as `status='pending'` in SQLite. On successful S3 upload they become `'committed'`. On startup, pending entries are cleaned up. GC removes orphaned S3 objects.
+**Crash safety:** Files start as `status='pending'` in SQLite. On successful S3 upload they become `'committed'`. On startup `RecoverPending` finishes uploads that failed in an earlier run, then `Cleanup` deletes the pending entries that are left. GC removes orphaned S3 objects.
+
+**Failed-upload recovery:** When an async upload fails, the bytes it meant to send are retained under `<db-dir>/pending/<inodeID>.<logicalSize>` and the inode stays `'pending'`. `RecoverPending` uploads them verbatim on the next start (they are already ciphertext under encryption, so it never needs the passphrase) and commits with the logical size from the filename — the stored object is longer than the file it represents when encrypted. Three rules hold this together, and breaking any one reintroduces silent data loss:
+- `<db-dir>/pending/` must **never** be wiped at startup the way `spill/` is; it is the only copy of that data.
+- `Cleanup` must skip pending inodes that still have retained bytes, and must run **after** `RecoverPending`.
+- A recovery attempt that cannot reach S3 leaves the file in place to retry, and never deletes it.
 
 ```
 cmd/hamstor/main.go        Entry point, wires everything together

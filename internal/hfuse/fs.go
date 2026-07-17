@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,12 @@ type HamstorFS struct {
 	// SpillDir is the directory for spill temp files (large writes).
 	// If empty, os.TempDir() is used.
 	SpillDir string
+
+	// PendingDir holds the bytes of uploads that failed, so a later boot can
+	// finish them (see retainPendingUpload / RecoverPending). Unlike SpillDir it
+	// must NOT be wiped at startup — it is the only copy of that data left.
+	// If empty, failed uploads are lost as before.
+	PendingDir string
 
 	// InflightUploads tracks async upload goroutines for graceful shutdown.
 	InflightUploads sync.WaitGroup
@@ -76,6 +83,50 @@ const FreeOSMemoryInterval = 50
 
 // MaybeFreeMem increments the upload counter and periodically calls
 // debug.FreeOSMemory() to reduce RSS after bulk operations.
+// retainPendingUpload saves the exact bytes an upload was about to send to S3,
+// so a later boot can finish it instead of the data being dropped. Without this
+// a single transient S3 error during a copy loses the file outright: `cp` has
+// already returned success, the inode stays 'pending', and the next startup's
+// Cleanup deletes it — the only trace being one line in the daemon log.
+//
+// The retained bytes are whatever was destined for the object verbatim, i.e.
+// ciphertext under encryption, so recovery can upload them without re-encrypting
+// (and without needing the passphrase to match this boot's).
+//
+// Exactly one of data / spillPath is used; spillPath is renamed in, since it
+// already holds the bytes and lives on the same filesystem. The logical size
+// rides in the filename because a pending inode's size column is still 0 and,
+// under encryption, the object is larger than the file it represents.
+// Reports whether the data was safely retained.
+func (hfs *HamstorFS) retainPendingUpload(inodeID, logicalSize int64, data []byte, spillPath string) bool {
+	if hfs.PendingDir == "" {
+		return false
+	}
+	dst := filepath.Join(hfs.PendingDir, fmt.Sprintf("%d.%d", inodeID, logicalSize))
+
+	if spillPath != "" {
+		if err := os.Rename(spillPath, dst); err != nil {
+			log.Printf("hamstor: retain failed upload for inode %d: %v", inodeID, err)
+			return false
+		}
+		return true
+	}
+
+	// tmp + rename so recovery never sees a half-written file.
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		os.Remove(tmp)
+		log.Printf("hamstor: retain failed upload for inode %d: %v", inodeID, err)
+		return false
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		log.Printf("hamstor: retain failed upload for inode %d: %v", inodeID, err)
+		return false
+	}
+	return true
+}
+
 // thumbJob is a pending thumbnail, referenced by path so a queued job costs a
 // few strings rather than a full image buffer.
 type thumbJob struct {

@@ -956,30 +956,49 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		}
 
 		var uploadErr error
+		// spillPath outlives uploadFile so a failed upload can retain the bytes;
+		// on success it is removed (or handed to the thumbnailer) as before.
+		spillPath := ""
 		if uploadFile != nil {
 			// Stream from spill file on disk — no file data on Go heap
 			uploadFile.Seek(0, io.SeekStart)
 			uploadErr = hfs.Store.UploadReader(uploadCtx, newKey, uploadFile, bufSize)
+			spillPath = uploadFile.Name()
 			uploadFile.Close()
-			if keepThumbSrc {
-				thumbSrc = uploadFile.Name()
-			} else {
-				os.Remove(uploadFile.Name())
-			}
 			uploadFile = nil
+			if uploadErr == nil {
+				if keepThumbSrc {
+					thumbSrc = spillPath
+				} else {
+					os.Remove(spillPath)
+				}
+				spillPath = ""
+			}
 		} else if uploadData != nil {
 			uploadErr = hfs.Store.Upload(uploadCtx, newKey, uploadData)
 		} else {
 			// Empty file
 			uploadErr = hfs.Store.Upload(uploadCtx, newKey, nil)
 		}
-		uploadData = nil
 		if uploadErr != nil {
-			log.Printf("hamstor: async upload failed: %v", uploadErr)
+			// Keep the data: cp has already reported success, so dropping it here
+			// loses the file with nothing but a log line to show for it. Retained
+			// bytes are re-uploaded by RecoverPending on the next start; the inode
+			// stays 'pending' until then, which is what makes it recoverable.
+			if bufSize > 0 && hfs.retainPendingUpload(inodeID, bufSize, uploadData, spillPath) {
+				log.Printf("hamstor: async upload failed for inode %d, data retained for retry on next start: %v", inodeID, uploadErr)
+			} else {
+				log.Printf("hamstor: async upload failed for inode %d, DATA LOST: %v", inodeID, uploadErr)
+				if spillPath != "" {
+					os.Remove(spillPath)
+				}
+			}
+			uploadData = nil
 			h.uploadErr = uploadErr
 			plainBuf = nil
 			return
 		}
+		uploadData = nil
 
 		if hfs.TestCrashBeforeCommit != nil {
 			hfs.TestCrashBeforeCommit()
