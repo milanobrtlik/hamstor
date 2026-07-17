@@ -174,6 +174,34 @@ func RecoverPending(d *db.DB, store *s3store.Store, pendingDir string) error {
 	return nil
 }
 
+// CheckStagedData returns committed files whose data is neither in S3 nor in the
+// staging directory — reads of these return EIO and no retry will fix it.
+//
+// A small file is committed the moment it is staged, so it is durable only on
+// local disk until the builder packs it. That is the documented trade for
+// bulk-copy throughput and is fine while the disk is there. It stops being fine
+// when the DB outlives the disk: restore the Litestream copy onto a fresh host
+// and these inodes claim to be committed while their bytes never left the old
+// machine. Surfacing them by name beats letting the user find out one EIO at a
+// time.
+//
+// Run after CleanupStagingDir, which normalizes interrupted claims back to plain
+// staging files, so a file mid-pack is not mistaken for a lost one.
+func CheckStagedData(d *db.DB, stagingDir string) ([]db.InodeMeta, error) {
+	staged, err := d.GetStagedInodes()
+	if err != nil {
+		return nil, err
+	}
+	var missing []db.InodeMeta
+	for _, meta := range staged {
+		matches, _ := filepath.Glob(filepath.Join(stagingDir, fmt.Sprintf("%d*", meta.ID)))
+		if len(matches) == 0 {
+			missing = append(missing, meta)
+		}
+	}
+	return missing, nil
+}
+
 // CleanupVolumes removes open (incomplete) volumes left by a crash.
 // Pending inodes referencing these volumes are cleaned up by Cleanup().
 func CleanupVolumes(d *db.DB, store *s3store.Store) error {

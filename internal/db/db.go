@@ -451,6 +451,23 @@ func (d *DB) RenameInode(id int64, newParentID int64, newName string) error {
 	return err
 }
 
+// GetStagedInodes returns committed files whose data is not in S3 yet, i.e.
+// those that depend on a local staging file. Callers pair this with the staging
+// directory to tell "waiting to be packed" apart from "data is gone".
+func (d *DB) GetStagedInodes() ([]InodeMeta, error) {
+	rows, err := d.db.Query(
+		"SELECT "+inodeCols+" FROM inodes WHERE status = 'committed'"+
+			" AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '')"+
+			" AND mode & ? = ? AND id > 1 AND size > 0",
+		uint32(syscall.S_IFMT), uint32(syscall.S_IFREG),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanInodeRows(rows)
+}
+
 func (d *DB) GetPending() ([]InodeMeta, error) {
 	rows, err := d.db.Query(
 		"SELECT " + inodeCols + " FROM inodes WHERE status = 'pending'",
@@ -903,10 +920,14 @@ func (d *DB) Fsck() (*FsckResult, error) {
 	if err := d.db.QueryRow("SELECT COUNT(*) FROM inodes WHERE status = 'pending'").Scan(&r.PendingInodes); err != nil {
 		return nil, fmt.Errorf("fsck pending: %w", err)
 	}
-	// Staged files: committed but data still in staging dir (not yet packed into a volume)
+	// Staged files: committed but data still in staging dir (not yet packed into
+	// a volume). Select regular files by masking with S_IFMT: the type lives in
+	// those 4 bits, it is not a set of independent flags. Testing
+	// "mode & S_IFLNK = 0" excludes regular files, because S_IFREG (0x8000) and
+	// S_IFLNK (0xA000) share a bit — this counter always reported 0.
 	if err := d.db.QueryRow(
-		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '') AND mode & ? = 0 AND mode & ? = 0 AND id > 1 AND size > 0",
-		uint32(syscall.S_IFDIR), uint32(syscall.S_IFLNK),
+		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '') AND mode & ? = ? AND id > 1 AND size > 0",
+		uint32(syscall.S_IFMT), uint32(syscall.S_IFREG),
 	).Scan(&r.StagedFiles); err != nil {
 		return nil, fmt.Errorf("fsck staged: %w", err)
 	}

@@ -109,6 +109,49 @@ func TestRecoverPendingUploadsRetainedBytes(t *testing.T) {
 	}
 }
 
+// TestCheckStagedDataFindsRegularFiles is the regression test for the file-type
+// mask: the staged query selected with "mode & S_IFLNK = 0", but S_IFREG
+// (0x8000) and S_IFLNK (0xA000) share a bit, so every regular file was filtered
+// out and the check reported nothing — including when the data was truly gone.
+// The type must be matched through S_IFMT.
+func TestCheckStagedDataFindsRegularFiles(t *testing.T) {
+	hfs, _ := setupTest(t)
+	stagingDir := t.TempDir()
+
+	// Committed, no S3 key, no staging file: unreadable.
+	lost, err := hfs.DB.InsertInode(1, "lost.txt", 0o100644, "pending")
+	if err != nil {
+		t.Fatalf("insert lost: %v", err)
+	}
+	if _, err := hfs.DB.CommitInode(lost, "", 8); err != nil {
+		t.Fatalf("commit lost: %v", err)
+	}
+
+	// Committed, no S3 key, but its bytes are staged: fine, awaiting packing.
+	staged, err := hfs.DB.InsertInode(1, "staged.txt", 0o100644, "pending")
+	if err != nil {
+		t.Fatalf("insert staged: %v", err)
+	}
+	if _, err := hfs.DB.CommitInode(staged, "", 8); err != nil {
+		t.Fatalf("commit staged: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, fmt.Sprintf("%d", staged)), []byte("contents"), 0o600); err != nil {
+		t.Fatalf("write staging file: %v", err)
+	}
+
+	missing, err := CheckStagedData(hfs.DB, stagingDir)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+
+	if len(missing) != 1 {
+		t.Fatalf("found %d unreadable files, want exactly 1 (regular files must not be filtered out by the type mask)", len(missing))
+	}
+	if missing[0].ID != lost {
+		t.Errorf("reported inode %d (%s), want the one with no staging file", missing[0].ID, missing[0].Name)
+	}
+}
+
 // TestRecoverPendingKeepsBytesWhenUploadFails verifies that a recovery attempt
 // that cannot reach S3 leaves the retained file alone to retry on the next
 // start, rather than dropping the only copy of the data.
