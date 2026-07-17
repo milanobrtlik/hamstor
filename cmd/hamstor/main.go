@@ -228,6 +228,23 @@ func main() {
 		log.Printf("hamstor: staging cleanup: %v", err)
 	}
 
+	// Committed files whose bytes are neither in S3 nor in staging read as EIO
+	// forever. The usual cause is a DB restored onto a host that does not have
+	// the original staging disk. Say so at mount time instead of letting it be
+	// discovered one failed read at a time.
+	if missing, err := hfuse.CheckStagedData(database, stagingDir); err != nil {
+		log.Printf("hamstor: staged data check: %v", err)
+	} else if len(missing) > 0 {
+		log.Printf("hamstor: WARNING: %d committed file(s) have no data in S3 and no staging file — reads will fail:", len(missing))
+		for i, meta := range missing {
+			if i == 10 {
+				log.Printf("hamstor:   ... and %d more (run `hamstor fsck` for the full list)", len(missing)-10)
+				break
+			}
+			log.Printf("hamstor:   unreadable: %s (inode %d, %d bytes)", meta.Name, meta.ID, meta.Size)
+		}
+	}
+
 	// Fix ownership of root inode and any legacy uid=0/gid=0 inodes
 	defaultUid := uint32(*ownerUid)
 	defaultGid := uint32(*ownerGid)
@@ -415,14 +432,33 @@ func runFsck(dbPath string) {
 		log.Fatalf("fsck: %v", err)
 	}
 
+	// A staged file is only fine while its bytes are on this disk. Check rather
+	// than assume: reporting "staged files will be packed into volumes" for an
+	// inode whose staging file does not exist calls permanent data loss OK.
+	stagingDir := filepath.Join(filepath.Dir(dbPath), "staging")
+	missing, err := hfuse.CheckStagedData(database, stagingDir)
+	if err != nil {
+		log.Fatalf("fsck: staged data check: %v", err)
+	}
+
 	fmt.Printf("fsck results:\n")
 	fmt.Printf("  total inodes:       %d\n", result.TotalInodes)
 	fmt.Printf("  orphaned inodes:    %d\n", result.OrphanedInodes)
 	fmt.Printf("  pending inodes:     %d\n", result.PendingInodes)
-	fmt.Printf("  staged files:       %d\n", result.StagedFiles)
+	fmt.Printf("  staged files:       %d\n", result.StagedFiles-len(missing))
+	fmt.Printf("  unreadable files:   %d\n", len(missing))
 	fmt.Printf("  sealed volumes:     %d\n", result.VolumeCount)
 	fmt.Printf("  volume mismatches:  %d\n", result.VolumeMismatches)
 
+	if len(missing) > 0 {
+		fmt.Println("\n  These files are committed but their data is neither in S3 nor in")
+		fmt.Printf("  %s — reads return EIO and no retry will fix it:\n", stagingDir)
+		for _, meta := range missing {
+			fmt.Printf("    %s (inode %d, %d bytes)\n", meta.Name, meta.ID, meta.Size)
+		}
+		fmt.Println("\n  status: ISSUES FOUND (unreadable files)")
+		os.Exit(1)
+	}
 	if result.OrphanedInodes > 0 || result.PendingInodes > 0 {
 		fmt.Println("  status: ISSUES FOUND (run gc to clean up)")
 		os.Exit(1)
