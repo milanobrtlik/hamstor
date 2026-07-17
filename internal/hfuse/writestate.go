@@ -73,13 +73,25 @@ type inodeWrite struct {
 	// upload is about to replace.
 	cur *uploadAttempt
 
-	// poisoned is set when an upload attempt failed. The bytes it meant to send
-	// are retained under <db-dir>/pending/ and the inode stays 'pending', so the
-	// retained copy is the only surviving one — anything that reads the inode
-	// back now would see a pending row with size 0, load an empty buffer, and a
-	// later commit would flip the status to 'committed', at which point
-	// RecoverPending deletes the retained bytes as stale. Failing loudly instead
-	// is the only way to keep that copy alive until the next start recovers it.
+	// poisoned is set when an upload attempt failed, and makes every later
+	// operation on this inode return EIO.
+	//
+	// It matters most when the bytes were retained under <db-dir>/pending/ (see
+	// retainPendingUpload): the inode then stays 'pending' and the retained copy
+	// is the only surviving one. Without poisoning, a sibling handle reading the
+	// inode back sees a pending row with size 0, loads an empty buffer, and its
+	// commit flips the status to 'committed' — at which point RecoverPending
+	// deletes the retained bytes as stale (cleanup.go). One transient S3 error
+	// plus one open handle would destroy the file outright. This is the one place
+	// where failing loudly beats merging.
+	//
+	// It dies with the state, which is fine for the case above: a 'pending' inode
+	// is invisible to LookupChild, so once every handle closes there is no way to
+	// reach the file again until RecoverPending finishes the upload on the next
+	// start.
+	//
+	// Not every poisoning path retains bytes — a GetInode failure in flushAsync
+	// has nothing to retain and simply loses them, reporting EIO to close(2).
 	poisoned error
 
 	// handleRefs and uploadRefs are guarded by HamstorFS.writeMu, NOT by mu.
