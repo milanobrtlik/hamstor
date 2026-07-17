@@ -46,6 +46,13 @@ type HamstorFS struct {
 	// InflightUploads tracks async upload goroutines for graceful shutdown.
 	InflightUploads sync.WaitGroup
 
+	// writeStates holds the per-inode write state shared by every open handle
+	// (see inodeWrite). writeMu guards the map and the reference counts in it,
+	// and nothing else — it is a leaf lock, never held across inodeWrite.mu, a
+	// syscall, S3 or the DB.
+	writeMu     sync.Mutex
+	writeStates map[int64]*inodeWrite
+
 	// UploadSem limits concurrent async S3 uploads.
 	UploadSem chan struct{}
 

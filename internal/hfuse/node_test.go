@@ -291,39 +291,35 @@ func TestSetattrTruncation(t *testing.T) {
 		t.Fatalf("insert file: %v", err)
 	}
 
-	handle := &HamstorHandle{
-		hfs:     hfs,
-		inodeID: fileID,
-		isNew:   true,
-	}
+	handle := newHandle(hfs, fileID, true)
 
 	// Write some data
 	ctx := context.Background()
 	handle.Write(ctx, []byte("hello world, this is test data"), 0)
 
 	// Truncate via buffer
-	if handle.buf == nil {
+	if handle.st.buf == nil {
 		t.Fatal("expected buf to be set")
 	}
-	origLen := len(handle.buf)
+	origLen := len(handle.st.buf)
 	if origLen == 0 {
 		t.Fatal("expected non-empty buf")
 	}
 
 	// Simulate Setattr truncation
-	handle.mu.Lock()
+	handle.st.mu.Lock()
 	newSize := int64(5)
-	if newSize < int64(len(handle.buf)) {
-		handle.buf = handle.buf[:newSize]
+	if newSize < int64(len(handle.st.buf)) {
+		handle.st.buf = handle.st.buf[:newSize]
 	}
-	handle.dirty = true
-	handle.mu.Unlock()
+	handle.st.dirty = true
+	handle.st.mu.Unlock()
 
-	if len(handle.buf) != 5 {
-		t.Fatalf("expected buf len 5, got %d", len(handle.buf))
+	if len(handle.st.buf) != 5 {
+		t.Fatalf("expected buf len 5, got %d", len(handle.st.buf))
 	}
-	if string(handle.buf) != "hello" {
-		t.Fatalf("expected 'hello', got %q", string(handle.buf))
+	if string(handle.st.buf) != "hello" {
+		t.Fatalf("expected 'hello', got %q", string(handle.st.buf))
 	}
 }
 
@@ -396,38 +392,34 @@ func TestSpillToDisk(t *testing.T) {
 		t.Fatalf("insert file: %v", err)
 	}
 
-	handle := &HamstorHandle{
-		hfs:     hfs,
-		inodeID: fileID,
-		isNew:   true,
-	}
+	handle := newHandle(hfs, fileID, true)
 	ctx := context.Background()
 
 	// Write small data first (stays in memory)
 	handle.Write(ctx, []byte("hello"), 0)
-	if handle.spillFile != nil {
+	if handle.st.spillFile != nil {
 		t.Fatal("small write should not spill")
 	}
-	if handle.buf == nil {
+	if handle.st.buf == nil {
 		t.Fatal("small write should be in buf")
 	}
 
 	// Write at a large offset to trigger spill
 	bigOffset := int64(spillThreshold + 1)
 	handle.Write(ctx, []byte("X"), bigOffset)
-	if handle.spillFile == nil {
+	if handle.st.spillFile == nil {
 		t.Fatal("large write should trigger spill to disk")
 	}
-	if handle.buf != nil {
+	if handle.st.buf != nil {
 		t.Fatal("buf should be nil after spill")
 	}
-	if handle.spillSize != bigOffset+1 {
-		t.Fatalf("spillSize: expected %d, got %d", bigOffset+1, handle.spillSize)
+	if handle.st.spillSize != bigOffset+1 {
+		t.Fatalf("spillSize: expected %d, got %d", bigOffset+1, handle.st.spillSize)
 	}
 
 	// Verify we can read back from spill file
 	data := make([]byte, 5)
-	n, err := handle.spillFile.ReadAt(data, 0)
+	n, err := handle.st.spillFile.ReadAt(data, 0)
 	if err != nil {
 		t.Fatalf("read spill: %v", err)
 	}
@@ -448,11 +440,7 @@ func TestSetattrSpillTruncation(t *testing.T) {
 		t.Fatalf("insert file: %v", err)
 	}
 
-	handle := &HamstorHandle{
-		hfs:     hfs,
-		inodeID: fileID,
-		isNew:   true,
-	}
+	handle := newHandle(hfs, fileID, true)
 	ctx := context.Background()
 
 	// Write enough to trigger spill
@@ -461,27 +449,27 @@ func TestSetattrSpillTruncation(t *testing.T) {
 		bigData[i] = byte(i % 256)
 	}
 	handle.Write(ctx, bigData, 0)
-	if handle.spillFile == nil {
+	if handle.st.spillFile == nil {
 		t.Fatal("should have spilled to disk")
 	}
 
-	originalSize := handle.spillSize
+	originalSize := handle.st.spillSize
 
 	// Truncate via the spill file (simulating Setattr)
-	handle.mu.Lock()
+	handle.st.mu.Lock()
 	newSize := int64(1024)
-	if err := handle.spillFile.Truncate(newSize); err != nil {
-		handle.mu.Unlock()
+	if err := handle.st.spillFile.Truncate(newSize); err != nil {
+		handle.st.mu.Unlock()
 		t.Fatalf("truncate spill: %v", err)
 	}
-	handle.spillSize = newSize
-	handle.dirty = true
-	handle.mu.Unlock()
+	handle.st.spillSize = newSize
+	handle.st.dirty = true
+	handle.st.mu.Unlock()
 
-	if handle.spillSize != 1024 {
-		t.Fatalf("expected spillSize 1024, got %d", handle.spillSize)
+	if handle.st.spillSize != 1024 {
+		t.Fatalf("expected spillSize 1024, got %d", handle.st.spillSize)
 	}
-	if handle.spillSize >= originalSize {
+	if handle.st.spillSize >= originalSize {
 		t.Fatal("truncation should have reduced size")
 	}
 

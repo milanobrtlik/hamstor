@@ -34,22 +34,30 @@ type HamstorHandle struct {
 	// once an async upload commits the real size. nil in tests that build a
 	// handle without a mounted tree; the notify is then skipped.
 	inode *fs.Inode
-	mu      sync.Mutex
-	buf     []byte // in-memory write buffer (small files)
-	dirty   bool
-	loaded  bool
-	isNew   bool
 
-	// Spill file for large writes: when total size exceeds spillThreshold,
-	// data is written to disk instead of keeping it all in memory.
-	spillFile *os.File
-	spillSize int64
+	// st is the file state shared with every other handle open on this inode:
+	// buffer, dirty/loaded flags, spill and cache files, upload attempts. It is
+	// never nil, and st.mu guards all of it — this handle has no lock of its
+	// own. Obtained from hfs.acquireWrite, dropped in Release.
+	st *inodeWrite
 
-	// Cache-backed read: when set, reads use ReadAt on this file
-	// instead of keeping the entire file in buf.
-	cacheFile *os.File
-	s3Key     string // S3 key at open time
-	fileSize  int64  // from DB metadata
+	s3Key string // S3 key at open time
+	// fileSize is this handle's view of the logical size, taken at open time and
+	// refreshed whenever this handle loads. Under sharing it is deliberately a
+	// per-handle view of shared data: readChunked/readStreaming need a size that
+	// matches the s3Key they were opened against. readLoaded only clamps to it
+	// for clean reads, and any write or truncate sets st.dirty, so a stale
+	// fileSize can never truncate a sibling's writes. Do not "simplify" this
+	// into the shared state without re-deriving that.
+	fileSize int64
+
+	// appendMode records O_APPEND from Open. The kernel computes append offsets
+	// from its cached st_size (attr timeout, 60s by default), so two appenders
+	// are handed the same stale offset and overwrite each other — a shared
+	// buffer alone does not fix that. Write ignores the kernel's offset for
+	// these handles and appends at the true shared end of file. Linux already
+	// ignores the offset for pwrite() on an O_APPEND fd, so this matches it.
+	appendMode bool
 
 	released bool
 
@@ -65,10 +73,6 @@ type HamstorHandle struct {
 	streamChunks    []streamChunk // ring buffer of recent chunks
 	streamChunksCap int
 	lastStreamOff   int64 // for seek detection
-
-	// Async upload state
-	uploadDone chan struct{}
-	uploadErr  error
 }
 
 type streamChunk struct {
@@ -84,13 +88,36 @@ var (
 	_ fs.FileFsyncer  = (*HamstorHandle)(nil)
 )
 
+// ensureLoaded populates the shared state's contents from storage. Must be
+// called with st.mu held; it may release and reacquire it while waiting for an
+// in-flight upload.
 func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
-	if h.loaded {
+	if h.st.poisoned != nil {
+		return syscall.EIO
+	}
+	if h.st.loaded {
 		return 0
 	}
-	if h.isNew {
-		h.buf = []byte{}
-		h.loaded = true
+	if h.st.isNew {
+		h.st.buf = []byte{}
+		h.st.loaded = true
+		return 0
+	}
+
+	// An upload of this inode may be in flight, in which case the DB still names
+	// the key it is about to replace. Loading that would hand back content
+	// predating the upload — harmless for a read on its own, but it becomes the
+	// base the next write builds on, and committing that silently drops
+	// everything the upload carried. Wait it out.
+	//
+	// This costs nothing on the fast read paths: Read tries streaming and
+	// chunked reads before it ever gets here, and both bypass the shared buffer.
+	// What reaches this point already faces a full download.
+	if errno := h.st.awaitUpload(); errno != 0 {
+		return errno
+	}
+	// awaitUpload may have dropped the lock; another handle could have loaded.
+	if h.st.loaded {
 		return 0
 	}
 
@@ -138,15 +165,15 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 				return syscall.EIO
 			}
 		}
-		h.buf = data
-		h.loaded = true
+		h.st.buf = data
+		h.st.loaded = true
 		h.fileSize = meta.Size
 		return 0
 	}
 
 	if meta.S3Key == "" {
-		h.buf = []byte{}
-		h.loaded = true
+		h.st.buf = []byte{}
+		h.st.loaded = true
 		return 0
 	}
 
@@ -154,10 +181,10 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	h.fileSize = meta.Size
 
 	// Try cache first (read-only path)
-	if h.hfs.Cache != nil && !h.dirty {
+	if h.hfs.Cache != nil && !h.st.dirty {
 		if f, err := h.hfs.Cache.Open(meta.S3Key); err == nil {
-			h.cacheFile = f
-			h.loaded = true
+			h.st.cacheFile = f
+			h.st.loaded = true
 			return 0
 		}
 	}
@@ -177,17 +204,17 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	if h.hfs.Cache != nil {
 		if putErr := h.hfs.Cache.Put(meta.S3Key, data); putErr != nil {
 			log.Printf("hamstor: cache put failed for %s: %v", meta.S3Key, putErr)
-		} else if !h.dirty {
+		} else if !h.st.dirty {
 			if f, openErr := h.hfs.Cache.Open(meta.S3Key); openErr == nil {
-				h.cacheFile = f
-				h.loaded = true
+				h.st.cacheFile = f
+				h.st.loaded = true
 				return 0
 			}
 		}
 	}
 
-	h.buf = data
-	h.loaded = true
+	h.st.buf = data
+	h.st.loaded = true
 	return 0
 }
 
@@ -197,10 +224,10 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 	h.fileSize = meta.Size
 
 	// Try cache first
-	if h.hfs.Cache != nil && !h.dirty {
+	if h.hfs.Cache != nil && !h.st.dirty {
 		if f, cacheErr := h.hfs.Cache.Open(cacheKey); cacheErr == nil {
-			h.cacheFile = f
-			h.loaded = true
+			h.st.cacheFile = f
+			h.st.loaded = true
 			return 0
 		}
 	}
@@ -222,23 +249,23 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 	if h.hfs.Cache != nil {
 		if putErr := h.hfs.Cache.Put(cacheKey, data); putErr != nil {
 			log.Printf("hamstor: cache put failed for vol needle %s: %v", cacheKey, putErr)
-		} else if !h.dirty {
+		} else if !h.st.dirty {
 			if f, openErr := h.hfs.Cache.Open(cacheKey); openErr == nil {
-				h.cacheFile = f
-				h.loaded = true
+				h.st.cacheFile = f
+				h.st.loaded = true
 				return 0
 			}
 		}
 	}
 
-	h.buf = data
-	h.loaded = true
+	h.st.buf = data
+	h.st.loaded = true
 	return 0
 }
 
 func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.st.mu.Lock()
+	defer h.st.mu.Unlock()
 
 	// Streaming mode for multimedia files — rate-limited, no disk cache
 	if h.streaming {
@@ -246,12 +273,12 @@ func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.
 	}
 
 	// Fast path: already loaded (full file in buf/cache/spill)
-	if h.loaded {
+	if h.st.loaded {
 		return h.readLoaded(dest, off)
 	}
 
 	// Chunk-based path: unencrypted, has S3 key, not dirty, cache available
-	if h.s3Key != "" && h.hfs.Encryptor == nil && !h.dirty && h.hfs.Cache != nil {
+	if h.s3Key != "" && h.hfs.Encryptor == nil && !h.st.dirty && h.hfs.Cache != nil {
 		if off >= h.fileSize {
 			return fuse.ReadResultData(nil), 0
 		}
@@ -311,7 +338,7 @@ func (h *HamstorHandle) readChunked(ctx context.Context, dest []byte, off int64)
 }
 
 // getOrFetchChunk returns chunk data from cache or fetches it from S3.
-// Called with h.mu held — serializes downloads per handle.
+// Called with h.st.mu held — serializes downloads per handle.
 func (h *HamstorHandle) getOrFetchChunk(ctx context.Context, index int64) ([]byte, error) {
 	// Try cache first
 	if data, err := h.hfs.Cache.GetChunk(h.s3Key, index); err == nil {
@@ -411,7 +438,7 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 	// handles the buffer/spill length is authoritative (writes may have extended
 	// past fileSize), so no clamp is applied.
 	clampLen := func(n int) int {
-		if h.dirty {
+		if h.st.dirty {
 			return n
 		}
 		avail := h.fileSize - off
@@ -425,11 +452,11 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 	}
 
 	// Read from spill file
-	if h.spillFile != nil {
-		if off >= h.spillSize {
+	if h.st.spillFile != nil {
+		if off >= h.st.spillSize {
 			return fuse.ReadResultData(nil), 0
 		}
-		n, err := h.spillFile.ReadAt(dest, off)
+		n, err := h.st.spillFile.ReadAt(dest, off)
 		if n == 0 && err == io.EOF {
 			return fuse.ReadResultData(nil), 0
 		}
@@ -440,8 +467,8 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 	}
 
 	// Read from cache file
-	if h.cacheFile != nil {
-		n, err := h.cacheFile.ReadAt(dest, off)
+	if h.st.cacheFile != nil {
+		n, err := h.st.cacheFile.ReadAt(dest, off)
 		if n == 0 && err == io.EOF {
 			return fuse.ReadResultData(nil), 0
 		}
@@ -453,24 +480,24 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 	}
 
 	// Read from in-memory buffer
-	if off >= int64(len(h.buf)) {
+	if off >= int64(len(h.st.buf)) {
 		return fuse.ReadResultData(nil), 0
 	}
 	end := off + int64(len(dest))
-	if end > int64(len(h.buf)) {
-		end = int64(len(h.buf))
+	if end > int64(len(h.st.buf)) {
+		end = int64(len(h.st.buf))
 	}
-	if !h.dirty && h.fileSize >= 0 && end > h.fileSize {
+	if !h.st.dirty && h.fileSize >= 0 && end > h.fileSize {
 		end = h.fileSize
 	}
 	if end <= off {
 		return fuse.ReadResultData(nil), 0
 	}
-	// Return a copy, not a slice aliasing h.buf: go-fuse copies the bytes out
-	// after Read releases h.mu, which could race a concurrent Write that
-	// reallocates or mutates h.buf and tear the in-flight read.
+	// Return a copy, not a slice aliasing h.st.buf: go-fuse copies the bytes out
+	// after Read releases h.st.mu, which could race a concurrent Write that
+	// reallocates or mutates h.st.buf and tear the in-flight read.
 	out := make([]byte, end-off)
-	copy(out, h.buf[off:end])
+	copy(out, h.st.buf[off:end])
 	return fuse.ReadResultData(out), 0
 }
 
@@ -501,12 +528,12 @@ func (h *HamstorHandle) readStreaming(ctx context.Context, dest []byte, off int6
 		if chunkData == nil {
 			// Rate limit before S3 download
 			if h.rateLimiter != nil {
-				h.mu.Unlock()
+				h.st.mu.Unlock()
 				if err := h.rateLimiter.Wait(ctx, cache.ChunkSize); err != nil {
-					h.mu.Lock()
+					h.st.mu.Lock()
 					return nil, syscall.EINTR
 				}
-				h.mu.Lock()
+				h.st.mu.Lock()
 				// Revalidate after re-acquiring lock
 				if h.released {
 					return nil, syscall.EIO
@@ -590,37 +617,37 @@ func (h *HamstorHandle) putStreamChunk(index int64, data []byte) {
 
 // spillToDisk moves in-memory buf to a temp file for large file writes.
 func (h *HamstorHandle) spillToDisk() error {
-	if h.spillFile != nil {
+	if h.st.spillFile != nil {
 		return nil
 	}
 	f, err := os.CreateTemp(h.hfs.SpillDir, "hamstor-spill-*")
 	if err != nil {
 		return err
 	}
-	if len(h.buf) > 0 {
-		if _, err := f.Write(h.buf); err != nil {
+	if len(h.st.buf) > 0 {
+		if _, err := f.Write(h.st.buf); err != nil {
 			f.Close()
 			os.Remove(f.Name())
 			return err
 		}
 	}
-	h.spillFile = f
-	h.spillSize = int64(len(h.buf))
-	h.buf = nil // free memory
+	h.st.spillFile = f
+	h.st.spillSize = int64(len(h.st.buf))
+	h.st.buf = nil // free memory
 	return nil
 }
 
 func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.st.mu.Lock()
+	defer h.st.mu.Unlock()
 
 	if errno := h.ensureLoaded(ctx); errno != 0 {
 		return 0, errno
 	}
 
 	// Transition from cache-file mode to buf mode on first write
-	if h.cacheFile != nil {
-		info, err := h.cacheFile.Stat()
+	if h.st.cacheFile != nil {
+		info, err := h.st.cacheFile.Stat()
 		if err != nil {
 			return 0, syscall.EIO
 		}
@@ -632,36 +659,47 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 			}
 			// spillToDisk created the spill file with empty buf content
 			// Now copy cache file content to spill file
-			h.spillFile.Truncate(0)
-			h.spillFile.Seek(0, io.SeekStart)
-			h.cacheFile.Seek(0, io.SeekStart)
-			if _, err := io.Copy(h.spillFile, h.cacheFile); err != nil {
+			h.st.spillFile.Truncate(0)
+			h.st.spillFile.Seek(0, io.SeekStart)
+			h.st.cacheFile.Seek(0, io.SeekStart)
+			if _, err := io.Copy(h.st.spillFile, h.st.cacheFile); err != nil {
 				return 0, syscall.EIO
 			}
-			h.spillSize = sz
+			h.st.spillSize = sz
 		} else {
-			h.buf = make([]byte, sz)
-			if _, err := h.cacheFile.ReadAt(h.buf, 0); err != nil && err != io.EOF {
+			h.st.buf = make([]byte, sz)
+			if _, err := h.st.cacheFile.ReadAt(h.st.buf, 0); err != nil && err != io.EOF {
 				return 0, syscall.EIO
 			}
 		}
-		h.cacheFile.Close()
-		h.cacheFile = nil
+		h.st.cacheFile.Close()
+		h.st.cacheFile = nil
+	}
+
+	// O_APPEND: ignore the offset the kernel handed us. It computed it from its
+	// cached st_size, which two appenders both read before either write lands,
+	// so both are told to write at the same place and one silently overwrites
+	// the other. The shared state knows the real end of file. (Linux likewise
+	// ignores the offset for pwrite() on an O_APPEND fd, so this matches it.)
+	// Must come after the cache-file transition above, which is what settles
+	// where the contents actually live.
+	if h.appendMode {
+		off = h.st.logicalSize()
 	}
 
 	// If writing to spill file
-	if h.spillFile != nil {
+	if h.st.spillFile != nil {
 		end := off + int64(len(data))
-		if end > h.spillSize {
-			if err := h.spillFile.Truncate(end); err != nil {
+		if end > h.st.spillSize {
+			if err := h.st.spillFile.Truncate(end); err != nil {
 				return 0, syscall.EIO
 			}
-			h.spillSize = end
+			h.st.spillSize = end
 		}
-		if _, err := h.spillFile.WriteAt(data, off); err != nil {
+		if _, err := h.st.spillFile.WriteAt(data, off); err != nil {
 			return 0, syscall.EIO
 		}
-		h.dirty = true
+		h.st.dirty = true
 		return uint32(len(data)), 0
 	}
 
@@ -672,58 +710,75 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 			log.Printf("hamstor: spill to disk failed: %v", err)
 			return 0, syscall.EIO
 		}
-		if end > h.spillSize {
-			if err := h.spillFile.Truncate(end); err != nil {
+		if end > h.st.spillSize {
+			if err := h.st.spillFile.Truncate(end); err != nil {
 				return 0, syscall.EIO
 			}
-			h.spillSize = end
+			h.st.spillSize = end
 		}
-		if _, err := h.spillFile.WriteAt(data, off); err != nil {
+		if _, err := h.st.spillFile.WriteAt(data, off); err != nil {
 			return 0, syscall.EIO
 		}
-		h.dirty = true
+		h.st.dirty = true
 		return uint32(len(data)), 0
 	}
 
 	// In-memory write
-	if end > int64(len(h.buf)) {
-		h.buf = append(h.buf, make([]byte, end-int64(len(h.buf)))...)
+	if end > int64(len(h.st.buf)) {
+		h.st.buf = append(h.st.buf, make([]byte, end-int64(len(h.st.buf)))...)
 	}
-	copy(h.buf[off:], data)
-	h.dirty = true
+	copy(h.st.buf[off:], data)
+	h.st.dirty = true
 	return uint32(len(data)), 0
 }
 
 func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.st.mu.Lock()
+	defer h.st.mu.Unlock()
 
-	if !h.dirty {
-		if h.isNew {
+	if h.st.poisoned != nil {
+		return syscall.EIO
+	}
+
+	// Not dirty: either nothing was written, or another handle sharing this
+	// inode already flushed what we would have. FUSE sends one FLUSH per
+	// close(2), so with N handles open this is what collapses N uploads into
+	// one — the first close to find the state dirty uploads, the rest no-op.
+	if !h.st.dirty {
+		if h.st.isNew {
 			if _, err := h.hfs.DB.CommitInode(h.inodeID, "", 0); err != nil {
 				return toErrno(err)
 			}
-			h.isNew = false
+			h.st.isNew = false
 		}
 		return 0
+	}
+
+	// Wait for a previous attempt on this inode before reading anything from
+	// the DB below: until it commits, the inode still points at the key it is
+	// about to replace, so both the staging path's GetInode and the async
+	// path's oldKey would be stale. Two flushes that each read the same oldKey
+	// end up with the loser deleting the winner's live object.
+	if errno := h.st.awaitUpload(); errno != 0 {
+		return errno
 	}
 
 	// Spill data to disk BEFORE waiting on the semaphore. During bulk copy,
 	// thousands of FUSE goroutines block on the semaphore — if each holds
 	// file data in memory, that's thousands * avg_file_size = hundreds of MB.
-	// By writing to disk first and nil'ing h.buf, blocked goroutines hold
+	// By writing to disk first and nil'ing h.st.buf, blocked goroutines hold
 	// only a file path, not data.
 	var uploadFile *os.File
 	var bufSize int64
 	canVolumePack := h.hfs.VolumeBuilder != nil
 
-	if h.spillFile != nil {
+	if h.st.spillFile != nil {
 		// Already on disk — just take ownership
-		uploadFile = h.spillFile
-		bufSize = h.spillSize
-		h.spillFile = nil
-	} else if len(h.buf) > 0 {
-		bufSize = int64(len(h.buf))
+		uploadFile = h.st.spillFile
+		bufSize = h.st.spillSize
+		h.st.spillFile = nil
+	} else if len(h.st.buf) > 0 {
+		bufSize = int64(len(h.st.buf))
 		if bufSize <= int64(volume.MaxNeedleSize) && canVolumePack {
 			// Small file going to volume staging — keep buf, skip temp spill
 		} else {
@@ -731,25 +786,58 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			if sfErr != nil {
 				return syscall.EIO
 			}
-			if _, sfErr = sf.Write(h.buf); sfErr != nil {
+			if _, sfErr = sf.Write(h.st.buf); sfErr != nil {
 				sf.Close()
 				os.Remove(sf.Name())
 				return syscall.EIO
 			}
 			uploadFile = sf
-			h.buf = nil // free memory immediately — data is on disk now
+			h.st.buf = nil // free memory immediately — data is on disk now
 		}
 	} else {
 		// Empty file
 		bufSize = 0
 	}
 
-	h.loaded = false
-	h.dirty = false
-	h.isNew = false
+	// Publish the attempt before mu is released for the first time (below, for
+	// UploadSem). Between that release and the goroutine launch, loaded is
+	// false and the DB still names the old key; without a published attempt a
+	// concurrent load has nothing to tell it to wait, and would take the old
+	// key as the base for the next version. The staging path publishes one too,
+	// even though it never starts a goroutine, so that awaitUpload and Fsync
+	// behave the same on both paths and staging takes its turn in the per-inode
+	// order rather than racing an in-flight async upload.
+	att := newUploadAttempt()
+	h.st.cur = att
+	h.st.loaded = false
+	h.st.dirty = false
+	h.st.isNew = false
 
 	// Small files: stage to disk, commit immediately, volume builder packs later.
 	if bufSize > 0 && bufSize <= int64(volume.MaxNeedleSize) && canVolumePack {
+		errno := h.flushStaged(uploadFile, bufSize)
+		if errno != 0 {
+			// The bytes are no longer anywhere: buf was handed to stageData and
+			// nil'd, and this path retains nothing (unlike the async one). A
+			// sibling handle that loaded the inode back now would get a base
+			// that never contained them and commit over the gap, so poison the
+			// state instead and let close(2)/fsync report it.
+			att.err = fmt.Errorf("stage flush failed: errno %d", errno)
+			h.st.poisoned = att.err
+		}
+		close(att.done)
+		return errno
+	}
+
+	return h.flushAsync(att, uploadFile, bufSize)
+}
+
+// flushStaged writes a small file to the volume staging directory and commits it
+// immediately; the volume builder packs it into a volume object later. Called
+// with st.mu held, and keeps it for the whole path — there is no upload
+// goroutine here, so the attempt is already complete when this returns.
+func (h *HamstorHandle) flushStaged(uploadFile *os.File, bufSize int64) syscall.Errno {
+	{
 		// Clean up the old standalone S3 object before overwriting. The old
 		// volume needle (if any) is accounted for atomically by CommitInode
 		// below, which decrements the previously-referenced volume in the same
@@ -777,10 +865,10 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			}
 			uploadFile.Close()
 			os.Remove(uploadFile.Name())
-		} else if h.buf != nil {
+		} else if h.st.buf != nil {
 			// Data still in memory — use directly, skip temp file round-trip
-			stageData = h.buf
-			h.buf = nil
+			stageData = h.st.buf
+			h.st.buf = nil
 		}
 		if stageData == nil {
 			return syscall.EIO
@@ -838,25 +926,47 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		}
 
 		// Commit immediately — file is visible right away
-		if _, err := h.hfs.DB.CommitInode(h.inodeID, "", bufSize); err != nil {
+		committed, err := h.hfs.DB.CommitInode(h.inodeID, "", bufSize)
+		if err != nil {
 			os.Remove(stagePath)
 			return toErrno(err)
+		}
+		if !committed {
+			// The inode was unlinked while we staged. Nothing references these
+			// bytes now, so drop the staging file instead of leaving it for
+			// CleanupStagingDir to find on the next boot.
+			os.Remove(stagePath)
+			return 0
 		}
 
 		// Notify builder that new staged file is available
 		h.hfs.VolumeBuilder.NotifyStaged()
 
 		// Ownership of the thumbnail source passes to scheduleThumb.
-		h.hfs.scheduleThumb(h.inodeID, stageMeta.Name, stageThumbSrc)
-		stageThumbSrc = ""
+		if stageMetaErr == nil {
+			h.hfs.scheduleThumb(h.inodeID, stageMeta.Name, stageThumbSrc)
+			stageThumbSrc = ""
+		}
 		return 0
 	}
+}
 
+// flushAsync uploads a standalone object in the background and commits the inode
+// once it lands. Called with st.mu held and returns with it held (Flush's defer
+// unlocks); it drops the lock around the upload semaphore.
+//
+// att is already published in st.cur, so a concurrent load waits for this upload
+// instead of reading the key it is about to replace.
+func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufSize int64) syscall.Errno {
 	// Now wait for upload slot — this goroutine holds no file data in RAM.
-	h.mu.Unlock()
+	h.st.mu.Unlock()
 	h.hfs.UploadSem <- struct{}{}
-	h.mu.Lock()
+	h.st.mu.Lock()
 
+	// Read the inode only now. Flush already waited for any previous attempt to
+	// commit, so oldKey below names the object this upload really supersedes.
+	// Reading it before that wait let two flushes see the same oldKey, and the
+	// loser then deleted the object the winner had just committed.
 	meta, err := h.hfs.DB.GetInode(h.inodeID)
 	if err != nil {
 		<-h.hfs.UploadSem
@@ -864,6 +974,9 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			uploadFile.Close()
 			os.Remove(uploadFile.Name())
 		}
+		att.err = err
+		h.st.poisoned = err
+		close(att.done)
 		return toErrno(err)
 	}
 	oldKey := meta.S3Key
@@ -873,30 +986,28 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 
 	hfs := h.hfs
 	inodeID := h.inodeID
-
-	// Serialize per-handle uploads: if a previous Flush launched an upload that
-	// is still running, wait for it before reusing the shared uploadDone/uploadErr
-	// fields. Otherwise two goroutines race on those fields (lost error, premature
-	// channel reuse). The upload goroutine never takes h.mu, so releasing it here
-	// to wait cannot deadlock.
-	if prev := h.uploadDone; prev != nil {
-		h.mu.Unlock()
-		<-prev
-		h.mu.Lock()
-	}
-	h.uploadDone = make(chan struct{})
-	h.uploadErr = nil
+	st := h.st
 	inode := h.inode
+
+	// The upload outlives this handle — Release deliberately does not wait for
+	// it. Hold a reference so the shared state survives until the commit lands;
+	// otherwise a reopen in that window builds a fresh state, reads the
+	// pre-upload key from the DB and writes on top of it.
+	hfs.retainUpload(st)
 	hfs.InflightUploads.Add(1)
 
 	go func() {
 		defer hfs.InflightUploads.Done()
-		defer close(h.uploadDone)
+		defer hfs.releaseUpload(inodeID, st)
+		// Closing att.done releases every waiter, so it must come after both the
+		// commit and the last write to att.err. Defers run LIFO, so this line
+		// running before the two above is what orders it correctly.
+		defer close(att.done)
 		defer func() { <-hfs.UploadSem }()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("hamstor: async upload panic: %v", r)
-				h.uploadErr = fmt.Errorf("panic: %v", r)
+				att.err = fmt.Errorf("panic: %v", r)
 			}
 		}()
 
@@ -927,7 +1038,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 				log.Printf("hamstor: spill read failed for inode %d: %v", inodeID, err)
 				uploadFile.Close()
 				os.Remove(uploadFile.Name())
-				h.uploadErr = fmt.Errorf("spill read: %w", err)
+				att.err = fmt.Errorf("spill read: %w", err)
 				return
 			}
 			uploadFile.Close()
@@ -941,7 +1052,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			encrypted, encErr := hfs.Encryptor.Encrypt(plainBuf)
 			if encErr != nil {
 				log.Printf("hamstor: encrypt failed for inode %d: %v", inodeID, encErr)
-				h.uploadErr = fmt.Errorf("encrypt: %w", encErr)
+				att.err = fmt.Errorf("encrypt: %w", encErr)
 				return
 			}
 			uploadData = encrypted
@@ -994,7 +1105,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 				}
 			}
 			uploadData = nil
-			h.uploadErr = uploadErr
+			att.err = uploadErr
 			plainBuf = nil
 			return
 		}
@@ -1015,7 +1126,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			if delErr := hfs.Store.Delete(uploadCtx, newKey); delErr != nil {
 				log.Printf("hamstor: async cleanup failed: %v", delErr)
 			}
-			h.uploadErr = err
+			att.err = err
 			plainBuf = nil
 			return
 		}
@@ -1024,6 +1135,10 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			if delErr := hfs.Store.Delete(uploadCtx, newKey); delErr != nil {
 				log.Printf("hamstor: orphan cleanup failed: %v", delErr)
 			}
+			// The object we just wrote is gone again, so record it: an fsync
+			// that reported success here would be claiming durability for a
+			// file whose only copy was deleted two lines up.
+			att.err = fmt.Errorf("inode %d deleted during upload", inodeID)
 			plainBuf = nil
 			return
 		}
@@ -1079,12 +1194,15 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	if errno != 0 {
 		return errno
 	}
-	h.mu.Lock()
-	done := h.uploadDone
-	h.mu.Unlock()
-	if done != nil {
-		<-done
-		if h.uploadErr != nil {
+	// Wait on the shared attempt, not one of this handle's own: with several
+	// handles open on the inode, the upload carrying our bytes may well have
+	// been launched by whichever of them closed first.
+	h.st.mu.Lock()
+	att := h.st.cur
+	h.st.mu.Unlock()
+	if att != nil {
+		<-att.done
+		if att.err != nil {
 			return syscall.EIO
 		}
 	}
@@ -1138,7 +1256,7 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 }
 
 func (h *HamstorHandle) Release(ctx context.Context) syscall.Errno {
-	h.mu.Lock()
+	h.st.mu.Lock()
 	h.released = true
 	// Don't wait for uploadDone — the upload goroutine manages its own
 	// lifecycle and logs errors. Blocking here causes goroutine pile-up
@@ -1147,19 +1265,11 @@ func (h *HamstorHandle) Release(ctx context.Context) syscall.Errno {
 	if h.cancelPrefetch != nil {
 		h.cancelPrefetch()
 	}
-	h.buf = nil
-	if h.cacheFile != nil {
-		h.cacheFile.Close()
-		h.cacheFile = nil
-	}
-	// spillFile ownership is transferred to the upload goroutine in Flush.
-	// Only clean up here if Flush wasn't called (file opened but never written).
-	if h.spillFile != nil {
-		name := h.spillFile.Name()
-		h.spillFile.Close()
-		os.Remove(name)
-		h.spillFile = nil
-	}
-	h.mu.Unlock()
+	h.st.mu.Unlock()
+
+	// Drop this handle's reference. The buffer, cache file and any spill file
+	// belong to the shared state now, so they are freed by the last reference to
+	// go — which may be this one, or an upload goroutine still in flight.
+	h.hfs.releaseWrite(h.inodeID, h.st)
 	return 0
 }

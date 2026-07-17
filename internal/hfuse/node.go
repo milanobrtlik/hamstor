@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"io"
 	"log"
 	"os"
 	"syscall"
@@ -103,45 +102,20 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 		s := int64(sz)
 		sizePtr = &s
 
-		// Truncate the active file handle's data if one is provided, so the
-		// resize is captured and re-uploaded on Flush.
-		if fh, ok := f.(*HamstorHandle); ok {
-			fh.mu.Lock()
-			if fh.spillFile != nil {
-				if err := fh.spillFile.Truncate(s); err != nil {
-					fh.mu.Unlock()
-					log.Printf("hamstor: spill truncate failed: %v", err)
-					return syscall.EIO
-				}
-				fh.spillSize = s
-				fh.dirty = true
-			} else {
-				// A cache-backed (read) handle holds no mutable buffer. Materialize
-				// it into buf so the truncation is durable on the next Flush
-				// instead of only changing the DB size while storage keeps the old
-				// bytes (which a later rewrite/append would then resurrect).
-				if fh.cacheFile != nil {
-					if info, statErr := fh.cacheFile.Stat(); statErr == nil {
-						b := make([]byte, info.Size())
-						if _, rerr := fh.cacheFile.ReadAt(b, 0); rerr == nil || rerr == io.EOF {
-							fh.buf = b
-							fh.cacheFile.Close()
-							fh.cacheFile = nil
-							fh.loaded = true
-						}
-					}
-				}
-				if fh.loaded && fh.cacheFile == nil {
-					if s < int64(len(fh.buf)) {
-						fh.buf = fh.buf[:s]
-					} else if s > int64(len(fh.buf)) {
-						fh.buf = append(fh.buf, make([]byte, s-int64(len(fh.buf)))...)
-					}
-					fh.dirty = true
-				}
+		// Resize the shared buffer so the truncation is captured and re-uploaded
+		// on Flush. f is nil for a path-based truncate(2), so go through the
+		// registry rather than the handle: without that, open handles keep their
+		// pre-truncate contents and resurrect the tail on their next flush.
+		st := n.hfs.tryAcquireWrite(n.inodeID)
+		if st != nil {
+			errno := truncateWriteState(st, s)
+			n.hfs.releaseWrite(n.inodeID, st)
+			if errno != 0 {
+				return errno
 			}
+		}
+		if fh, ok := f.(*HamstorHandle); ok {
 			fh.fileSize = s
-			fh.mu.Unlock()
 		}
 	}
 	if m, ok := in.GetMode(); ok {
@@ -247,11 +221,16 @@ func (n *HamstorNode) Create(ctx context.Context, name string, flags uint32, mod
 	stable := fs.StableAttr{Mode: fileMode, Ino: uint64(newID)}
 	node := n.NewInode(ctx, child, stable)
 
+	st := n.hfs.acquireWrite(newID)
+	st.mu.Lock()
+	st.isNew = true
+	st.mu.Unlock()
 	handle := &HamstorHandle{
-		hfs:     n.hfs,
-		inodeID: newID,
-		inode:   node,
-		isNew:   true,
+		hfs:        n.hfs,
+		inodeID:    newID,
+		inode:      node,
+		st:         st,
+		appendMode: flags&uint32(syscall.O_APPEND) != 0,
 	}
 
 	out.Ino = uint64(newID)
@@ -268,24 +247,49 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		return nil, 0, toErrno(err)
 	}
 
+	st := n.hfs.acquireWrite(n.inodeID)
 	handle := &HamstorHandle{
-		hfs:      n.hfs,
-		inodeID:  n.inodeID,
-		inode:    &n.Inode,
-		s3Key:    meta.S3Key,
-		fileSize: meta.Size,
+		hfs:        n.hfs,
+		inodeID:    n.inodeID,
+		inode:      &n.Inode,
+		st:         st,
+		s3Key:      meta.S3Key,
+		fileSize:   meta.Size,
+		appendMode: flags&uint32(syscall.O_APPEND) != 0,
 	}
+	// Every failure below returns no handle, so Release will never come for it
+	// and the reference would pin the state in the registry for the life of the
+	// mount. Hand it back unless we make it to a successful return.
+	ok := false
+	defer func() {
+		if !ok {
+			n.hfs.releaseWrite(n.inodeID, st)
+		}
+	}()
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
 
 	// Preload data for files opened in write mode
 	writeFlags := uint32(syscall.O_WRONLY | syscall.O_RDWR | syscall.O_APPEND | syscall.O_TRUNC)
 	hasData := meta.S3Key != "" || meta.VolS3Key != "" ||
 		(meta.Size > 0 && n.hfs.VolumeBuilder != nil)
-	if flags&writeFlags != 0 && hasData {
-		if flags&uint32(syscall.O_TRUNC) != 0 {
-			handle.buf = []byte{}
-			handle.loaded = true
-			handle.dirty = true
-		} else if meta.S3Key != "" {
+
+	// O_TRUNC empties the file for everyone, so it applies even when another
+	// handle has already loaded the shared state — unlike the preload below,
+	// which is skipped in that case because the contents are already there.
+	if flags&uint32(syscall.O_TRUNC) != 0 {
+		st.buf = nil
+		st.loaded = true
+		st.dirty = true
+		if st.spillFile != nil {
+			if err := st.spillFile.Truncate(0); err != nil {
+				return nil, 0, syscall.EIO
+			}
+			st.spillSize = 0
+		}
+	} else if flags&writeFlags != 0 && hasData && !st.loaded {
+		if meta.S3Key != "" {
 			// Try cache first for write preload
 			var data []byte
 			if n.hfs.Cache != nil {
@@ -326,12 +330,12 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 					os.Remove(sf.Name())
 					return nil, 0, syscall.EIO
 				}
-				handle.spillFile = sf
-				handle.spillSize = int64(len(data))
+				st.spillFile = sf
+				st.spillSize = int64(len(data))
 			} else {
-				handle.buf = data
+				st.buf = data
 			}
-			handle.loaded = true
+			st.loaded = true
 		} else if meta.VolS3Key != "" {
 			// Preload from volume (file is packed in a volume S3 object)
 			data, dlErr := n.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
@@ -345,16 +349,16 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 					return nil, 0, syscall.EIO
 				}
 			}
-			handle.buf = data
-			handle.loaded = true
+			st.buf = data
+			st.loaded = true
 		} else if n.hfs.VolumeBuilder != nil {
 			// Preload from staging dir (file staged but not yet packed)
 			data, dlErr := n.openPreloadStaged(ctx)
 			if dlErr != 0 {
 				return nil, 0, dlErr
 			}
-			handle.buf = data
-			handle.loaded = true
+			st.buf = data
+			st.loaded = true
 		}
 
 		// If the stored object is longer than the inode's logical size — e.g. a
@@ -362,15 +366,15 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		// preloaded data to meta.Size so a subsequent rewrite or append does not
 		// resurrect the truncated tail. (Not applied for O_TRUNC, which loads an
 		// empty buffer.)
-		if handle.loaded && flags&uint32(syscall.O_TRUNC) == 0 {
-			if handle.spillFile != nil {
-				if handle.spillSize > meta.Size {
-					if err := handle.spillFile.Truncate(meta.Size); err == nil {
-						handle.spillSize = meta.Size
+		if st.loaded && flags&uint32(syscall.O_TRUNC) == 0 {
+			if st.spillFile != nil {
+				if st.spillSize > meta.Size {
+					if err := st.spillFile.Truncate(meta.Size); err == nil {
+						st.spillSize = meta.Size
 					}
 				}
-			} else if int64(len(handle.buf)) > meta.Size {
-				handle.buf = handle.buf[:meta.Size]
+			} else if int64(len(st.buf)) > meta.Size {
+				st.buf = st.buf[:meta.Size]
 			}
 		}
 	}
@@ -391,6 +395,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		}
 	}
 
+	ok = true
 	return handle, fuse.FOPEN_DIRECT_IO, 0
 }
 
