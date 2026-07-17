@@ -116,7 +116,10 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	if errno := h.st.awaitUpload(); errno != 0 {
 		return errno
 	}
-	// awaitUpload may have dropped the lock; another handle could have loaded.
+	// awaitUpload may have dropped the lock; re-check what it could have changed.
+	if h.st.poisoned != nil {
+		return syscall.EIO
+	}
 	if h.st.loaded {
 		return 0
 	}
