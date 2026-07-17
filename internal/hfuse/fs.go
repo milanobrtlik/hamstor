@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/milan/hamstor/internal/cache"
@@ -77,6 +79,12 @@ type HamstorFS struct {
 	// VolumeBuilder packs small files into volume S3 objects.
 	// nil means volume packing is disabled.
 	VolumeBuilder *volume.Builder
+
+	// volumeFetch dedups whole-volume downloads so that when a directory of
+	// files packed into the same volume is browsed cold, concurrent reads of
+	// sibling inodes (each with its own inodeWrite lock) trigger a single
+	// download of that volume object, not one per file. See loadFromVolume.
+	volumeFetch singleflight.Group
 
 	// TestCrashBeforeCommit, when non-nil, is called after S3 upload
 	// but before SQLite commit. Tests use this to simulate a crash
