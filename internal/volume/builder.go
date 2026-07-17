@@ -34,11 +34,26 @@ const (
 	// fallbackInterval is how often the builder checks for staged files
 	// even without an explicit notification.
 	fallbackInterval = 5 * time.Second
+)
 
-	// maxBatchEntries limits how many staged files are read into memory per
-	// scan cycle. At 256 KB max each, 64 entries = ~16 MB worst case.
-	// Remaining files are picked up on the next tick/notify cycle.
-	maxBatchEntries = 64
+// scanBudgetBytes and maxBatchEntries are var, not const, only so tests can
+// lower them to trigger the budget/entry-cap paths with a handful of files
+// instead of thousands. Production never reassigns them.
+var (
+	// scanBudgetBytes caps how many bytes of staged data a single scan pass
+	// reads into memory before sealing. Sized to fill exactly one volume, so a
+	// backlog of small files packs into full TargetVolumeSize volumes one pass
+	// at a time instead of the ~243 KB objects a fixed 64-entry cap produced.
+	scanBudgetBytes int64 = TargetVolumeSize // 8 MB
+
+	// maxBatchEntries bounds the file count per pass: the slice length and the
+	// per-file GetInode + rename + ReadFile syscalls. It binds only when files
+	// average below scanBudgetBytes/maxBatchEntries = 512 B; above that the byte
+	// budget stops the read first. 16384 * ~90 B slice overhead ≈ 1.5 MB.
+	// The old value was 64, purely a memory proxy (256 KB * 64 = 16 MB); the
+	// byte budget bounds memory directly and lifts the throughput ceiling the
+	// count accidentally imposed.
+	maxBatchEntries = 16384
 )
 
 // closeTimeout is the maximum time Close() will wait for the final
@@ -250,23 +265,55 @@ func (b *Builder) run() {
 	for {
 		select {
 		case <-b.done:
-			// Final sweep: drain the ENTIRE staging directory. scanAndSeal caps
-			// each pass at maxBatchEntries for memory safety, so a single call
-			// would leave any backlog (>64 files, common after a bulk copy)
-			// stranded as committed inodes with no S3 backing. Loop until a pass
-			// seals nothing more. The bound guards against a pathological
+			// Final sweep: drain the ENTIRE staging directory so no backlog is
+			// left stranded as committed inodes with no S3 backing. This runs
+			// AFTER b.done is closed, so it must NOT yield to b.done the way the
+			// notify/ticker drain does. It also loops until a pass seals nothing
+			// (not until a partial tail like drain does): durability outranks
+			// packing here, and a needle superseded by a last-moment overwrite is
+			// restored and must be re-swept. The 1<<20 bound guards a pathological
 			// non-draining file (e.g. an inode that keeps failing to commit).
 			for i := 0; i < 1<<20; i++ {
-				if b.scanAndSeal(true) == 0 {
+				if sealed, _ := b.scanAndSeal(true); sealed == 0 {
 					break
 				}
 			}
 			return
 		case <-b.notify:
-			b.scanAndSeal(false)
+			b.drain(false)
 		case <-ticker.C:
-			// Fallback: seal even small batches to avoid stale staging files
-			b.scanAndSeal(true)
+			// Fallback: seal even small batches to avoid stale staging files.
+			b.drain(true)
+		}
+	}
+}
+
+// drain seals staged files pass after pass so a bulk copy of many small files
+// empties as fast as S3 accepts uploads instead of dribbling out one batch per
+// fallback tick. Each pass caps its memory at scanBudgetBytes, so looping is
+// what turns that cap into throughput.
+//
+// It loops while scanAndSeal reports more backlog (a full volume was sealed and
+// a limit truncated the scan) and stops once a pass drains down to a partial
+// tail. That keeps a forced (ticker) drain from spinning to seal every file a
+// concurrent copy trickles in as its own tiny volume: the bulk goes into full
+// volumes, the sub-budget remainder is sealed once, and newly arrived files wait
+// for the next notify/tick to be packed together.
+//
+// Unlike the shutdown sweep, drain yields to b.done every iteration: once
+// Close() has closed b.done the non-blocking select returns immediately, and
+// run()'s outer select then re-fires the <-b.done case to run the final full
+// sweep. The 1<<20 bound guards against a pathological non-draining file
+// spinning forever.
+func (b *Builder) drain(forceSmall bool) {
+	for i := 0; i < 1<<20; i++ {
+		select {
+		case <-b.done:
+			return
+		default:
+		}
+		if sealed, more := b.scanAndSeal(forceSmall); sealed == 0 || !more {
+			return
 		}
 	}
 }
@@ -280,19 +327,30 @@ type stagedFile struct {
 
 // scanAndSeal reads staged files and packs them into volumes.
 // If forceSmall is true, it seals even if total size is below TargetVolumeSize.
-// Returns the number of staged files it sealed into volumes this pass (0 if it
-// found nothing, or restored everything because the batch was too small and not
-// forced), so the shutdown drain loop knows when the directory is exhausted.
-func (b *Builder) scanAndSeal(forceSmall bool) int {
+//
+// It returns (sealed, more): sealed is the number of staged files it packed this
+// pass (0 if it found nothing, or restored everything because the batch was too
+// small and not forced); more reports that a per-pass limit truncated the scan,
+// i.e. at least one budget's worth of backlog is still queued. drain() loops
+// while more is true and stops once a pass drains down to a partial tail, so a
+// forced (ticker) drain seals the whole backlog into full volumes without
+// spinning to seal every trickling new file into its own tiny object.
+func (b *Builder) scanAndSeal(forceSmall bool) (sealed int, more bool) {
 	entries, err := os.ReadDir(b.stagingDir)
 	if err != nil || len(entries) == 0 {
-		return 0
+		return 0, false
 	}
 
 	var staged []stagedFile
 	totalSize := int64(0)
+	truncated := false // hit a per-pass limit with entries remaining = a backlog
 	for _, e := range entries {
-		if len(staged) >= maxBatchEntries {
+		if len(staged) >= maxBatchEntries || totalSize >= scanBudgetBytes {
+			// Hit a per-pass limit before running out of entries. Record it so
+			// the seal decision below seals this batch instead of restoring it:
+			// a notify pass that fills the entry cap with tiny files must make
+			// progress, not claim thousands of files and rename them all back.
+			truncated = true
 			break
 		}
 		if e.IsDir() {
@@ -353,21 +411,24 @@ func (b *Builder) scanAndSeal(forceSmall bool) int {
 	}
 
 	if len(staged) == 0 {
-		return 0
+		return 0, false
 	}
 
-	// Wait for more files unless forced (ticker/shutdown) or enough data
-	if !forceSmall && totalSize < TargetVolumeSize {
+	// Seal when forced (ticker/shutdown), when we accumulated a full volume, or
+	// when a per-pass limit truncated the scan (a backlog is queued behind us).
+	// Only a small, complete batch on the notify path waits for more data.
+	enoughData := totalSize >= scanBudgetBytes || truncated
+	if !forceSmall && !enoughData {
 		// Put claimed files back so the next scan can pick them up, unless a
 		// concurrent overwrite already wrote a newer staging file at the path.
 		for _, sf := range staged {
 			restoreClaim(sf.path, strings.TrimSuffix(sf.path, ".packing"))
 		}
-		return 0
+		return 0, false
 	}
 
 	b.sealBatch(staged)
-	return len(staged)
+	return len(staged), truncated
 }
 
 // sealBatch packs staged files into volumes, splitting at TargetVolumeSize boundaries.
