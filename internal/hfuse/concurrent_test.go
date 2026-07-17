@@ -1,6 +1,7 @@
 package hfuse
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
 	"github.com/milan/hamstor/internal/testutil"
@@ -355,6 +357,106 @@ func TestWriteStateReleasedOnOpenError(t *testing.T) {
 
 	if live := hfs.liveWriteStates(); live != 0 {
 		t.Fatalf("Open leaked write state on its error path: %d live", live)
+	}
+}
+
+// TestOpenTruncWithCacheBackedSibling drives node.Open directly, which the other
+// tests do not: they build handles straight from the registry. O_TRUNC is the one
+// path sharing made unconditional, so it is exactly where a shared state left
+// over from a reader can be found in a shape Open did not expect.
+//
+// A cache-backed state serves reads from cacheFile and rebuilds buf from it on
+// the first write. Emptying only buf therefore truncates nothing: `> file` comes
+// back the full length of the old file.
+func TestOpenTruncWithCacheBackedSibling(t *testing.T) {
+	hfs, _ := setupTest(t) // async path: >MaxNeedleSize file gets a standalone key
+	cacheDir := t.TempDir()
+	dc, err := cache.New(cacheDir, 1<<30)
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	hfs.Cache = dc
+	hfs.SpillDir = t.TempDir()
+
+	id := mustInsert(t, hfs, "trunc-me.bin")
+
+	// Write a file large enough to become a standalone S3 object, so that a
+	// later load goes through the disk cache and leaves cacheFile set.
+	orig := bytes.Repeat([]byte("O"), 300*1024)
+	w := NewTestHandle(hfs, id, true)
+	if errno := w.TestWriteAt(orig, 0); errno != 0 {
+		t.Fatalf("write: %v", errno)
+	}
+	w.TestFlush()
+	w.WaitUpload()
+	w.TestRelease()
+
+	// A reader holds the file open, populating the shared state's cacheFile.
+	reader := NewTestHandle(hfs, id, false)
+	defer reader.TestRelease()
+	if _, errno := reader.TestRead(16, 0); errno != 0 {
+		t.Fatalf("reader read: %v", errno)
+	}
+	reader.h.st.mu.Lock()
+	cached := reader.h.st.cacheFile != nil
+	reader.h.st.mu.Unlock()
+	if !cached {
+		t.Skip("state is not cache-backed; nothing for this test to catch")
+	}
+
+	// Now `> file` while the reader is still open.
+	n := &HamstorNode{hfs: hfs, inodeID: id}
+	fh, _, errno := n.Open(context.Background(), uint32(syscall.O_WRONLY|syscall.O_TRUNC))
+	if errno != 0 {
+		t.Fatalf("open O_TRUNC: %v", errno)
+	}
+	th := &TestHandle{h: fh.(*HamstorHandle)}
+	if errno := th.TestWriteAt([]byte("hi\n"), 0); errno != 0 {
+		t.Fatalf("write after trunc: %v", errno)
+	}
+	if errno := th.TestFlush(); errno != 0 {
+		t.Fatalf("flush: %v", errno)
+	}
+	th.WaitUpload()
+	th.TestRelease()
+
+	meta, err := hfs.DB.GetInode(id)
+	if err != nil {
+		t.Fatalf("get inode: %v", err)
+	}
+	if meta.Size != 3 {
+		t.Fatalf("`> file` left %d bytes, want 3: the truncated content came back", meta.Size)
+	}
+}
+
+// TestOpenTruncEmptyFileNoUpload guards the other side of the O_TRUNC gate: for a
+// file with no stored data there is nothing to truncate, and marking it dirty
+// would cost an empty upload and commit on every `> file`.
+func TestOpenTruncEmptyFileNoUpload(t *testing.T) {
+	hfs := setupDBOnly(t)
+	id, err := hfs.DB.InsertInode(1, "empty.txt", syscall.S_IFREG|0o644, "committed")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	n := &HamstorNode{hfs: hfs, inodeID: id}
+	fh, _, errno := n.Open(context.Background(), uint32(syscall.O_WRONLY|syscall.O_TRUNC))
+	if errno != 0 {
+		t.Fatalf("open: %v", errno)
+	}
+	h := fh.(*HamstorHandle)
+	h.st.mu.Lock()
+	dirty := h.st.dirty
+	h.st.mu.Unlock()
+	if dirty {
+		t.Error("`> emptyfile` marked the state dirty; every redirect would upload an empty object")
+	}
+	// Flush must not reach the Store, which is nil in this fixture.
+	if errno := h.Flush(context.Background()); errno != 0 {
+		t.Fatalf("flush: %v", errno)
+	}
+	h.Release(context.Background())
+	if live := hfs.liveWriteStates(); live != 0 {
+		t.Fatalf("leaked state: %d", live)
 	}
 }
 

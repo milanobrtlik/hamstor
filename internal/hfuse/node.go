@@ -278,16 +278,27 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 	// O_TRUNC empties the file for everyone, so it applies even when another
 	// handle has already loaded the shared state — unlike the preload below,
 	// which is skipped in that case because the contents are already there.
-	if flags&uint32(syscall.O_TRUNC) != 0 {
-		st.buf = nil
-		st.loaded = true
-		st.dirty = true
+	if flags&uint32(syscall.O_TRUNC) != 0 && (hasData || st.loaded) {
+		// Do the one fallible step first: nothing below can fail, so the shared
+		// state is never left half-truncated for other handles after an open(2)
+		// that reported failure.
 		if st.spillFile != nil {
 			if err := st.spillFile.Truncate(0); err != nil {
+				log.Printf("hamstor: spill truncate on open: %v", err)
 				return nil, 0, syscall.EIO
 			}
 			st.spillSize = 0
 		}
+		st.buf = nil
+		// A cache-backed state serves reads straight from cacheFile, and Write
+		// rebuilds buf from it on first write. Emptying buf alone would truncate
+		// nothing — the whole pre-truncate file comes back.
+		if st.cacheFile != nil {
+			st.cacheFile.Close()
+			st.cacheFile = nil
+		}
+		st.loaded = true
+		st.dirty = true
 	} else if flags&writeFlags != 0 && hasData && !st.loaded {
 		if meta.S3Key != "" {
 			// Try cache first for write preload
