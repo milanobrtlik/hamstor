@@ -51,6 +51,7 @@ func main() {
 	pprofAddr := flag.String("pprof", "", "pprof listen address (e.g. :6060, empty to disable)")
 	volumePacking := flag.Bool("volume-packing", true, "pack small files (<256KB) into volume S3 objects")
 	compactRatio := flag.Float64("compact-ratio", 0.5, "dead space ratio threshold for volume compaction")
+	snapshotInterval := flag.Duration("snapshot-interval", 6*time.Hour, "litestream snapshot interval; lower = faster cold restore, higher = less B2 cost")
 	flag.Parse()
 
 	// Collect the subcommand words, parsing flags wherever they appear. Go's
@@ -145,6 +146,9 @@ func main() {
 			Path:            "litestream",
 			AccessKeyID:     creds.AWSAccessKeyID,
 			SecretAccessKey: creds.AWSSecretAccessKey,
+
+			SnapshotInterval:  *snapshotInterval,
+			SnapshotRetention: 24 * time.Hour,
 		})
 		if subcmd == "" || subcmd == "restore" {
 			if err := rep.Restore(ctx); err != nil {
