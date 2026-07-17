@@ -213,21 +213,20 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 }
 
 // loadFromVolume loads a file packed in a volume S3 object into the handle.
+//
+// The read is served from the WHOLE volume object, not a byte-range slice of it:
+// on a cache miss the entire volume (<=8 MB) is downloaded once and cached, then
+// every needle in it is read locally. Files in one directory are almost always
+// packed into the same one or two volumes (the builder packs in copy order,
+// which follows directory traversal), so browsing a folder cold drops from one
+// S3 request per file to one per volume — the read-side counterpart of the
+// write-side packing. Individual reads pay at most ~8 MB of extra download that
+// their siblings then reuse; with no cache to amortise it (or a dirty buffer we
+// must not clobber) it falls back to the old per-needle range read.
 func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) syscall.Errno {
-	cacheKey := fmt.Sprintf("vol/%s/%d/%d", meta.VolS3Key, meta.VolOffset, meta.VolSize)
 	h.fileSize = meta.Size
 
-	// Try cache first
-	if h.hfs.Cache != nil && !h.st.dirty {
-		if f, cacheErr := h.hfs.Cache.Open(cacheKey); cacheErr == nil {
-			h.st.cacheFile = f
-			h.st.loaded = true
-			h.st.size = meta.Size
-			return 0
-		}
-	}
-
-	data, err := h.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
+	data, err := h.readNeedle(ctx, meta)
 	if err != nil {
 		log.Printf("hamstor: volume read failed for inode %d (vol %s offset %d): %v",
 			h.inodeID, meta.VolS3Key, meta.VolOffset, err)
@@ -241,23 +240,80 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 		}
 	}
 
-	if h.hfs.Cache != nil {
-		if putErr := h.hfs.Cache.Put(cacheKey, data); putErr != nil {
-			log.Printf("hamstor: cache put failed for vol needle %s: %v", cacheKey, putErr)
-		} else if !h.st.dirty {
-			if f, openErr := h.hfs.Cache.Open(cacheKey); openErr == nil {
-				h.st.cacheFile = f
-				h.st.loaded = true
-				h.st.size = meta.Size
-				return 0
-			}
-		}
-	}
-
 	h.st.buf = data
 	h.st.loaded = true
 	h.st.size = meta.Size
 	return 0
+}
+
+// readNeedle returns the raw (still-encrypted, if the mount is encrypted) bytes
+// of one needle. It serves them from the cached whole-volume object when it can,
+// downloading the volume once (deduped across sibling inodes) on a miss.
+func (h *HamstorHandle) readNeedle(ctx context.Context, meta *db.InodeMeta) ([]byte, error) {
+	// No cache to amortise a whole-volume fetch, or a dirty buffer we must not
+	// disturb: fall back to a per-needle range read (the original behaviour).
+	if h.hfs.Cache == nil || h.st.dirty {
+		return h.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
+	}
+
+	volCacheKey := "volobj/" + meta.VolS3Key
+
+	// Fast path: read just this needle's bytes out of the cached whole volume.
+	if f, err := h.hfs.Cache.Open(volCacheKey); err == nil {
+		buf := make([]byte, meta.VolSize)
+		n, rerr := f.ReadAt(buf, meta.VolOffset)
+		f.Close()
+		if (rerr == nil || rerr == io.EOF) && int64(n) == meta.VolSize {
+			return buf, nil
+		}
+		// Short or failed read (e.g. cache file truncated by eviction) — re-fetch.
+	}
+
+	// Miss: fetch the whole volume once, then slice this needle out of it.
+	volData, err := h.fetchVolume(meta.VolS3Key, volCacheKey)
+	if err != nil {
+		return nil, err
+	}
+	if meta.VolOffset < 0 || meta.VolOffset+meta.VolSize > int64(len(volData)) {
+		return nil, fmt.Errorf("needle [%d:%d] out of range for volume %s (len %d)",
+			meta.VolOffset, meta.VolOffset+meta.VolSize, meta.VolS3Key, len(volData))
+	}
+	buf := make([]byte, meta.VolSize)
+	copy(buf, volData[meta.VolOffset:meta.VolOffset+meta.VolSize])
+	return buf, nil
+}
+
+// fetchVolume downloads the whole volume object and caches it, deduping
+// concurrent callers for the same volume via singleflight so a parallel browse
+// of a packed directory issues one download per volume, not one per file.
+//
+// The download runs on a detached context: the volume fill benefits every
+// sibling reader, so one reader cancelling (e.g. a file manager abandoning a
+// thumbnail) must not fail the shared fetch for the others. Store.Download's own
+// retry bounds it.
+func (h *HamstorHandle) fetchVolume(volKey, volCacheKey string) ([]byte, error) {
+	v, err, _ := h.hfs.volumeFetch.Do(volKey, func() (any, error) {
+		// A racing caller may have cached it between our fast-path miss and now.
+		if f, oerr := h.hfs.Cache.Open(volCacheKey); oerr == nil {
+			data, rerr := io.ReadAll(f)
+			f.Close()
+			if rerr == nil {
+				return data, nil
+			}
+		}
+		data, derr := h.hfs.Store.Download(context.Background(), volKey)
+		if derr != nil {
+			return nil, derr
+		}
+		if putErr := h.hfs.Cache.Put(volCacheKey, data); putErr != nil {
+			log.Printf("hamstor: cache put whole volume %s: %v", volCacheKey, putErr)
+		}
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]byte), nil
 }
 
 func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
