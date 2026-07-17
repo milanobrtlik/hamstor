@@ -42,13 +42,15 @@ type HamstorHandle struct {
 	st *inodeWrite
 
 	s3Key string // S3 key at open time
-	// fileSize is this handle's view of the logical size, taken at open time and
-	// refreshed whenever this handle loads. Under sharing it is deliberately a
-	// per-handle view of shared data: readChunked/readStreaming need a size that
-	// matches the s3Key they were opened against. readLoaded only clamps to it
-	// for clean reads, and any write or truncate sets st.dirty, so a stale
-	// fileSize can never truncate a sibling's writes. Do not "simplify" this
-	// into the shared state without re-deriving that.
+	// fileSize is this handle's own view of the logical size, taken at open time
+	// and refreshed only when this handle loads. It pairs with s3Key: both are
+	// open-time snapshots, and readChunked/readStreaming need a size that matches
+	// the key they are reading from.
+	//
+	// It is NOT the file's size and must never be used as one. A handle that
+	// never loads the state (a sibling got there first) keeps its open-time value
+	// forever, so anything shared — notably readLoaded's clamp — must use
+	// st.size instead.
 	fileSize int64
 
 	// appendMode records O_APPEND from Open. The kernel computes append offsets
@@ -101,6 +103,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	if h.st.isNew {
 		h.st.buf = []byte{}
 		h.st.loaded = true
+		h.st.size = 0
 		return 0
 	}
 
@@ -134,23 +137,13 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 
 	// File staged locally, not yet packed into a volume
 	if meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 && h.hfs.VolumeBuilder != nil {
-		stagePath := h.hfs.VolumeBuilder.StagePath(h.inodeID)
-		data, err := os.ReadFile(stagePath)
-		if err != nil {
-			// Builder (.packing) or Fsync (.flushing) may have claimed the file.
-			// Try reading from the claimed path — the data is identical and
-			// reading is safe (the claimer only reads, never modifies).
-			for _, suffix := range []string{".packing", ".flushing"} {
-				if d, e := os.ReadFile(stagePath + suffix); e == nil {
-					data = d
-					err = nil
-					break
-				}
-			}
+		data, size, errno := h.hfs.readStaged(ctx, h.inodeID)
+		if errno != 0 {
+			return errno
 		}
-		if err != nil {
-			// Staging file may have been packed by the builder between
-			// GetInode and ReadFile. Re-read metadata and retry.
+		if data == nil {
+			// The builder packed it while we looked; the metadata now names a
+			// volume, so start over rather than guess.
 			meta2, err2 := h.hfs.DB.GetInode(h.inodeID)
 			if err2 != nil {
 				return toErrno(err2)
@@ -158,25 +151,20 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 			if meta2.VolS3Key != "" {
 				return h.loadFromVolume(ctx, meta2)
 			}
-			log.Printf("hamstor: staged file read failed for inode %d: %v", h.inodeID, err)
 			return syscall.EIO
-		}
-		if h.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
-			data, err = h.hfs.Encryptor.Decrypt(data)
-			if err != nil {
-				log.Printf("hamstor: staged file decrypt failed for inode %d: %v", h.inodeID, err)
-				return syscall.EIO
-			}
 		}
 		h.st.buf = data
 		h.st.loaded = true
-		h.fileSize = meta.Size
+		h.st.size = size
+		h.fileSize = size
 		return 0
 	}
 
 	if meta.S3Key == "" {
 		h.st.buf = []byte{}
 		h.st.loaded = true
+		h.st.size = meta.Size
+		h.fileSize = meta.Size
 		return 0
 	}
 
@@ -188,6 +176,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 		if f, err := h.hfs.Cache.Open(meta.S3Key); err == nil {
 			h.st.cacheFile = f
 			h.st.loaded = true
+			h.st.size = meta.Size
 			return 0
 		}
 	}
@@ -211,6 +200,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 			if f, openErr := h.hfs.Cache.Open(meta.S3Key); openErr == nil {
 				h.st.cacheFile = f
 				h.st.loaded = true
+				h.st.size = meta.Size
 				return 0
 			}
 		}
@@ -218,6 +208,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 
 	h.st.buf = data
 	h.st.loaded = true
+	h.st.size = meta.Size
 	return 0
 }
 
@@ -231,6 +222,7 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 		if f, cacheErr := h.hfs.Cache.Open(cacheKey); cacheErr == nil {
 			h.st.cacheFile = f
 			h.st.loaded = true
+			h.st.size = meta.Size
 			return 0
 		}
 	}
@@ -256,6 +248,7 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 			if f, openErr := h.hfs.Cache.Open(cacheKey); openErr == nil {
 				h.st.cacheFile = f
 				h.st.loaded = true
+				h.st.size = meta.Size
 				return 0
 			}
 		}
@@ -263,6 +256,7 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 
 	h.st.buf = data
 	h.st.loaded = true
+	h.st.size = meta.Size
 	return 0
 }
 
@@ -438,13 +432,18 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 	// the inode may not have rewritten the backing object (e.g. truncate() on a
 	// path with no open write handle), so the cache file / buffer can hold stale
 	// bytes past EOF; clamping here serves the correct truncated view. For dirty
-	// handles the buffer/spill length is authoritative (writes may have extended
-	// past fileSize), so no clamp is applied.
+	// states the buffer/spill length is authoritative (writes may have extended
+	// past the stored size), so no clamp is applied.
+	//
+	// Clamp to the SHARED size, never to h.fileSize: a handle that opened when
+	// the file was shorter and never loaded it itself (a sibling got there first)
+	// still holds its open-time snapshot, and clamping to that would cut
+	// everyone's contents down to it.
 	clampLen := func(n int) int {
 		if h.st.dirty {
 			return n
 		}
-		avail := h.fileSize - off
+		avail := h.st.size - off
 		if avail < 0 {
 			avail = 0 // read starts past EOF — return nothing
 		}
@@ -490,8 +489,8 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 	if end > int64(len(h.st.buf)) {
 		end = int64(len(h.st.buf))
 	}
-	if !h.st.dirty && h.fileSize >= 0 && end > h.fileSize {
-		end = h.fileSize
+	if !h.st.dirty && h.st.size >= 0 && end > h.st.size {
+		end = h.st.size
 	}
 	if end <= off {
 		return fuse.ReadResultData(nil), 0
@@ -677,6 +676,7 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		}
 		h.st.cacheFile.Close()
 		h.st.cacheFile = nil
+		h.st.size = h.st.logicalSize()
 	}
 
 	// O_APPEND: ignore the offset the kernel handed us. It computed it from its
@@ -703,6 +703,7 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 			return 0, syscall.EIO
 		}
 		h.st.dirty = true
+		h.st.size = h.st.spillSize
 		return uint32(len(data)), 0
 	}
 
@@ -723,6 +724,7 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 			return 0, syscall.EIO
 		}
 		h.st.dirty = true
+		h.st.size = h.st.spillSize
 		return uint32(len(data)), 0
 	}
 
@@ -732,6 +734,7 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 	}
 	copy(h.st.buf[off:], data)
 	h.st.dirty = true
+	h.st.size = int64(len(h.st.buf))
 	return uint32(len(data)), 0
 }
 

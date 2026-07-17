@@ -3,9 +3,12 @@ package hfuse
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -426,6 +429,149 @@ func TestOpenTruncWithCacheBackedSibling(t *testing.T) {
 	}
 	if meta.Size != 3 {
 		t.Fatalf("`> file` left %d bytes, want 3: the truncated content came back", meta.Size)
+	}
+}
+
+// TestStaleFileSizeDoesNotClampSiblingsWrites covers the reader half of sharing.
+// readLoaded clamps clean reads to the handle's open-time fileSize; once the
+// buffer is shared, a handle that opened when the file was short and never
+// loaded it itself (because a sibling did) would clamp everyone's contents down
+// to its own stale idea of the size.
+//
+// This is what cost a line in the live two-appender run: `wc -l` opened while
+// the log was 15 bytes, a sibling reloaded the state clean at 18, and the read
+// came back clamped to 15.
+func TestStaleFileSizeDoesNotClampSiblingsWrites(t *testing.T) {
+	hfs, _ := setupStaging(t)
+	ctx := context.Background()
+
+	root := &HamstorNode{hfs: hfs, inodeID: 1}
+	id := mustInsert(t, hfs, "grow.txt")
+	w0 := NewTestHandle(hfs, id, true)
+	if errno := w0.TestWriteAt([]byte("AAAAA"), 0); errno != 0 {
+		t.Fatalf("seed write: %v", errno)
+	}
+	w0.TestFlush()
+	w0.WaitUpload()
+	w0.TestRelease()
+
+	n := &HamstorNode{hfs: hfs, inodeID: id}
+	_ = root
+
+	// R opens while the file is 5 bytes and does not read yet.
+	rfh, _, errno := n.Open(ctx, uint32(syscall.O_RDONLY))
+	if errno != 0 {
+		t.Fatalf("open R: %v", errno)
+	}
+	r := &TestHandle{h: rfh.(*HamstorHandle)}
+	defer r.TestRelease()
+
+	// A writer grows the file to 18 bytes and commits.
+	wfh, _, errno := n.Open(ctx, uint32(syscall.O_RDWR))
+	if errno != 0 {
+		t.Fatalf("open W: %v", errno)
+	}
+	w := &TestHandle{h: wfh.(*HamstorHandle)}
+	if errno := w.TestWriteAt([]byte("BBBBBBBBBBBBB"), 5); errno != 0 {
+		t.Fatalf("grow write: %v", errno)
+	}
+	if errno := w.TestFlush(); errno != 0 {
+		t.Fatalf("flush W: %v", errno)
+	}
+	w.WaitUpload()
+	w.TestRelease()
+
+	// A third handle loads the shared state clean at its new size.
+	cfh, _, errno := n.Open(ctx, uint32(syscall.O_RDONLY))
+	if errno != 0 {
+		t.Fatalf("open C: %v", errno)
+	}
+	c := &TestHandle{h: cfh.(*HamstorHandle)}
+	defer c.TestRelease()
+	if _, errno := c.TestRead(32, 0); errno != 0 {
+		t.Fatalf("read C: %v", errno)
+	}
+
+	// R now reads through the shared, already-loaded state. Its own fileSize is
+	// still 5; the file is 18.
+	got, errno := r.TestRead(32, 0)
+	if errno != 0 {
+		t.Fatalf("read R: %v", errno)
+	}
+	if len(got) != 18 {
+		t.Fatalf("stale fileSize clamped the read to %d bytes (%q), want 18", len(got), got)
+	}
+}
+
+// TestConcurrentAppendersViaOpen is the live two-appender scenario in process:
+// two writers each doing open(O_APPEND) / write / close, repeatedly, through the
+// real node.Open. Every line must survive.
+//
+// It goes through node.Open on purpose. Open both loads from storage and clamps
+// the shared buffer to a size it read before locking the state, so a sibling's
+// flush in that window makes the clamp cut their line off — a loss no test built
+// on registry handles can see. It reproduced at roughly one round in three on a
+// live mount.
+func TestConcurrentAppendersViaOpen(t *testing.T) {
+	hfs, _ := setupStaging(t)
+	ctx := context.Background()
+
+	const rounds = 12
+	for round := 0; round < rounds; round++ {
+		name := fmt.Sprintf("appendrace%d.log", round)
+		id := mustInsert(t, hfs, name)
+		seed := NewTestHandle(hfs, id, true)
+		seed.TestFlush() // commit an empty file
+		seed.TestRelease()
+
+		n := &HamstorNode{hfs: hfs, inodeID: id}
+		var wg sync.WaitGroup
+		for _, who := range []string{"A", "B"} {
+			wg.Add(1)
+			go func(who string) {
+				defer wg.Done()
+				for i := 1; i <= 3; i++ {
+					fh, _, errno := n.Open(ctx, uint32(syscall.O_WRONLY|syscall.O_APPEND))
+					if errno != 0 {
+						t.Errorf("%s%d open: %v", who, i, errno)
+						return
+					}
+					h := fh.(*HamstorHandle)
+					// Offset 0 is what the kernel hands an appender with a stale
+					// cached size; Write must ignore it.
+					if _, errno := h.Write(ctx, []byte(who+strconv.Itoa(i)+"\n"), 0); errno != 0 {
+						t.Errorf("%s%d write: %v", who, i, errno)
+						return
+					}
+					if errno := h.Flush(ctx); errno != 0 {
+						t.Errorf("%s%d flush: %v", who, i, errno)
+						return
+					}
+					h.Release(ctx)
+				}
+			}(who)
+		}
+		wg.Wait()
+		if t.Failed() {
+			return
+		}
+
+		hfs.InflightUploads.Wait()
+		got := readBack(t, hfs, id, 128)
+		if lines := strings.Count(string(got), "\n"); lines != 6 {
+			m, _ := hfs.DB.GetInode(id)
+			sp := hfs.VolumeBuilder.StagePath(id)
+			raw, rerr := os.ReadFile(sp)
+			t.Fatalf("round %d: %d lines, want 6: %q\n  DB: size=%d s3=%q vol=%q volsize=%d\n  staging file: %d bytes %q (err %v)",
+				round, lines, got, m.Size, m.S3Key, m.VolS3Key, m.VolSize, len(raw), raw, rerr)
+		}
+		for _, who := range []string{"A", "B"} {
+			for i := 1; i <= 3; i++ {
+				if !strings.Contains(string(got), who+strconv.Itoa(i)+"\n") {
+					t.Fatalf("round %d: %s%d lost: %q", round, who, i, got)
+				}
+			}
+		}
 	}
 }
 
