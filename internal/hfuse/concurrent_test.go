@@ -25,6 +25,15 @@ import (
 // proves nothing about the other, so each test says which one it wants.
 func setupStaging(t *testing.T) (*HamstorFS, string) {
 	t.Helper()
+	return setupStagingCache(t, nil)
+}
+
+// setupStagingCache is setupStaging with a disk cache wired into both the
+// filesystem and the builder, for tests that care about what packing leaves in
+// the cache. Passing nil keeps the cache-free behaviour every other staging test
+// was written against.
+func setupStagingCache(t *testing.T, c *cache.DiskCache) (*HamstorFS, string) {
+	t.Helper()
 
 	hfs, dbPath := setupTest(t)
 	stagingDir := filepath.Join(filepath.Dir(dbPath), "staging")
@@ -32,8 +41,15 @@ func setupStaging(t *testing.T) (*HamstorFS, string) {
 		t.Fatalf("staging dir: %v", err)
 	}
 	hfs.SpillDir = t.TempDir()
-	hfs.VolumeBuilder = volume.NewBuilder(hfs.DB, hfs.Store, stagingDir)
-	t.Cleanup(func() { hfs.VolumeBuilder.Close() })
+	hfs.Cache = c
+	hfs.VolumeBuilder = volume.NewBuilder(hfs.DB, hfs.Store, stagingDir, c)
+	// Nil-tolerant: a test that packs its backlog closes the builder itself and
+	// hands the field back as nil (see packStaged), and Close is not idempotent.
+	t.Cleanup(func() {
+		if hfs.VolumeBuilder != nil {
+			hfs.VolumeBuilder.Close()
+		}
+	})
 	return hfs, dbPath
 }
 

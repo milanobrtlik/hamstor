@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
 )
@@ -67,6 +68,7 @@ const closeTimeout = 30 * time.Second
 type Builder struct {
 	db    *db.DB
 	store *s3store.Store
+	cache *cache.DiskCache // nil means no caching
 
 	stagingDir string
 	notify     chan struct{}
@@ -77,11 +79,14 @@ type Builder struct {
 }
 
 // NewBuilder creates a volume builder that scans stagingDir for files to pack.
-func NewBuilder(database *db.DB, store *s3store.Store, stagingDir string) *Builder {
+// diskCache may be nil; when present, every sealed volume is stored in it so the
+// bytes we just packed are readable locally instead of being downloaded back.
+func NewBuilder(database *db.DB, store *s3store.Store, stagingDir string, diskCache *cache.DiskCache) *Builder {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Builder{
 		db:         database,
 		store:      store,
+		cache:      diskCache,
 		stagingDir: stagingDir,
 		notify:     make(chan struct{}, 1),
 		done:       make(chan struct{}),
@@ -155,6 +160,29 @@ func (b *Builder) NotifyStaged() {
 	}
 }
 
+// cacheVolume stores a freshly sealed volume in the disk cache under the key the
+// read path looks for ("volobj/<volKey>", see hfuse.readNeedle). Without it the
+// bytes we just uploaded get downloaded straight back on the first read of any
+// file in the volume, so a bulk write of small files sends its data on a local
+// disk -> S3 -> local disk round trip.
+//
+// The buffer we pack is byte-identical to what the read path caches: needles are
+// encrypted individually before staging, so the volume object itself is never
+// transformed on the way to or from S3.
+//
+// Call only after CommitNeedlesToVolume succeeded. On the failure paths the
+// volume has just been deleted from S3, and caching it would serve bytes that
+// nothing references. A failed cache write is logged and ignored — this is an
+// optimisation, never correctness.
+func (b *Builder) cacheVolume(volKey string, data []byte) {
+	if b.cache == nil {
+		return
+	}
+	if err := b.cache.Put("volobj/"+volKey, data); err != nil {
+		log.Printf("hamstor: volume builder cache put %s: %v", volKey, err)
+	}
+}
+
 // FlushInode packs a single staged file into a volume and uploads it to S3,
 // providing on-demand S3 durability for Fsync.
 func (b *Builder) FlushInode(inodeID int64) error {
@@ -224,6 +252,9 @@ func (b *Builder) FlushInode(inodeID int64) error {
 		b.store.Delete(b.ctx, volKey)
 		restoreClaim(claimPath, path) // restore for retry
 		return fmt.Errorf("flush inode %d: commit: %w", inodeID, err)
+	}
+	if len(committedIDs) > 0 {
+		b.cacheVolume(volKey, data)
 	}
 	// Remove the claimed file. If no needles were committed, the uploaded S3
 	// volume is orphaned and GC will clean it.
@@ -482,6 +513,12 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 			b.store.Delete(b.ctx, volKey)
 			restorePaths(paths)
 			return
+		}
+
+		// Zero needles committed leaves an orphaned volume for GC — caching it
+		// would only occupy space nothing can reference.
+		if len(committedIDs) > 0 {
+			b.cacheVolume(volKey, data)
 		}
 
 		// Remove staging files only for needles that were actually committed.
