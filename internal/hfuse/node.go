@@ -10,11 +10,8 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
-	"github.com/milan/hamstor/internal/media"
-	"github.com/milan/hamstor/internal/ratelimit"
 	"github.com/milan/hamstor/internal/thumb"
 	sqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -448,21 +445,24 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		}
 	}
 
-	// Enable streaming mode for multimedia files opened read-only (separate from
-	// write block above). Disabled under encryption: stored objects are a single
-	// whole-file AES-256-GCM blob, so a byte-range slice is undecryptable
-	// ciphertext. Encrypted media instead falls through to the full-download +
-	// decrypt path in ensureLoaded.
-	if flags&writeFlags == 0 && n.hfs.Encryptor == nil && media.IsMediaExt(meta.Name) && n.hfs.StreamRate > 0 {
-		rateBps := float64(n.hfs.StreamRate) * (1 << 20) // MB/s to bytes/s
-		burstBytes := float64(n.hfs.StreamBuffer) * (1 << 20)
-		handle.streaming = true
-		handle.rateLimiter = ratelimit.New(rateBps, burstBytes)
-		handle.streamChunksCap = n.hfs.StreamBuffer * (1 << 20) / cache.ChunkSize
-		if handle.streamChunksCap < 4 {
-			handle.streamChunksCap = 4
-		}
-	}
+	// Streaming mode for multimedia is OFF, deliberately, until it can fetch per
+	// block.
+	//
+	// It exists to serve a movie by ranging into the one object that holds it,
+	// rate-limited, without downloading the whole thing first. A file written as
+	// blocks has no such object, and h.s3Key is empty for every file the write
+	// path has produced since it switched — so enabling it here sends
+	// DownloadRange for the EMPTY KEY and answers EIO for a perfectly healthy
+	// file. --stream-rate defaults to 5, so every media file on an unencrypted
+	// mount has been unreadable, and nothing caught it because no test ever set
+	// StreamRate.
+	//
+	// Media now falls through to ensureLoaded, which fetches every block and
+	// serves the file whole: slower to first byte, but correct. Re-enabling it on
+	// blocks also retires the "no streaming under encryption" limitation, since
+	// each block is separately decryptable — both belong to the same change.
+	//
+	// TestStreamingMediaFileReads covers the read either way.
 
 	ok = true
 	return handle, fuse.FOPEN_DIRECT_IO, 0
