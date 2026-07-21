@@ -13,6 +13,7 @@ import (
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/thumb"
+	"github.com/milan/hamstor/internal/volume"
 	sqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -105,7 +106,19 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 		// pre-truncate contents and resurrect the tail on their next flush.
 		st := n.hfs.tryAcquireWrite(n.inodeID)
 		if st != nil {
-			errno := truncateWriteState(st, s)
+			// Wait out any in-flight upload first. SetAttr below now deletes the
+			// block rows past the new end and this returns their objects for
+			// deletion; an upload committing after that re-inserts rows for
+			// objects that are already gone, leaving the file with rows pointing
+			// at nothing — EIO on the next read of that region. It is the same
+			// rule as Open's write preload: do not act on a version of the inode
+			// an upload is about to replace.
+			st.mu.Lock()
+			errno := st.awaitUpload()
+			st.mu.Unlock()
+			if errno == 0 {
+				errno = n.hfs.truncateWriteState(st, s)
+			}
 			n.hfs.releaseWrite(n.inodeID, st)
 			if errno != 0 {
 				return errno
@@ -128,9 +141,16 @@ func (n *HamstorNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Set
 		mtimePtr = &ns
 	}
 
-	if err := n.hfs.DB.SetAttr(n.inodeID, sizePtr, modePtr, mtimePtr); err != nil {
+	orphaned, err := n.hfs.DB.SetAttr(n.inodeID, sizePtr, modePtr, mtimePtr)
+	if err != nil {
 		return toErrno(err)
 	}
+	// The blocks a shrink cut off. Deleted only AFTER the transaction stopped
+	// referencing them: a crash in this order leaves orphans for GC, while the
+	// reverse deletes live data. Without this, truncate(2) on a path with no open
+	// write handle leaves the rows behind and growing the file back serves the
+	// old tail where it should read as zeroes.
+	n.hfs.dropObjects(ctx, orphaned)
 
 	// Handle chown
 	if uid, ok := in.GetUID(); ok {
@@ -302,16 +322,23 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 	// then commit as the whole file), while hasData true without a block branch
 	// below would send it down the staging path to hunt for a staging file that
 	// never existed.
-	var blocks []db.BlockCommit
+	// HasBlocks, not BlocksForInode: this is a routing question, and a 4 TB file
+	// has 524288 block rows. Reading them all to learn one bit would charge every
+	// open the file's size — which is what lazy materialization is here to stop.
+	var hasBlocks bool
 	if meta.VolS3Key == "" && meta.Size > 0 {
-		b, bErr := n.hfs.DB.BlocksForInode(n.inodeID)
+		b, bErr := n.hfs.DB.HasBlocks(n.inodeID)
 		if bErr != nil {
 			return nil, 0, toErrno(bErr)
 		}
-		blocks = b
+		hasBlocks = b
 	}
+	// Too big to have ever been staged, with no needle and no blocks: a sparse
+	// file, not a file whose data went missing. It attaches like a block-stored
+	// one and every block resolves to a hole. See ensureLoaded.
+	sparse := meta.VolS3Key == "" && !hasBlocks && meta.Size > volume.MaxNeedleSize
 
-	hasData := meta.VolS3Key != "" || len(blocks) > 0 ||
+	hasData := meta.VolS3Key != "" || hasBlocks || sparse ||
 		(meta.Size > 0 && n.hfs.VolumeBuilder != nil)
 
 	// O_TRUNC empties the file for everyone, so it applies even when another
@@ -330,17 +357,29 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		}
 		st.buf = nil
 		// Nothing written since the last flush survives an emptied file, and the
-		// commit at size 0 drops every block anyway.
+		// commit at size 0 drops every block anyway. The presence map goes with
+		// it: an emptied file has no block to be present, and a stale entry would
+		// tell a later read that a block it never fetched is already local.
 		st.dirtyBlocks = nil
+		st.presentBlocks = nil
+		st.blockBacked = false
+		// Nothing of the old storage survives, so nothing has to be carried
+		// across: the commit at size 0 drops the needle and every block.
+		st.wholeLoaded = false
 		st.loaded = true
 		st.dirty = true
 		st.size = 0
 	} else if flags&writeFlags != 0 && hasData && !st.loaded {
-		if len(blocks) > 0 {
-			// Shares loadFromBlocks with ensureLoaded rather than repeating it:
-			// hole handling and the short-last-block clamp are exactly the kind of
-			// thing a second copy gets subtly wrong.
-			if errno := handle.loadFromBlocks(ctx, blocks, meta.Size); errno != 0 {
+		if hasBlocks || sparse {
+			// Attach a sparse backing store and fetch NOTHING. Opening a large
+			// file for writing used to download all of it — the read-modify-write
+			// this whole layout exists to retire. Write faults in the blocks it
+			// partially overwrites; readLoaded faults in what it serves.
+			//
+			// Shares attachBlocks with ensureLoaded rather than repeating it: the
+			// store's length is an invariant the rest of the state reads off, and
+			// a second copy gets that kind of thing subtly wrong.
+			if errno := handle.attachBlocks(meta.Size); errno != 0 {
 				return nil, 0, errno
 			}
 		} else if meta.VolS3Key != "" {
@@ -358,6 +397,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			}
 			st.buf = data
 			st.loaded = true
+			st.wholeLoaded = true // a needle: the next block commit drops it
 		} else if n.hfs.VolumeBuilder != nil {
 			// Preload from staging dir (file staged but not yet packed)
 			data, settled, dlErr := n.openPreloadStaged(ctx, handle)
@@ -367,6 +407,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			if !settled {
 				st.buf = data
 				st.loaded = true
+				st.wholeLoaded = true // a staging file: the next commit drops it
 			}
 		}
 
@@ -386,6 +427,11 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 				st.buf = st.buf[:meta.Size]
 			}
 			st.size = meta.Size
+			// Anything recorded about blocks the file no longer has goes with
+			// them: a present index that survives a shrink claims the store holds
+			// that block, so growing the file again would serve the zeroes the
+			// re-extension left rather than fetch the row that is still there.
+			st.dropBlocksPast(meta.Size)
 		}
 	}
 
@@ -438,12 +484,12 @@ func (n *HamstorNode) openPreloadStaged(ctx context.Context, handle *HamstorHand
 		}
 		if meta.VolS3Key == "" {
 			if meta.Size > 0 {
-				blocks, bErr := n.hfs.DB.BlocksForInode(n.inodeID)
+				has, bErr := n.hfs.DB.HasBlocks(n.inodeID)
 				if bErr != nil {
 					return nil, false, toErrno(bErr)
 				}
-				if len(blocks) > 0 {
-					return nil, true, handle.loadFromBlocks(ctx, blocks, meta.Size)
+				if has || meta.Size > volume.MaxNeedleSize {
+					return nil, true, handle.attachBlocks(meta.Size)
 				}
 			}
 			return nil, false, syscall.EIO
