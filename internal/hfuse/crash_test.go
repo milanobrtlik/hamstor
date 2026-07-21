@@ -1,8 +1,11 @@
 package hfuse
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/milan/hamstor/internal/db"
@@ -151,5 +154,85 @@ func TestCrashHookInFlush(t *testing.T) {
 	_, err = database2.GetInode(fileID)
 	if err == nil {
 		t.Fatal("expected inode to be cleaned up")
+	}
+}
+
+// TestCrashBetweenBlockUploadAndCommit covers the window the block layout widened:
+// a multi-block flush uploads N objects and only then opens the transaction, so a
+// crash in between leaves objects in the bucket that no row names.
+//
+// What must hold is that nothing is half-committed. A file with rows for the
+// blocks that made it and none for the rest reads as data followed by zeroes, and
+// nothing ever reports it — which is precisely why the commit is one transaction
+// after all the uploads rather than a row per object.
+//
+// A real crash also cannot retain anything: retention runs in the failure branch
+// of the upload loop, and there is no failure here, just death. So the pending
+// directory stays empty and Cleanup removes the inode on the next start, naming
+// it. The orphaned objects are GC phase 1's problem.
+func TestCrashBetweenBlockUploadAndCommit(t *testing.T) {
+	hfs, dbPath := setupTest(t)
+	hfs.SpillDir = t.TempDir()
+	pendingDir := filepath.Join(filepath.Dir(dbPath), "pending")
+	if err := os.MkdirAll(pendingDir, 0o755); err != nil {
+		t.Fatalf("pending dir: %v", err)
+	}
+	hfs.PendingDir = pendingDir
+
+	crashed := false
+	hfs.TestCrashBeforeCommit = func() {
+		crashed = true
+		panic("simulated crash")
+	}
+
+	fileID, err := hfs.DB.InsertInode(1, "crash-blocks.bin", 0o100644, "pending")
+	if err != nil {
+		t.Fatalf("insert inode: %v", err)
+	}
+
+	handle := NewTestHandle(hfs, fileID, true)
+	if errno := handle.TestWriteAt(bytes.Repeat([]byte("c"), 2*db.BlockSize), 0); errno != 0 {
+		t.Fatalf("write: %v", errno)
+	}
+	handle.TestFlush()
+	handle.WaitUpload()
+	handle.TestRelease()
+
+	if !crashed {
+		t.Fatal("crash hook was not called — the upload never reached the commit window")
+	}
+
+	if blocks, _ := hfs.DB.BlocksForInode(fileID); len(blocks) != 0 {
+		t.Fatalf("crash left %d block row(s); a file with rows for some blocks and not others reads as "+
+			"data followed by zeroes and nothing reports it", len(blocks))
+	}
+	meta, err := hfs.DB.GetInode(fileID)
+	if err != nil {
+		t.Fatalf("get inode: %v", err)
+	}
+	if meta.Status != "pending" {
+		t.Fatalf("status %q, want pending", meta.Status)
+	}
+	if entries, _ := os.ReadDir(pendingDir); len(entries) != 0 {
+		t.Errorf("a crash retained %v; retention only runs when an upload reports an error, and death is "+
+			"not an error", entryNames(entries))
+	}
+
+	// --- restart ---
+	hfs.DB.Close()
+	database2, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer database2.Close()
+
+	if err := RecoverPending(database2, hfs.Store, pendingDir); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if err := Cleanup(database2, hfs.Store, pendingDir); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := database2.GetInode(fileID); err == nil {
+		t.Fatal("a pending inode with nothing retained must be cleaned up")
 	}
 }
