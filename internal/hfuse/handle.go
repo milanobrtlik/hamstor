@@ -8,13 +8,11 @@ import (
 	"log"
 	"os"
 	"slices"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/ratelimit"
@@ -22,8 +20,6 @@ import (
 	"github.com/milan/hamstor/internal/thumb"
 	"github.com/milan/hamstor/internal/volume"
 )
-
-const readAheadChunks = 3 // prefetch 3 chunks ahead (~6 MB)
 
 // spillThreshold is the size at which writes switch from memory to a temp file.
 const spillThreshold = 64 << 20 // 64 MB
@@ -42,18 +38,6 @@ type HamstorHandle struct {
 	// own. Obtained from hfs.acquireWrite, dropped in Release.
 	st *inodeWrite
 
-	// s3Key is ALWAYS EMPTY, and nothing assigns it any more: an inode names no
-	// whole-file object, so there is no single key a range read could target.
-	// It survives only to keep readChunked/getOrFetchChunk/prefetchChunks and
-	// fetchStreamChunk compiling until they are rewritten to fetch per block,
-	// which also closes their two gates: readChunked's `s3Key != ""` test never
-	// passes, and Open no longer turns streaming on. Deleting the field means
-	// deleting those five functions, and they are meant to be rewritten, not lost.
-	//
-	// It carries no invariant and nothing reads it — unlike inodeWrite.cacheFile,
-	// which became equally unreachable and was removed outright because the code
-	// around it kept rules for a state that could no longer occur.
-	s3Key string
 	// fileSize is this handle's own view of the logical size, taken at open time
 	// and refreshed only when this handle loads.
 	//
@@ -73,21 +57,25 @@ type HamstorHandle struct {
 
 	released bool
 
-	// Chunk prefetch coordination
-	prefetching    sync.Map           // int64 -> bool: chunks currently being fetched
-	prefetchSem    chan struct{}      // limits concurrent prefetch goroutines
-	prefetchCtx    context.Context    // shared context for all prefetch goroutines
-	cancelPrefetch context.CancelFunc // cancels background prefetch goroutines
-
-	// Streaming mode (multimedia files)
-	streaming       bool
-	rateLimiter     *ratelimit.Bucket
-	streamChunks    []streamChunk // ring buffer of recent chunks
-	streamChunksCap int
+	// Streaming mode (multimedia files). See readStreaming: the handle serves
+	// the file a block at a time out of streamBlocks, rate-limited, and puts
+	// nothing in the disk cache.
+	streaming   bool
+	rateLimiter *ratelimit.Bucket
+	// streamBlocks is a ring of recently served blocks, and it is the whole of
+	// this handle's memory budget: at most streamBlocksCap * db.BlockSize.
+	//
+	// It cannot be dropped in favour of the disk cache the way the block fault
+	// path uses it, because streaming deliberately does not write there — a
+	// 4 GB film played once would evict everything else. Without a ring, every
+	// 128 KB read the kernel sends would re-download the whole 8 MiB block it
+	// falls in.
+	streamBlocks    []streamBlock
+	streamBlocksCap int
 	lastStreamOff   int64 // for seek detection
 }
 
-type streamChunk struct {
+type streamBlock struct {
 	index int64
 	data  []byte
 }
@@ -343,9 +331,7 @@ func (h *HamstorHandle) faultBlock(ctx context.Context, idx int64) syscall.Errno
 			h.inodeID, idx, b.S3Key, err)
 		return toErrno(err)
 	}
-	if extent := min(int64(db.BlockSize), h.st.size-start, b.Size); int64(len(data)) > extent {
-		data = data[:extent]
-	}
+	data = clampBlock(data, h.st.size, start, b.Size)
 
 	if h.st.spillFile != nil {
 		if _, werr := h.st.spillFile.WriteAt(data, start); werr != nil {
@@ -424,16 +410,49 @@ func (h *HamstorHandle) materializeForWrite(ctx context.Context, off, n int64) s
 // of a block is a new key and the old entry can never be mistaken for the new
 // one.
 func (h *HamstorHandle) fetchBlock(ctx context.Context, b db.BlockCommit) ([]byte, error) {
+	if data, ok := h.blockFromCache(b.S3Key); ok {
+		return data, nil
+	}
+	data, err := h.downloadBlock(ctx, b)
+	if err != nil {
+		return nil, err
+	}
 	if h.hfs.Cache != nil {
-		if f, err := h.hfs.Cache.Open(b.S3Key); err == nil {
-			data, rerr := io.ReadAll(f)
-			f.Close()
-			if rerr == nil {
-				return data, nil
-			}
+		if putErr := h.hfs.Cache.Put(b.S3Key, data); putErr != nil {
+			log.Printf("hamstor: cache put block %s: %v", b.S3Key, putErr)
 		}
 	}
+	return data, nil
+}
 
+// blockFromCache returns one block's plaintext if the disk cache holds it.
+//
+// Split out of fetchBlock so the streaming path can share the lookup without
+// sharing the Put that follows it: streaming reads local bytes gladly but must
+// never seed the cache, or one film played once evicts everything else in it.
+func (h *HamstorHandle) blockFromCache(key string) ([]byte, bool) {
+	if h.hfs.Cache == nil {
+		return nil, false
+	}
+	f, err := h.hfs.Cache.Open(key)
+	if err != nil {
+		return nil, false
+	}
+	data, rerr := io.ReadAll(f)
+	f.Close()
+	if rerr != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// downloadBlock fetches one block's object from S3 and decrypts it.
+//
+// Each block is encrypted on its own — crypto.Encrypt emits a fresh
+// [version][nonce][ct+tag] per call — so a block object is independently
+// decryptable. That is what lets streaming range over an encrypted file at all,
+// which the whole-file layout could not do.
+func (h *HamstorHandle) downloadBlock(ctx context.Context, b db.BlockCommit) ([]byte, error) {
 	data, err := h.hfs.Store.Download(ctx, b.S3Key)
 	if err != nil {
 		return nil, err
@@ -444,12 +463,28 @@ func (h *HamstorHandle) fetchBlock(ctx context.Context, b db.BlockCommit) ([]byt
 			return nil, fmt.Errorf("decrypt block %d (%s): %w", b.Index, b.S3Key, err)
 		}
 	}
-	if h.hfs.Cache != nil {
-		if putErr := h.hfs.Cache.Put(b.S3Key, data); putErr != nil {
-			log.Printf("hamstor: cache put block %s: %v", b.S3Key, putErr)
-		}
-	}
 	return data, nil
+}
+
+// clampBlock cuts a fetched block down to the bytes the file still claims.
+//
+// Both clamps are load-bearing and neither implies the other, which is why this
+// is one function rather than an expression repeated at each fetch site:
+//
+//   - size-start is the block's live extent within the file, because the logical
+//     size is the only authority on how long the file is;
+//   - stored is b.Size, how many of the block's bytes the file still claims. A
+//     truncate that cut into this block only shortened that number — the object
+//     was not rewritten — so it still holds the old tail, and the live extent
+//     alone would happily place all of it when the file grows back.
+func clampBlock(data []byte, size, start, stored int64) []byte {
+	if extent := min(int64(db.BlockSize), size-start, stored); int64(len(data)) > extent {
+		if extent < 0 {
+			extent = 0
+		}
+		return data[:extent]
+	}
+	return data
 }
 
 // readNeedle returns the raw (still-encrypted, if the mount is encrypted) bytes
@@ -526,8 +561,11 @@ func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.
 	h.st.mu.Lock()
 	defer h.st.mu.Unlock()
 
-	// Streaming mode for multimedia files — rate-limited, no disk cache
-	if h.streaming {
+	// Streaming mode for multimedia files — rate-limited, bounded memory, no
+	// disk cache. Skipped once the shared state is dirty: streaming reads the
+	// committed blocks, so with a writer's buffer sitting in front of them it
+	// would serve the version that writer is in the middle of replacing.
+	if h.streaming && !h.st.dirty {
 		return h.readStreaming(ctx, dest, off)
 	}
 
@@ -537,162 +575,10 @@ func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.
 		return h.readLoaded(ctx, dest, off)
 	}
 
-	// Chunk-based path: unencrypted, has S3 key, not dirty, cache available —
-	// and the whole file is not already cached. Range-reading an object we hold
-	// in full locally would download bytes we have, and PutChunk deletes the
-	// whole-file entry to put its chunk directory at that path, so the first
-	// read after a flush would throw away the copy the flush just kept.
-	if h.s3Key != "" && h.hfs.Encryptor == nil && !h.st.dirty && h.hfs.Cache != nil &&
-		!h.hfs.Cache.Has(h.s3Key) {
-		if off >= h.fileSize {
-			return fuse.ReadResultData(nil), 0
-		}
-		result, errno := h.readChunked(ctx, dest, off)
-		if errno == 0 {
-			return result, 0
-		}
-		log.Printf("hamstor: chunked read failed, falling back to full download")
-	}
-
 	if errno := h.ensureLoaded(ctx); errno != 0 {
 		return nil, errno
 	}
 	return h.readLoaded(ctx, dest, off)
-}
-
-// readChunked serves a read from chunk-based cache, fetching missing chunks from S3.
-func (h *HamstorHandle) readChunked(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	length := int64(len(dest))
-	if off+length > h.fileSize {
-		length = h.fileSize - off
-	}
-	if length <= 0 {
-		return fuse.ReadResultData(nil), 0
-	}
-
-	firstChunk := cache.ChunkIndex(off)
-	lastChunk := cache.ChunkIndex(off + length - 1)
-
-	// Collect data from chunks
-	buf := make([]byte, 0, length)
-	for ci := firstChunk; ci <= lastChunk; ci++ {
-		chunkData, err := h.getOrFetchChunk(ctx, ci)
-		if err != nil {
-			return nil, syscall.EIO
-		}
-
-		// Calculate the slice of this chunk that overlaps [off, off+length)
-		chunkStart := ci * cache.ChunkSize
-		sliceStart := int64(0)
-		if off > chunkStart {
-			sliceStart = off - chunkStart
-		}
-		sliceEnd := int64(len(chunkData))
-		if chunkStart+sliceEnd > off+length {
-			sliceEnd = off + length - chunkStart
-		}
-		if sliceStart < int64(len(chunkData)) && sliceEnd > sliceStart {
-			buf = append(buf, chunkData[sliceStart:sliceEnd]...)
-		}
-	}
-
-	// Prefetch ahead in background
-	h.prefetchChunks(lastChunk+1, readAheadChunks)
-
-	return fuse.ReadResultData(buf), 0
-}
-
-// getOrFetchChunk returns chunk data from cache or fetches it from S3.
-// Called with h.st.mu held — serializes downloads per handle.
-func (h *HamstorHandle) getOrFetchChunk(ctx context.Context, index int64) ([]byte, error) {
-	// Try cache first
-	if data, err := h.hfs.Cache.GetChunk(h.s3Key, index); err == nil {
-		return data, nil
-	}
-
-	// Fetch from S3 via range request
-	chunkStart := index * cache.ChunkSize
-	chunkLen := int64(cache.ChunkSize)
-	if chunkStart+chunkLen > h.fileSize {
-		chunkLen = h.fileSize - chunkStart
-	}
-	if chunkLen <= 0 {
-		return nil, nil
-	}
-
-	data, err := h.hfs.Store.DownloadRange(ctx, h.s3Key, chunkStart, chunkLen)
-	if err != nil {
-		return nil, err
-	}
-
-	// Cache the chunk (best-effort)
-	if putErr := h.hfs.Cache.PutChunk(h.s3Key, index, data); putErr != nil {
-		log.Printf("hamstor: chunk cache put failed: %v", putErr)
-	}
-
-	return data, nil
-}
-
-// prefetchChunks fetches upcoming chunks in the background.
-// Uses per-chunk deduplication and a semaphore to limit concurrency.
-func (h *HamstorHandle) prefetchChunks(startIndex int64, count int) {
-	if h.fileSize <= 0 {
-		return
-	}
-	maxChunk := cache.ChunkIndex(h.fileSize-1) + 1
-	s3Key := h.s3Key
-	hfs := h.hfs
-	fileSize := h.fileSize
-
-	// Lazy init semaphore and cancel context (max 2 concurrent prefetches).
-	// The context is created ONCE per handle and reused for every prefetch
-	// batch, so Release()'s single cancelPrefetch() call reliably aborts every
-	// in-flight prefetch goroutine the handle ever launched. (Previously a fresh
-	// context+cancel was created on every read, dropping earlier CancelFuncs and
-	// leaking goroutines that could no longer be cancelled.)
-	if h.prefetchSem == nil {
-		h.prefetchSem = make(chan struct{}, 2)
-	}
-	if h.cancelPrefetch == nil {
-		h.prefetchCtx, h.cancelPrefetch = context.WithCancel(context.Background())
-	}
-	ctx := h.prefetchCtx
-
-	for i := 0; i < count; i++ {
-		ci := startIndex + int64(i)
-		if ci >= maxChunk {
-			break
-		}
-		if hfs.Cache.HasChunk(s3Key, ci) {
-			continue
-		}
-		// Deduplicate: skip if this chunk is already being fetched
-		if _, loaded := h.prefetching.LoadOrStore(ci, true); loaded {
-			continue
-		}
-		// Try to acquire semaphore (non-blocking)
-		select {
-		case h.prefetchSem <- struct{}{}:
-		default:
-			h.prefetching.Delete(ci)
-			return // all prefetch slots busy, stop
-		}
-		go func(idx int64) {
-			defer func() { <-h.prefetchSem }()
-			defer h.prefetching.Delete(idx)
-
-			chunkStart := idx * cache.ChunkSize
-			chunkLen := int64(cache.ChunkSize)
-			if chunkStart+chunkLen > fileSize {
-				chunkLen = fileSize - chunkStart
-			}
-			data, err := hfs.Store.DownloadRange(ctx, s3Key, chunkStart, chunkLen)
-			if err != nil {
-				return
-			}
-			hfs.Cache.PutChunk(s3Key, idx, data)
-		}(ci)
-	}
 }
 
 func (h *HamstorHandle) readLoaded(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -767,7 +653,22 @@ func (h *HamstorHandle) readLoaded(ctx context.Context, dest []byte, off int64) 
 
 // --- Streaming mode (multimedia) ---
 
-// readStreaming serves reads for multimedia files with rate limiting and in-memory LRU.
+// readStreaming serves a media file one block at a time, rate-limited, with a
+// bounded memory footprint and without seeding the disk cache. Called with
+// st.mu held; it releases and re-acquires the lock while waiting on the rate
+// limiter.
+//
+// It is the one read path with a footprint that does not grow with the file.
+// Everything else attaches a backing store the length of the file and faults
+// into it, so a sequential read of a 4 GB film materializes 4 GB in the spill
+// directory. Here nothing is attached at all: the blocks a read touches are
+// fetched, served, and dropped when the ring wraps.
+//
+// The disk cache is read but never written. A film watched once would otherwise
+// evict most of what the cache holds and then, being the largest thing in it,
+// buy nothing for what it displaced. Bytes already local are still served from
+// there, and — because they cost no S3 bandwidth — without paying the rate
+// limiter.
 func (h *HamstorHandle) readStreaming(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	if off >= h.fileSize {
 		return fuse.ReadResultData(nil), 0
@@ -778,56 +679,38 @@ func (h *HamstorHandle) readStreaming(ctx context.Context, dest []byte, off int6
 		length = h.fileSize - off
 	}
 
-	// Detect seek: non-sequential read → reset rate limiter for fast resume
+	// Detect seek: a non-sequential read must not queue behind credit the
+	// sequential playback before it used up. A player that jumps to a chapter
+	// would otherwise sit through the wait its own earlier reads earned.
 	if h.rateLimiter != nil && off != h.lastStreamOff {
 		h.rateLimiter.Reset()
 	}
 
-	firstChunk := cache.ChunkIndex(off)
-	lastChunk := cache.ChunkIndex(off + length - 1)
-
 	buf := make([]byte, 0, length)
-	for ci := firstChunk; ci <= lastChunk; ci++ {
-		chunkData := h.getStreamChunk(ci)
-		if chunkData == nil {
-			// Rate limit before S3 download
-			if h.rateLimiter != nil {
-				h.st.mu.Unlock()
-				if err := h.rateLimiter.Wait(ctx, cache.ChunkSize); err != nil {
-					h.st.mu.Lock()
-					return nil, syscall.EINTR
-				}
-				h.st.mu.Lock()
-				// Revalidate after re-acquiring lock
-				if h.released {
-					return nil, syscall.EIO
-				}
-			}
+	for bi := off / db.BlockSize; bi <= (off+length-1)/db.BlockSize; bi++ {
+		start := bi * db.BlockSize
 
-			// Check memory cache again (another Read might have fetched it while we waited)
-			chunkData = h.getStreamChunk(ci)
-			if chunkData == nil {
-				var err error
-				chunkData, err = h.fetchStreamChunk(ctx, ci)
-				if err != nil {
-					log.Printf("hamstor: stream chunk fetch failed: %v", err)
-					return nil, syscall.EIO
-				}
-			}
+		data, errno := h.streamBlockData(ctx, bi, start)
+		if errno != 0 {
+			return nil, errno
 		}
 
-		// Slice the chunk to the requested range
-		chunkStart := ci * cache.ChunkSize
-		sliceStart := int64(0)
-		if off > chunkStart {
-			sliceStart = off - chunkStart
+		// Block-relative bounds of what this read wants, capped at the block's
+		// live extent within the file.
+		lo := max(int64(0), off-start)
+		hi := min(int64(db.BlockSize), off+length-start, h.fileSize-start)
+
+		// Whatever the object supplied, then zeroes to the live extent. The
+		// padding is not a corner case: a hole arrives here as no data at all,
+		// and a block whose stored size was shortened by a truncate the file has
+		// since grown back past must read as zeroes there — cutting the read
+		// short instead would report a hole in the middle of a file as EOF.
+		if end := min(hi, int64(len(data))); end > lo {
+			buf = append(buf, data[lo:end]...)
+			lo = end
 		}
-		sliceEnd := int64(len(chunkData))
-		if chunkStart+sliceEnd > off+length {
-			sliceEnd = off + length - chunkStart
-		}
-		if sliceStart < int64(len(chunkData)) && sliceEnd > sliceStart {
-			buf = append(buf, chunkData[sliceStart:sliceEnd]...)
+		if hi > lo {
+			buf = append(buf, make([]byte, hi-lo)...)
 		}
 	}
 
@@ -835,48 +718,91 @@ func (h *HamstorHandle) readStreaming(ctx context.Context, dest []byte, off int6
 	return fuse.ReadResultData(buf), 0
 }
 
-// fetchStreamChunk downloads a chunk from S3 and stores it in the memory LRU.
-func (h *HamstorHandle) fetchStreamChunk(ctx context.Context, index int64) ([]byte, error) {
-	chunkStart := index * cache.ChunkSize
-	chunkLen := int64(cache.ChunkSize)
-	if chunkStart+chunkLen > h.fileSize {
-		chunkLen = h.fileSize - chunkStart
-	}
-	if chunkLen <= 0 {
-		return nil, nil
+// streamBlockData returns whatever block bi stores, from the ring, from the disk
+// cache, or from S3 behind the rate limiter. Called with st.mu held; it may
+// release and re-acquire it.
+//
+// It returns NOTHING for a hole (a block with no row) rather than a block of
+// zeroes: the caller pads to the live extent anyway, and a hole must cost
+// neither a fetch nor rate-limiter credit — the same distinction faultBlock
+// draws. Charging for holes would stall playback of a sparse file on bytes that
+// were never stored, and materializing them would put 8 MiB of zeroes in the
+// ring for every hole crossed, evicting blocks that cost something to obtain.
+func (h *HamstorHandle) streamBlockData(ctx context.Context, bi, start int64) ([]byte, syscall.Errno) {
+	if data := h.getStreamBlock(bi); data != nil {
+		return data, 0
 	}
 
-	data, err := h.hfs.Store.DownloadRange(ctx, h.s3Key, chunkStart, chunkLen)
+	b, ok, err := h.hfs.DB.BlockAt(h.inodeID, bi)
 	if err != nil {
-		return nil, err
+		return nil, toErrno(err)
+	}
+	if !ok {
+		return nil, 0 // hole
 	}
 
-	h.putStreamChunk(index, data)
-	return data, nil
+	if data, hit := h.blockFromCache(b.S3Key); hit {
+		data = clampBlock(data, h.fileSize, start, b.Size)
+		h.putStreamBlock(bi, data)
+		return data, 0
+	}
+
+	if h.rateLimiter != nil {
+		extent := min(int64(db.BlockSize), h.fileSize-start, b.Size)
+		h.st.mu.Unlock()
+		werr := h.rateLimiter.Wait(ctx, int(extent))
+		h.st.mu.Lock()
+		if werr != nil {
+			return nil, syscall.EINTR
+		}
+		if h.released {
+			return nil, syscall.EIO
+		}
+		// Another read on this handle may have fetched it while we waited.
+		if data := h.getStreamBlock(bi); data != nil {
+			return data, 0
+		}
+	}
+
+	data, err := h.downloadBlock(ctx, b)
+	if err != nil {
+		log.Printf("hamstor: stream block fetch failed for inode %d block %d (%s): %v",
+			h.inodeID, bi, b.S3Key, err)
+		return nil, toErrno(err)
+	}
+	data = clampBlock(data, h.fileSize, start, b.Size)
+	h.putStreamBlock(bi, data)
+	return data, 0
 }
 
-// getStreamChunk returns chunk data from the in-memory ring buffer, or nil.
-func (h *HamstorHandle) getStreamChunk(index int64) []byte {
-	for _, sc := range h.streamChunks {
-		if sc.index == index {
-			return sc.data
+// getStreamBlock returns a block from the in-memory ring, or nil.
+func (h *HamstorHandle) getStreamBlock(index int64) []byte {
+	for _, sb := range h.streamBlocks {
+		if sb.index == index {
+			return sb.data
 		}
 	}
 	return nil
 }
 
-// putStreamChunk stores a chunk in the in-memory ring buffer, evicting the oldest if full.
-func (h *HamstorHandle) putStreamChunk(index int64, data []byte) {
-	// Don't store duplicates
-	for _, sc := range h.streamChunks {
-		if sc.index == index {
+// putStreamBlock stores a block in the ring, dropping the oldest when full.
+//
+// The cap is the handle's entire memory budget and it is derived from
+// --stream-buffer in Open. It has a floor of one block, not four: at an 8 MiB
+// unit a floor of four would pin 32 MiB per open media file against the
+// process's 150 MB limit.
+func (h *HamstorHandle) putStreamBlock(index int64, data []byte) {
+	for _, sb := range h.streamBlocks {
+		if sb.index == index {
 			return
 		}
 	}
-	if len(h.streamChunks) >= h.streamChunksCap && h.streamChunksCap > 0 {
-		h.streamChunks = h.streamChunks[1:]
+	if h.streamBlocksCap > 0 {
+		for len(h.streamBlocks) >= h.streamBlocksCap {
+			h.streamBlocks = h.streamBlocks[1:]
+		}
 	}
-	h.streamChunks = append(h.streamChunks, streamChunk{index: index, data: data})
+	h.streamBlocks = append(h.streamBlocks, streamBlock{index: index, data: data})
 }
 
 // spillState moves an inode's in-memory contents to a temp file, for large
@@ -1775,9 +1701,11 @@ func (h *HamstorHandle) Release(ctx context.Context) syscall.Errno {
 	// lifecycle and logs errors. Blocking here causes goroutine pile-up
 	// during bulk copy (32k blocked Release handlers = hundreds of MB stacks).
 	// Graceful shutdown uses InflightUploads.Wait() to ensure completion.
-	if h.cancelPrefetch != nil {
-		h.cancelPrefetch()
-	}
+	//
+	// The stream ring is this handle's alone, and it holds up to
+	// streamBlocksCap * 8 MiB. Drop it now rather than leave it to whenever the
+	// kernel lets go of the FileHandle.
+	h.streamBlocks = nil
 	h.st.mu.Unlock()
 
 	// Drop this handle's reference. The buffer and any spill file belong to the
