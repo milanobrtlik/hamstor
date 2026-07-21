@@ -756,6 +756,13 @@ ve streaming módu se schválně necachovaly na disk; blok se na disk cachuje ja
 jiný objekt, takže ring řeší problém, který přestane existovat. Podlahu i `readAheadChunks`
 pak nahradí jedna hodnota „kolik bloků dopředu", laděná v blocích.
 
+> **Krok 6 to doporučení nepřijal, a premisa je důvod.** „Blok se na disk cachuje jako
+> každý jiný objekt" pro streaming neplatí: ten diskovou cache obchází záměrně (4GB film
+> by ji přehráním jednou celou vyhodil), takže ring řeší problém, který nepřestal
+> existovat — bez něj by každé 128 KB čtení znovu stáhlo celý 8 MiB blok. Přeladit
+> podlahu na **1** ale bylo nutné přesně z důvodu, který tenhle odstavec popisuje.
+> Read-ahead odložen. Viz „Co Krok 6 zjistil navíc".
+
 ---
 
 ## 4. Přeformulované invarianty
@@ -1337,6 +1344,15 @@ ale je to poslední kout, kde velikost o obsahu nic neříká.
 ---
 
 **Krok 6 — smazat chunk sub-cache a přepsat streaming.**
+> ✅ **HOTOVO 2026-07-21.** Chunk API pryč (`cache.go` −66 řádků), `readChunked`/
+> `getOrFetchChunk`/`prefetchChunks` a `HamstorHandle.s3Key` pryč, streaming přepsaný
+> na bloky (`readStreaming`/`streamBlockData`/`getStreamBlock`/`putStreamBlock`),
+> `fetchBlock` rozdělený na `blockFromCache`/`downloadBlock` + sdílený `clampBlock`,
+> úklid zděděných chunk adresářů v `cache.New`. Testy: `internal/hfuse/streaming_test.go`
+> (9 funkcí, dřív 1) a dvě v `internal/cache`. Ověřeno mutací: šest zásahů, šest
+> očekávaných pádů. **Čtyři věci vyšly jinak, než tenhle dokument předpokládal —
+> jsou zapsané níž.** Nenasazeno samostatně.
+
 `cache.chunkPath`/`GetChunk`/`PutChunk`/`HasChunk` pryč; s nimi guardy na adresář v `Has`
 a `Open`. `readChunked`/`getOrFetchChunk`/`prefetchChunks`/`readStreaming` na bloky.
 In-memory ring v streaming módu zrušit (sekce 3.3), `readAheadChunks` přeladit v blocích.
@@ -1353,6 +1369,59 @@ kroku má procházet přes streaming — takže musí projít pořád.
 slouží čtení (krok 5). Dřív by to byla změna dvou cest najednou.
 
 *Riziko:* nízké. Ubývá kód. Hlídat jen paměťový rozpočet streamingu proti 150MB limitu.
+
+#### Co Krok 6 zjistil navíc (zapsáno po implementaci)
+
+1. **Ring se zrušit nedá, protože sekce 3.3 předpokládala opak toho, co se od
+   streamingu chce.** Argument 3.3 zní: ring existuje jen proto, že chunky se schválně
+   necachovaly na disk, a „blok se na disk cachuje jako každý jiný objekt". Jenže
+   streaming diskovou cache obchází **záměrně** — 4GB film přehraný jednou by při
+   defaultní 10GB cache vyhodil skoro všechno ostatní a jako největší záznam by za to
+   nekoupil nic. Ta podmínka tedy neplatí a ring řeší problém dál: bez něj by každé
+   128 KB čtení, které kernel pošle, znovu stáhlo celý 8 MiB blok, do kterého spadá —
+   64× amplifikace. Zůstal, ale v blocích, a s **podlahou 1, ne 4**: podlaha 4 by při
+   8 MiB jednotce držela 32 MiB na otevřený soubor proti `debug.SetMemoryLimit(150<<20)`,
+   což je přesně past, před kterou 3.3 varuje. Cache se **čte, nezapisuje** — lokální
+   bajty nestojí S3 bandwidth, takže se ani neúčtují rate limiteru.
+2. **`hasBlocks` je nová podmínka zapnutí a otevřelo ji zrušení té šifrovací.**
+   Streaming řeší každý blok přes tabulku `blocks`, kde chybějící řádek znamená díru.
+   Médium uložené jako **needle nebo staging soubor** nemá řádek žádný, takže by se
+   servírovalo jako ticho — celý soubor vynulovaný, nikde chyba. Dokud platilo
+   „jen nešifrovaně", byl ten případ z větší části mimo dosah; bez něj do něj spadne
+   každá `.mp3`/`.m4a` pod `MaxNeedleSize`. Ověřeno mutací: bez hradla test čte
+   1024 bajtů nul místo obsahu. Návrh tohle nikde nezmiňuje a je to jediná cesta
+   ke ztrátě dat v celém kroku.
+3. **Díra i zkrácený blok se musí *dopadovat nulami*, ne uříznout.** První verze
+   `readStreaming` na krátkých datech čtení ukončila. Jenže blok, jehož `b.Size`
+   zkrátil truncate a soubor pak zase narostl, musí v tom rozsahu číst nuly (přesně to
+   dělá `faultBlock` tím, že klade data do nulovaného storu) — uříznout ho znamená
+   ohlásit díru uprostřed souboru jako EOF. Sjednoceno tak, že díra se vrací jako
+   **žádná data** a padding pokrývá oba případy jedním kusem kódu. Díra přitom nesmí
+   stát ani fetch, ani kredit, a nepatří do ringu: 8 MiB nul by vytlačilo blok, který
+   něco stál.
+4. **Detekce seeku je offsetově přesná, takže kredit se hromadí jen přes striktně
+   souvislá čtení.** Vyšlo to najevo na testu: „sekvenční" krok z offsetu 0 na hranici
+   bloku se počítá jako seek, resetuje bucket a rate limit se neprojeví. Je to
+   *správně* vzhledem ke kritériu 3 (přehrávač skákající na kapitolu nesmí čekat za
+   kreditem vlastních dřívějších čtení), ale znamená to, že `--stream-rate` omezuje
+   **sekvenční drain, ne celkovou šířku pásma**. Zapsáno do CLAUDE.md, ať se to
+   příště nemusí objevovat testem.
+5. **Read-ahead vědomě odložen.** Návrh naznačoval „`readAheadChunks` nahradí jedna
+   hodnota kolik bloků dopředu". Neudělalo se: prefetch by chtěl goroutinu sahající na
+   `st.mu` a rušenou v `Release` — tedy přesně tu mašinerii (`prefetchCtx`/
+   `cancelPrefetch`), kterou tenhle krok jinak maže. Proti dosavadnímu stavu (stáhni
+   celý film před prvním bajtem) je i bez prefetche stall jednoho bloku velké
+   zlepšení. Ring má při defaultu cap 2, takže místo pro předsazený blok existuje,
+   až to bude stát za to.
+6. **Guard na adresář v `Has`/`Open` zůstal, proti liteře návrhu.** Ten „odpadá
+   s chunky" platí ve světě, kde žádné chunk adresáře nejsou. Reálný svět je jiný:
+   `--cache-dir` se drží napříč reinstalacemi, takže na disku leží adresáře, které
+   nikdo nikdy nesmaže a které se počítají do `--cache-size`. Guard stojí `IsDir()`
+   na `Stat`u, který se stejně dělá. K tomu **jednorázový úklid v `cache.New`**,
+   uvnitř walku, který `initApproxSize` už dělá: rozhoduje **jméno souboru**
+   (`chunk-*` ⇒ smaž rodiče), nikdy tvar — „adresář dvě úrovně hluboko" popisuje i
+   `volobj/{prefix}`, tedy celou cache volumes. Hlídají to dva testy s kontrolními
+   záznamy.
 
 ---
 
@@ -1375,9 +1444,9 @@ s vlastními testy a ne přílepek ke kroku 3.
 
 ### Co zbývá po posledním kroku
 
-- **Aktualizovat CLAUDE.md**: reader coherence (sekce 4) a zrušené omezení range reads pod
-  šifrováním. *(Zmínky o `migrate`, 2GB stropu, sekce o blocích a stav kroků už hotové
-  v Kroku 4.)*
+- ~~**Aktualizovat CLAUDE.md**: reader coherence (sekce 4) a zrušené omezení range reads
+  pod šifrováním.~~ *(Hotovo v Kroku 6, spolu s README. Zmínky o `migrate`, 2GB stropu,
+  sekce o blocích a stav kroků už hotové v Kroku 4.)*
 - **`purge-s3` + reinit** produkčního bucketu.
 - Nezávisle a kdykoli: oprava `evictLRU` pro `volobj/` (sekce 3.3), HKDF subkeys (D6),
   writeback cache, split `dentries` z `inodes`.
