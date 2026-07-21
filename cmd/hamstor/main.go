@@ -311,7 +311,7 @@ func main() {
 		if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 			log.Printf("hamstor: staging dir: %v (volume packing disabled)", err)
 		} else {
-			hfs.VolumeBuilder = volume.NewBuilder(database, store, stagingDir)
+			hfs.VolumeBuilder = volume.NewBuilder(database, store, stagingDir, diskCache)
 			log.Println("hamstor: volume packing enabled (files <256KB packed into volumes)")
 		}
 	} else {
@@ -319,7 +319,7 @@ func main() {
 		// Close() triggers a final scanAndSeal(true) that packs everything.
 		if entries, dirErr := os.ReadDir(stagingDir); dirErr == nil && len(entries) > 0 {
 			log.Printf("hamstor: volume packing disabled but %d staged files found, draining...", len(entries))
-			drainBuilder := volume.NewBuilder(database, store, stagingDir)
+			drainBuilder := volume.NewBuilder(database, store, stagingDir, diskCache)
 			drainBuilder.Close()
 			log.Println("hamstor: staged files drained into volumes")
 		}

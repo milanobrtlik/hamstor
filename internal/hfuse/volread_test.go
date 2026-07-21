@@ -102,6 +102,87 @@ func TestWholeVolumeReadServesSiblingsFromCache(t *testing.T) {
 	}
 }
 
+// packStaged seals everything currently staged into volumes. Close()'s final
+// sweep is the only trigger that packs a sub-budget batch on the spot — the
+// notify path deliberately waits for more data and the fallback tick is 5s away
+// — so packing in a test means closing the builder. It is handed back as nil
+// because Close is not idempotent and setupStagingCache also closes it; the
+// filesystem is read-only from here on.
+func packStaged(t *testing.T, hfs *HamstorFS) {
+	t.Helper()
+	b := hfs.VolumeBuilder
+	hfs.VolumeBuilder = nil
+	if err := b.Close(); err != nil {
+		t.Fatalf("close builder: %v", err)
+	}
+}
+
+// TestPackedFilesReadFromBuilderSeededCache is the write-side counterpart of the
+// two tests around it: the builder holds the whole volume in memory as it seals
+// it, so the first read of a packed file should never have to download those
+// same bytes back. The proof is again deletion — nothing reads the files before
+// the volume object is removed from S3, so a successful read afterwards can only
+// come from the cache the builder itself seeded.
+func TestPackedFilesReadFromBuilderSeededCache(t *testing.T) {
+	c, err := cache.New(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	hfs, _ := setupStagingCache(t, c)
+
+	contents := map[string][]byte{
+		"packed-a.txt": bytes.Repeat([]byte("alpha "), 50),
+		"packed-b.txt": []byte("bravo payload"),
+	}
+	ids := map[string]int64{}
+	for name, data := range contents {
+		id := mustInsert(t, hfs, name)
+		h := NewTestHandle(hfs, id, true)
+		if errno := h.TestWriteAt(data, 0); errno != 0 {
+			t.Fatalf("write %s: %v", name, errno)
+		}
+		if errno := h.TestFlush(); errno != 0 {
+			t.Fatalf("flush %s: %v", name, errno)
+		}
+		h.WaitUpload()
+		h.TestRelease()
+		ids[name] = id
+	}
+
+	packStaged(t, hfs)
+
+	// Every file must be packed, and the volumes must already be cached — before
+	// a single read has happened.
+	volKeys := map[string]bool{}
+	for name, id := range ids {
+		m, err := hfs.DB.GetInode(id)
+		if err != nil {
+			t.Fatalf("GetInode %s: %v", name, err)
+		}
+		if m.VolS3Key == "" {
+			t.Fatalf("%s was not packed into a volume", name)
+		}
+		if !c.Has("volobj/" + m.VolS3Key) {
+			t.Fatalf("volume %s not cached by the builder — reading %s will download the bytes it just uploaded",
+				m.VolS3Key, name)
+		}
+		volKeys[m.VolS3Key] = true
+	}
+
+	// Remove the volumes from S3. Reads can now only be served locally.
+	for volKey := range volKeys {
+		if err := hfs.Store.Delete(context.Background(), volKey); err != nil {
+			t.Fatalf("delete volume %s: %v", volKey, err)
+		}
+	}
+	for name, id := range ids {
+		want := contents[name]
+		if got := readBack(t, hfs, id, len(want)); !bytes.Equal(got, want) {
+			t.Fatalf("%s = %q, want %q — not served from the builder-seeded cache", name, got, want)
+		}
+	}
+}
+
 // TestWholeVolumeReadDecryptsNeedleFromCache is the same proof for an encrypted
 // mount: each needle is individually encrypted inside the volume, so serving a
 // sibling from the cached volume must slice its ciphertext range and decrypt it.
