@@ -241,9 +241,33 @@ func CleanupVolumes(d *db.DB, store *s3store.Store) error {
 }
 
 // CleanupStagingDir removes orphaned staging files left by a crash.
-// A staging file is orphaned if its inode no longer exists or already
-// has an S3 key or volume reference.
+// A staging file is orphaned if its inode no longer exists or already has
+// storage: an S3 key, a volume reference, or a set of blocks.
+//
+// Blocks count as storage here for the same reason they do everywhere else. A
+// file that grew past MaxNeedleSize is committed as blocks and its staging file
+// removed; if a crash lands between those two, the leftover is stale. Treating
+// it as still-staged would rename it back for the builder, which would claim it,
+// pack it, have the commit refused (the inode already has blocks) and restore
+// the claim — then do it again on the next notify, for the life of the mount,
+// uploading an orphaned volume each time round.
 func CleanupStagingDir(d *db.DB, stagingDir string) error {
+	// hasStorage answers "is this staging file stale?" for both the .packing
+	// branch and the plain one, so the two cannot drift apart.
+	hasStorage := func(meta *db.InodeMeta) bool {
+		if meta.S3Key != "" || meta.VolS3Key != "" {
+			return true
+		}
+		has, err := d.HasBlocks(meta.ID)
+		if err != nil {
+			// Unknown: treat as still staged. Keeping a stale file costs disk;
+			// deleting a live one costs the file.
+			log.Printf("hamstor: staging cleanup, block lookup for inode %d: %v", meta.ID, err)
+			return false
+		}
+		return has
+	}
+
 	entries, err := os.ReadDir(stagingDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -279,7 +303,7 @@ func CleanupStagingDir(d *db.DB, stagingDir string) error {
 				cleaned++
 				continue
 			}
-			if meta.S3Key != "" || meta.VolS3Key != "" {
+			if hasStorage(meta) {
 				// Already has storage — staging file is stale
 				os.Remove(filepath.Join(stagingDir, e.Name()))
 				cleaned++
@@ -302,7 +326,7 @@ func CleanupStagingDir(d *db.DB, stagingDir string) error {
 			cleaned++
 			continue
 		}
-		if meta.S3Key != "" || meta.VolS3Key != "" {
+		if hasStorage(meta) {
 			// Already has storage — staging file is stale
 			os.Remove(filepath.Join(stagingDir, e.Name()))
 			cleaned++

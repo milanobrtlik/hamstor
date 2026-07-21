@@ -299,8 +299,24 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		handle.fileSize = meta.Size
 	}
 
-	// Preload data for files opened in write mode
-	hasData := meta.S3Key != "" || meta.VolS3Key != "" ||
+	// Preload data for files opened in write mode.
+	//
+	// A block-stored file has neither key, so it is found by looking for its
+	// blocks — and it must be, twice over: hasData false would skip the preload
+	// and leave an empty shared buffer for the first write to append to (and
+	// then commit as the whole file), while hasData true without a block branch
+	// below would send it down the staging path to hunt for a staging file that
+	// never existed.
+	var blocks []db.BlockCommit
+	if meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 {
+		b, bErr := n.hfs.DB.BlocksForInode(n.inodeID)
+		if bErr != nil {
+			return nil, 0, toErrno(bErr)
+		}
+		blocks = b
+	}
+
+	hasData := meta.S3Key != "" || meta.VolS3Key != "" || len(blocks) > 0 ||
 		(meta.Size > 0 && n.hfs.VolumeBuilder != nil)
 
 	// O_TRUNC empties the file for everyone, so it applies even when another
@@ -325,11 +341,21 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			st.cacheFile.Close()
 			st.cacheFile = nil
 		}
+		// Nothing written since the last flush survives an emptied file, and the
+		// commit at size 0 drops every block anyway.
+		st.dirtyBlocks = nil
 		st.loaded = true
 		st.dirty = true
 		st.size = 0
 	} else if flags&writeFlags != 0 && hasData && !st.loaded {
-		if meta.S3Key != "" {
+		if len(blocks) > 0 {
+			// Shares loadFromBlocks with ensureLoaded rather than repeating it:
+			// hole handling and the short-last-block clamp are exactly the kind of
+			// thing a second copy gets subtly wrong.
+			if errno := handle.loadFromBlocks(ctx, blocks, meta.Size); errno != 0 {
+				return nil, 0, errno
+			}
+		} else if meta.S3Key != "" {
 			// Try cache first for write preload
 			var data []byte
 			if n.hfs.Cache != nil {
@@ -393,12 +419,14 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			st.loaded = true
 		} else if n.hfs.VolumeBuilder != nil {
 			// Preload from staging dir (file staged but not yet packed)
-			data, dlErr := n.openPreloadStaged(ctx)
+			data, settled, dlErr := n.openPreloadStaged(ctx, handle)
 			if dlErr != 0 {
 				return nil, 0, dlErr
 			}
-			st.buf = data
-			st.loaded = true
+			if !settled {
+				st.buf = data
+				st.loaded = true
+			}
 		}
 
 		// If the stored object is longer than the inode's logical size — e.g. a
@@ -446,34 +474,50 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 // Shares readStaged with ensureLoaded rather than repeating it: the staging file
 // moves under readers constantly and the retry logic that rides that out is
 // exactly what a second copy gets wrong.
-func (n *HamstorNode) openPreloadStaged(ctx context.Context) ([]byte, syscall.Errno) {
-	data, _, errno := n.hfs.readStaged(ctx, n.inodeID)
+//
+// settled reports that the contents were loaded into the shared state directly
+// (the block path does its own placement, because a large file must go to a
+// spill file rather than come back as one buffer); the caller must then not
+// assign to st.buf itself.
+func (n *HamstorNode) openPreloadStaged(ctx context.Context, handle *HamstorHandle) (data []byte, settled bool, errno syscall.Errno) {
+	data, _, errno = n.hfs.readStaged(ctx, n.inodeID)
 	if errno != 0 {
-		return nil, errno
+		return nil, false, errno
 	}
 	if data == nil {
-		// Packed into a volume while we looked; read it back from there.
+		// It gained real storage while we looked. Either the builder packed it
+		// into a volume, or an overwrite grew it past MaxNeedleSize and committed
+		// it as blocks.
 		meta, err := n.hfs.DB.GetInode(n.inodeID)
 		if err != nil {
-			return nil, toErrno(err)
+			return nil, false, toErrno(err)
 		}
 		if meta.VolS3Key == "" {
-			return nil, syscall.EIO
+			if meta.S3Key == "" && meta.Size > 0 {
+				blocks, bErr := n.hfs.DB.BlocksForInode(n.inodeID)
+				if bErr != nil {
+					return nil, false, toErrno(bErr)
+				}
+				if len(blocks) > 0 {
+					return nil, true, handle.loadFromBlocks(ctx, blocks, meta.Size)
+				}
+			}
+			return nil, false, syscall.EIO
 		}
 		d, dlErr := n.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
 		if dlErr != nil {
-			return nil, toErrno(dlErr)
+			return nil, false, toErrno(dlErr)
 		}
 		if n.hfs.Encryptor != nil && crypto.IsEncrypted(d) {
 			d, dlErr = n.hfs.Encryptor.Decrypt(d)
 			if dlErr != nil {
 				log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, dlErr)
-				return nil, syscall.EIO
+				return nil, false, syscall.EIO
 			}
 		}
 		data = d
 	}
-	return data, 0
+	return data, false, 0
 }
 
 func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
