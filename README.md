@@ -118,8 +118,7 @@ Flags work on either side of the subcommand — `hamstor gc --bucket x` and `ham
 | `cache clear` | Empty the disk cache (safe — data is re-fetched on demand) |
 | `gc` | Delete orphaned S3 objects (skips objects younger than 10 minutes) |
 | `compact` | Rewrite volumes whose dead space exceeds `--compact-ratio` |
-| `migrate` | Migrate legacy unprefixed S3 keys to `{2-hex}/{uuid}` |
 | `restore` | Restore the database from S3 via Litestream (only when no local DB exists) |
 | `purge-s3` | **Destructive:** delete every object in the bucket and the local database |
 
-`gc`, `compact`, `migrate`, `restore` and `purge-s3` take an exclusive lock on `<db>.lock`; `fsck`, `cache` and `version` do not.
+`gc`, `compact`, `restore` and `purge-s3` take an exclusive lock on `<db>.lock`; `fsck`, `cache` and `version` do not.
