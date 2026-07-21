@@ -77,22 +77,41 @@ func (c *DiskCache) path(s3Key string) string {
 	return p
 }
 
-// Has reports whether the given S3 key is cached.
+// MaxBytes returns the cache's size limit.
+func (c *DiskCache) MaxBytes() int64 { return c.maxBytes }
+
+// Has reports whether the given S3 key is cached as a whole file.
+//
+// A chunk directory at that path does not count: it holds pieces of the object,
+// not the object, and every caller of Has and Open wants the file itself.
 func (c *DiskCache) Has(s3Key string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	_, err := os.Stat(c.path(s3Key))
-	return err == nil
+	info, err := os.Stat(c.path(s3Key))
+	return err == nil && !info.IsDir()
 }
 
 // Open returns a read-only file handle to the cached data.
 // The caller must close the returned file. Returns os.ErrNotExist if not cached.
 // The returned file descriptor remains valid even if the cache entry is evicted,
 // because Linux keeps the inode alive until all fds are closed.
+//
+// A chunk directory (left by PutChunk for this key) is reported as absent. It is
+// not the file, and os.Open succeeds on a directory: the callers then allocate
+// its stat size, get EISDIR from ReadAt, and — in HamstorNode.Open's write
+// preload, which discards that error — take a few KB of zeros for the file's
+// contents.
 func (c *DiskCache) Open(s3Key string) (*os.File, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	p := c.path(s3Key)
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, os.ErrNotExist
+	}
 	// Touch mtime so LRU eviction reflects actual access time, not write time.
 	now := time.Now()
 	os.Chtimes(p, now, now)

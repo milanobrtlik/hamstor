@@ -187,3 +187,31 @@ func TestOpenNotExist(t *testing.T) {
 		t.Fatalf("expected os.ErrNotExist, got %v", err)
 	}
 }
+
+// TestChunkDirIsNotAWholeFile: PutChunk leaves a directory at the key's path,
+// and os.Open succeeds on a directory. Reporting that as a cached file makes
+// callers allocate the directory's stat size, get EISDIR from ReadAt, and — in
+// hfuse's write preload, which discards that error — serve a few KB of zeros as
+// the file's contents.
+func TestChunkDirIsNotAWholeFile(t *testing.T) {
+	dir := t.TempDir()
+	c, err := New(dir, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := "ee/ee000000-0000-0000-0000-000000000003"
+	if err := c.PutChunk(key, 0, []byte("chunk zero")); err != nil {
+		t.Fatal(err)
+	}
+
+	if c.Has(key) {
+		t.Fatal("chunk directory reported as a cached whole file")
+	}
+	if _, err := c.Open(key); !os.IsNotExist(err) {
+		t.Fatalf("Open on a chunk directory: got %v, want os.ErrNotExist", err)
+	}
+	if !c.HasChunk(key, 0) {
+		t.Fatal("the chunk itself should still be cached")
+	}
+}
