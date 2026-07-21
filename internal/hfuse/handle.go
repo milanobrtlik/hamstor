@@ -42,11 +42,20 @@ type HamstorHandle struct {
 	// own. Obtained from hfs.acquireWrite, dropped in Release.
 	st *inodeWrite
 
-	s3Key string // S3 key at open time
+	// s3Key is ALWAYS EMPTY, and nothing assigns it any more: an inode names no
+	// whole-file object, so there is no single key a range read could target.
+	// It survives only to keep readChunked/getOrFetchChunk/prefetchChunks and
+	// fetchStreamChunk compiling until they are rewritten to fetch per block,
+	// which also closes their two gates: readChunked's `s3Key != ""` test never
+	// passes, and Open no longer turns streaming on. Deleting the field means
+	// deleting those five functions, and they are meant to be rewritten, not lost.
+	//
+	// It carries no invariant and nothing reads it — unlike inodeWrite.cacheFile,
+	// which became equally unreachable and was removed outright because the code
+	// around it kept rules for a state that could no longer occur.
+	s3Key string
 	// fileSize is this handle's own view of the logical size, taken at open time
-	// and refreshed only when this handle loads. It pairs with s3Key: both are
-	// open-time snapshots, and readChunked/readStreaming need a size that matches
-	// the key they are reading from.
+	// and refreshed only when this handle loads.
 	//
 	// It is NOT the file's size and must never be used as one. A handle that
 	// never loads the state (a sibling got there first) keeps its open-time value
@@ -137,15 +146,13 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	}
 
 	// Stored as blocks. This must be tested BEFORE the staged branch below: a
-	// block-stored file has no s3_key and no vol_s3_key, which is exactly the
-	// shape that branch takes as "staged but not yet packed". It would then hunt
-	// for a staging file that never existed and return EIO for a healthy file.
+	// block-stored file has no vol_s3_key, which is exactly the shape that branch
+	// takes as "staged but not yet packed". It would then hunt for a staging file
+	// that never existed and return EIO for a healthy file.
 	//
-	// The query is confined to the branch where neither key is set, so volume
-	// reads (the packed-directory hot path) and legacy standalone reads pay
-	// nothing for it, and size == 0 skips it because a zero-length file cannot
-	// have blocks — CommitBlocks deletes them all at size 0.
-	if meta.S3Key == "" && meta.Size > 0 {
+	// size == 0 skips the query because a zero-length file cannot have blocks —
+	// CommitBlocks deletes them all at size 0.
+	if meta.Size > 0 {
 		blocks, bErr := h.hfs.DB.BlocksForInode(h.inodeID)
 		if bErr != nil {
 			return toErrno(bErr)
@@ -156,7 +163,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	}
 
 	// File staged locally, not yet packed into a volume
-	if meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 && h.hfs.VolumeBuilder != nil {
+	if meta.Size > 0 && h.hfs.VolumeBuilder != nil {
 		data, size, errno := h.hfs.readStaged(ctx, h.inodeID)
 		if errno != 0 {
 			return errno
@@ -172,7 +179,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 			if meta2.VolS3Key != "" {
 				return h.loadFromVolume(ctx, meta2)
 			}
-			if meta2.S3Key == "" && meta2.Size > 0 {
+			if meta2.Size > 0 {
 				blocks, bErr := h.hfs.DB.BlocksForInode(h.inodeID)
 				if bErr != nil {
 					return toErrno(bErr)
@@ -190,55 +197,13 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 		return 0
 	}
 
-	if meta.S3Key == "" {
-		h.st.buf = []byte{}
-		h.st.loaded = true
-		h.st.size = meta.Size
-		h.fileSize = meta.Size
-		return 0
-	}
-
-	h.s3Key = meta.S3Key
-	h.fileSize = meta.Size
-
-	// Try cache first (read-only path)
-	if h.hfs.Cache != nil && !h.st.dirty {
-		if f, err := h.hfs.Cache.Open(meta.S3Key); err == nil {
-			h.st.cacheFile = f
-			h.st.loaded = true
-			h.st.size = meta.Size
-			return 0
-		}
-	}
-
-	data, err := h.hfs.Store.Download(ctx, meta.S3Key)
-	if err != nil {
-		return toErrno(err)
-	}
-	if h.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
-		data, err = h.hfs.Encryptor.Decrypt(data)
-		if err != nil {
-			log.Printf("hamstor: decrypt failed for inode %d: %v", h.inodeID, err)
-			return syscall.EIO
-		}
-	}
-
-	if h.hfs.Cache != nil {
-		if putErr := h.hfs.Cache.Put(meta.S3Key, data); putErr != nil {
-			log.Printf("hamstor: cache put failed for %s: %v", meta.S3Key, putErr)
-		} else if !h.st.dirty {
-			if f, openErr := h.hfs.Cache.Open(meta.S3Key); openErr == nil {
-				h.st.cacheFile = f
-				h.st.loaded = true
-				h.st.size = meta.Size
-				return 0
-			}
-		}
-	}
-
-	h.st.buf = data
+	// Nothing left to load from: no needle, no blocks, no staging file. That is
+	// an empty file — the only remaining shape with no storage of its own, now
+	// that an inode cannot name a whole-file object.
+	h.st.buf = []byte{}
 	h.st.loaded = true
 	h.st.size = meta.Size
+	h.fileSize = meta.Size
 	return 0
 }
 
@@ -374,10 +339,9 @@ func (h *HamstorHandle) loadFromBlocks(ctx context.Context, blocks []db.BlockCom
 // fetchBlock returns one block's plaintext, from the disk cache when it is
 // there and from S3 otherwise.
 //
-// The cache holds PLAINTEXT, like the standalone-object entries cacheUploaded
-// writes and unlike the whole-volume entries: a block entry is handed straight
-// back as file contents, so caching the ciphertext would serve encrypted bytes
-// as the file. Each block is its own object under its own key, so a new version
+// The cache holds PLAINTEXT, unlike the whole-volume entries: a block entry is
+// handed straight back as file contents, so caching the ciphertext would serve
+// encrypted bytes as the file. Each block is its own object under its own key, so a new version
 // of a block is a new key and the old entry can never be mistaken for the new
 // one.
 func (h *HamstorHandle) fetchBlock(ctx context.Context, b db.BlockCommit) ([]byte, error) {
@@ -692,19 +656,6 @@ func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, sys
 		return fuse.ReadResultData(dest[:clampLen(n)]), 0
 	}
 
-	// Read from cache file
-	if h.st.cacheFile != nil {
-		n, err := h.st.cacheFile.ReadAt(dest, off)
-		if n == 0 && err == io.EOF {
-			return fuse.ReadResultData(nil), 0
-		}
-		if err != nil && err != io.EOF {
-			log.Printf("hamstor: cache read failed for inode %d: %v", h.inodeID, err)
-			return nil, syscall.EIO
-		}
-		return fuse.ReadResultData(dest[:clampLen(n)]), 0
-	}
-
 	// Read from in-memory buffer
 	if off >= int64(len(h.st.buf)) {
 		return fuse.ReadResultData(nil), 0
@@ -871,45 +822,13 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		return 0, errno
 	}
 
-	// Transition from cache-file mode to buf mode on first write
-	if h.st.cacheFile != nil {
-		info, err := h.st.cacheFile.Stat()
-		if err != nil {
-			return 0, syscall.EIO
-		}
-		sz := info.Size()
-		if sz > spillThreshold {
-			// Large file: spill directly to disk
-			if err := h.spillToDisk(); err != nil {
-				return 0, syscall.EIO
-			}
-			// spillToDisk created the spill file with empty buf content
-			// Now copy cache file content to spill file
-			h.st.spillFile.Truncate(0)
-			h.st.spillFile.Seek(0, io.SeekStart)
-			h.st.cacheFile.Seek(0, io.SeekStart)
-			if _, err := io.Copy(h.st.spillFile, h.st.cacheFile); err != nil {
-				return 0, syscall.EIO
-			}
-			h.st.spillSize = sz
-		} else {
-			h.st.buf = make([]byte, sz)
-			if _, err := h.st.cacheFile.ReadAt(h.st.buf, 0); err != nil && err != io.EOF {
-				return 0, syscall.EIO
-			}
-		}
-		h.st.cacheFile.Close()
-		h.st.cacheFile = nil
-		h.st.size = h.st.logicalSize()
-	}
-
 	// O_APPEND: ignore the offset the kernel handed us. It computed it from its
 	// cached st_size, which two appenders both read before either write lands,
 	// so both are told to write at the same place and one silently overwrites
 	// the other. The shared state knows the real end of file. (Linux likewise
 	// ignores the offset for pwrite() on an O_APPEND fd, so this matches it.)
-	// Must come after the cache-file transition above, which is what settles
-	// where the contents actually live.
+	// Must come after ensureLoaded above, which is what settles where the
+	// contents actually live.
 	if h.appendMode {
 		off = h.st.logicalSize()
 	}
@@ -979,7 +898,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	// one — the first close to find the state dirty uploads, the rest no-op.
 	if !h.st.dirty {
 		if h.st.isNew {
-			if _, err := h.hfs.DB.CommitInode(h.inodeID, "", 0); err != nil {
+			if _, err := h.hfs.DB.CommitInode(h.inodeID, 0); err != nil {
 				return toErrno(err)
 			}
 			h.st.isNew = false
@@ -1094,21 +1013,13 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 // goroutine here, so the attempt is already complete when this returns.
 func (h *HamstorHandle) flushStaged(uploadFile *os.File, bufSize int64) syscall.Errno {
 	{
-		// Clean up the old standalone S3 object before overwriting. The old
-		// volume needle (if any) is accounted for atomically by CommitInode
-		// below, which decrements the previously-referenced volume in the same
-		// transaction that clears the inode's vol columns.
+		// There is no previous standalone object to clean up: an inode names no
+		// object of its own, and an inode that already has blocks never reaches
+		// this path (canStage is gated on !hasBlocks). The old volume needle, if
+		// any, is accounted for atomically by CommitInode below, which decrements
+		// the previously-referenced volume in the same transaction that clears
+		// the inode's vol columns.
 		stageMeta, stageMetaErr := h.hfs.DB.GetInode(h.inodeID)
-		if stageMetaErr == nil {
-			if stageMeta.S3Key != "" {
-				if delErr := h.hfs.Store.Delete(context.Background(), stageMeta.S3Key); delErr != nil {
-					log.Printf("hamstor: stage overwrite delete old key %s: %v", stageMeta.S3Key, delErr)
-				}
-				if h.hfs.Cache != nil {
-					h.hfs.Cache.Evict(stageMeta.S3Key)
-				}
-			}
-		}
 
 		var stageData []byte
 		if uploadFile != nil {
@@ -1182,7 +1093,7 @@ func (h *HamstorHandle) flushStaged(uploadFile *os.File, bufSize int64) syscall.
 		}
 
 		// Commit immediately — file is visible right away
-		committed, err := h.hfs.DB.CommitInode(h.inodeID, "", bufSize)
+		committed, err := h.hfs.DB.CommitInode(h.inodeID, bufSize)
 		if err != nil {
 			os.Remove(stagePath)
 			return toErrno(err)
@@ -1249,17 +1160,17 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 	//
 	// For a file already stored as blocks, exactly the dirty ones: every other
 	// block keeps its key, and uploading them again would be pure waste. But when
-	// the file is stored as ANYTHING ELSE — a legacy whole-file object, a volume
-	// needle, a staging file — CommitBlocks drops that storage wholesale (it
-	// nulls s3_key, decrements the volume and clears the vol columns). Committing
-	// only the dirty blocks would then leave the rest of the file with no storage
-	// at all: change one byte of a 100 MB legacy file and 92 MB of it silently
-	// become holes. So converting to blocks rewrites the whole file, once.
+	// the file is stored as ANYTHING ELSE — a volume needle, a staging file —
+	// CommitBlocks drops that storage wholesale (it decrements the volume and
+	// clears the vol columns). Committing only the dirty blocks would then leave
+	// the rest of the file with no storage at all: change one byte of a needle
+	// and everything but that byte silently becomes holes. So converting to
+	// blocks rewrites the whole file, once.
 	//
 	// A brand-new file is not converting — it has no prior storage to lose — and
 	// must NOT be forced to write every block, or a sparse write at offset 1 GB
 	// would upload 128 blocks of zeroes instead of one block.
-	converting := !hasBlocks && (meta.S3Key != "" || meta.VolS3Key != "" || meta.Size > 0)
+	converting := !hasBlocks && (meta.VolS3Key != "" || meta.Size > 0)
 
 	lastLive := int64(-1)
 	if bufSize > 0 {
@@ -1566,14 +1477,32 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 
 	// Ensure S3 durability for staged files not yet packed into a volume.
 	//
-	// A block-stored file has no s3_key and no vol_s3_key either, so without the
-	// HasBlocks test it lands here too — and FlushInode would go looking for a
-	// staging file that never existed and report "staging file missing and no S3
-	// reference", turning fsync on a perfectly durable large file into EIO. Its
-	// durability was already settled by the attempt we waited on above.
+	// A block-stored file has no vol_s3_key either, so without the HasBlocks test
+	// it lands here too — and FlushInode would go looking for a staging file that
+	// never existed and report "staging file missing and no S3 reference",
+	// turning fsync on a perfectly durable large file into EIO. Its durability
+	// was already settled by the attempt we waited on above.
+	//
+	// durable answers "did this inode get real storage?" for the waiting loops
+	// below, and must ask about blocks for the same reason: a concurrent
+	// overwrite that grew the file past MaxNeedleSize commits blocks, not a
+	// needle, so a vol_s3_key-only test would spin out every backoff and report
+	// EIO for a file that is safely in S3.
+	durable := func() bool {
+		m, dbErr := h.hfs.DB.GetInode(h.inodeID)
+		if dbErr != nil {
+			return false
+		}
+		if m.VolS3Key != "" {
+			return true
+		}
+		has, hErr := h.hfs.DB.HasBlocks(h.inodeID)
+		return hErr == nil && has
+	}
+
 	if h.hfs.VolumeBuilder != nil {
 		meta, err := h.hfs.DB.GetInode(h.inodeID)
-		if err == nil && meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 {
+		if err == nil && meta.VolS3Key == "" && meta.Size > 0 {
 			if has, hErr := h.hfs.DB.HasBlocks(h.inodeID); hErr == nil && has {
 				return 0
 			}
@@ -1587,8 +1516,7 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 					backoff := 200 * time.Millisecond
 					for attempt := 0; attempt < 10; attempt++ {
 						time.Sleep(backoff)
-						m, dbErr := h.hfs.DB.GetInode(h.inodeID)
-						if dbErr == nil && (m.VolS3Key != "" || m.S3Key != "") {
+						if durable() {
 							return 0 // builder finished
 						}
 						backoff *= 2
@@ -1600,14 +1528,14 @@ func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 					// durable (it was superseded by a concurrent overwrite, or
 					// the builder restored it). Re-drive the flush so we either
 					// pack it now or observe genuine durability.
-					if m, dbErr := h.hfs.DB.GetInode(h.inodeID); dbErr == nil && (m.VolS3Key != "" || m.S3Key != "") {
+					if durable() {
 						return 0
 					}
 					if err2 := h.hfs.VolumeBuilder.FlushInode(h.inodeID); err2 == nil {
 						return 0
 					} else if errors.Is(err2, volume.ErrBeingPacked) {
 						// Still racing the builder; the data is in-flight, not lost.
-						if m, dbErr := h.hfs.DB.GetInode(h.inodeID); dbErr == nil && (m.VolS3Key != "" || m.S3Key != "") {
+						if durable() {
 							return 0
 						}
 					}
@@ -1633,9 +1561,9 @@ func (h *HamstorHandle) Release(ctx context.Context) syscall.Errno {
 	}
 	h.st.mu.Unlock()
 
-	// Drop this handle's reference. The buffer, cache file and any spill file
-	// belong to the shared state now, so they are freed by the last reference to
-	// go — which may be this one, or an upload goroutine still in flight.
+	// Drop this handle's reference. The buffer and any spill file belong to the
+	// shared state now, so they are freed by the last reference to go — which may
+	// be this one, or an upload goroutine still in flight.
 	h.hfs.releaseWrite(h.inodeID, h.st)
 	return 0
 }

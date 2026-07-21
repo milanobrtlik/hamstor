@@ -183,7 +183,7 @@ func TestCommitBlocksDecrementsVolume(t *testing.T) {
 	// A staged small file is committed with an empty key before the builder
 	// packs it; the builder only ever moves committed inodes into a volume.
 	for _, staged := range []int64{id, sibling} {
-		if _, err := d.CommitInode(staged, "", 1024); err != nil {
+		if _, err := d.CommitInode(staged, 1024); err != nil {
 			t.Fatalf("commit staged inode %d: %v", staged, err)
 		}
 	}
@@ -240,43 +240,6 @@ func TestCommitBlocksDecrementsVolume(t *testing.T) {
 	}
 }
 
-// A file stored as one whole-file object before the block layout keeps its
-// s3_key until something overwrites it. CommitBlocks must clear it and hand it
-// back: leaving it set would keep the read path serving the pre-overwrite
-// object and keep AllS3KeySet protecting it forever.
-func TestCommitBlocksClearsWholeFileKey(t *testing.T) {
-	d := openTestDB(t)
-	id := newFile(t, d, "legacy.bin")
-
-	if _, err := d.CommitInode(id, "old-whole-file", 500000); err != nil {
-		t.Fatalf("commit whole file: %v", err)
-	}
-
-	_, orphaned, err := d.CommitBlocks(id, []BlockCommit{{Index: 0, S3Key: "k0", Size: 400000}}, 400000)
-	if err != nil {
-		t.Fatalf("commit blocks: %v", err)
-	}
-	if !slices.Contains(orphaned, "old-whole-file") {
-		t.Fatalf("orphaned %v does not contain the replaced whole-file key", orphaned)
-	}
-
-	meta, err := d.GetInode(id)
-	if err != nil {
-		t.Fatalf("get inode: %v", err)
-	}
-	if meta.S3Key != "" {
-		t.Errorf("inode still points at whole-file object %q", meta.S3Key)
-	}
-
-	set, err := d.AllS3KeySet()
-	if err != nil {
-		t.Fatalf("all s3 key set: %v", err)
-	}
-	if _, ok := set["old-whole-file"]; ok {
-		t.Error("the replaced whole-file key is still protected by AllS3KeySet")
-	}
-}
-
 func TestCommitBlocksMissingInode(t *testing.T) {
 	d := openTestDB(t)
 
@@ -320,9 +283,14 @@ func TestDeleteBlocksForInode(t *testing.T) {
 }
 
 // The table arrives by migration, so the case that matters is a database
-// written before it existed: Open must add it, twice in a row must be a no-op,
-// and a file still stored as one whole-file object must keep working alongside
-// blocks while inodes.s3_key is still around.
+// written before it existed: Open must add it, and twice in a row must be a
+// no-op.
+//
+// The legacy row seeded here carries an s3_key, because a real pre-existing
+// database does. Nothing reads that column any more, so the object it names
+// is no longer protected from GC — deliberately, and asserted below. Files
+// stored that way are unreadable from this step on; the agreed answer is purge
+// and reinitialize, not a migration.
 func TestBlocksMigrationOnPreExistingDB(t *testing.T) {
 	path := t.TempDir() + "/legacy.db"
 
@@ -360,10 +328,12 @@ func TestBlocksMigrationOnPreExistingDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("all s3 key set after open %d: %v", i, err)
 		}
-		for _, key := range []string{"aa/legacy", fmt.Sprintf("bb/block-%d", i)} {
-			if _, ok := set[key]; !ok {
-				t.Errorf("open %d: %q missing from AllS3KeySet", i, key)
-			}
+		blockKey := fmt.Sprintf("bb/block-%d", i)
+		if _, ok := set[blockKey]; !ok {
+			t.Errorf("open %d: %q missing from AllS3KeySet: gc would delete a live block", i, blockKey)
+		}
+		if _, ok := set["aa/legacy"]; ok {
+			t.Errorf("open %d: the legacy s3_key is still protected; nothing reads that column any more", i)
 		}
 		d.Close()
 	}
@@ -379,7 +349,7 @@ func TestDeleteInodeCascadesToBlocks(t *testing.T) {
 	if _, _, err := d.CommitBlocks(id, []BlockCommit{{Index: 0, S3Key: "k0", Size: 10}}, 10); err != nil {
 		t.Fatalf("commit blocks: %v", err)
 	}
-	if err := d.DeleteInode(id); err != nil {
+	if _, err := d.DeleteInode(id); err != nil {
 		t.Fatalf("delete inode: %v", err)
 	}
 

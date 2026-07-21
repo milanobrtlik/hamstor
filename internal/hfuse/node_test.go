@@ -208,7 +208,7 @@ func TestRenameOverEmptyDir(t *testing.T) {
 	}
 
 	// DeleteInode should work on empty dir (what Rename does after the check passes)
-	if err := hfs.DB.DeleteInode(dstID); err != nil {
+	if _, err := hfs.DB.DeleteInode(dstID); err != nil {
 		t.Fatalf("delete empty dst dir: %v", err)
 	}
 	if _, err := hfs.DB.GetInode(dstID); err == nil {
@@ -356,7 +356,7 @@ func TestDeleteInodeTransaction(t *testing.T) {
 	}
 
 	// Delete inode (should also delete xattrs in transaction)
-	if err := hfs.DB.DeleteInode(fileID); err != nil {
+	if _, err := hfs.DB.DeleteInode(fileID); err != nil {
 		t.Fatalf("delete inode: %v", err)
 	}
 

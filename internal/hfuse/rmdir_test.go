@@ -38,12 +38,22 @@ func TestRmdirRecursive(t *testing.T) {
 		t.Fatalf("expected 3 children, got %d", len(children))
 	}
 
-	// Collect S3 keys before deletion
+	// Collect the S3 keys before deletion. They have to be read from the blocks
+	// table: an inode names no object of its own, and the rows disappear with the
+	// inode through ON DELETE CASCADE, so after deleteTree nobody knows them.
+	// That is also what deleteTree itself has to get right — hence this check.
 	var s3Keys []string
 	for _, c := range children {
-		if c.S3Key != "" {
-			s3Keys = append(s3Keys, c.S3Key)
+		blocks, bErr := hfs.DB.BlocksForInode(c.ID)
+		if bErr != nil {
+			t.Fatalf("blocks for inode %d: %v", c.ID, bErr)
 		}
+		for _, b := range blocks {
+			s3Keys = append(s3Keys, b.S3Key)
+		}
+	}
+	if len(s3Keys) == 0 {
+		t.Fatal("no block objects to check: the files were not stored the way this test assumes")
 	}
 
 	// Delete dir recursively
@@ -98,12 +108,14 @@ func TestRmdirNestedDirs(t *testing.T) {
 	handle.TestFlush()
 	handle.WaitUpload()
 
-	// Get S3 key
-	meta, err := hfs.DB.GetInode(fileID)
+	// Get the file's block objects, the only storage it has.
+	blocks, err := hfs.DB.BlocksForInode(fileID)
 	if err != nil {
-		t.Fatalf("get inode: %v", err)
+		t.Fatalf("blocks for inode: %v", err)
 	}
-	s3Key := meta.S3Key
+	if len(blocks) == 0 {
+		t.Fatal("no block objects to check: the file was not stored the way this test assumes")
+	}
 
 	// Delete top recursively
 	if err := deleteTree(ctx, hfs, topID); err != nil {
@@ -118,11 +130,10 @@ func TestRmdirNestedDirs(t *testing.T) {
 		}
 	}
 
-	// Verify: S3 object gone
-	if s3Key != "" {
-		_, err := hfs.Store.Download(ctx, s3Key)
-		if err == nil {
-			t.Fatal("expected S3 object to be deleted")
+	// Verify: the block objects are gone
+	for _, b := range blocks {
+		if _, err := hfs.Store.Download(ctx, b.S3Key); err == nil {
+			t.Fatalf("block %d (%s) survived deleteTree", b.Index, b.S3Key)
 		}
 	}
 }

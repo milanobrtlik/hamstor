@@ -7,13 +7,16 @@ import (
 	"github.com/milan/hamstor/internal/db"
 )
 
-// TestCommitInodeDecrementsVolumeAtomically verifies the fix for the
-// non-atomic MarkNeedleDead + CommitInode bug: when a volume-packed inode is
-// overwritten with a standalone object, CommitInode must decrement the old
-// volume's live_count in the SAME transaction that clears the inode's vol
-// columns, so a crash window can never leave a referenced volume at
-// live_count=0 for GC to delete.
-func TestCommitInodeDecrementsVolumeAtomically(t *testing.T) {
+// TestCommitBlocksDecrementsVolumeAtomically verifies the fix for the
+// non-atomic MarkNeedleDead + commit bug: when a volume-packed inode is
+// overwritten, the commit must decrement the old volume's live_count in the SAME
+// transaction that clears the inode's vol columns, so a crash window can never
+// leave a referenced volume at live_count=0 for GC to delete.
+//
+// The overwrite is a block commit because that is what an overwrite past
+// MaxNeedleSize now produces — needle to blocks is the transition this rule has
+// to survive, and it happens every time a small file grows.
+func TestCommitBlocksDecrementsVolumeAtomically(t *testing.T) {
 	hfs := setupDBOnly(t)
 	database := hfs.DB
 
@@ -43,14 +46,14 @@ func TestCommitInodeDecrementsVolumeAtomically(t *testing.T) {
 		t.Fatalf("inode should reference volume, got vol_s3_key=%q", meta.VolS3Key)
 	}
 
-	// Overwrite the inode as a standalone object. CommitInode must atomically
-	// decrement the volume's live_count to 0 and clear the vol columns.
-	ok, err := database.CommitInode(id, "bb/new-standalone-key", 50)
+	// Overwrite the needle with a block set. The commit must atomically decrement
+	// the volume's live_count to 0 and clear the vol columns.
+	ok, _, err := database.CommitBlocks(id, []db.BlockCommit{{Index: 0, S3Key: "bb/new-block-key", Size: 50}}, 50)
 	if err != nil {
-		t.Fatalf("commit inode: %v", err)
+		t.Fatalf("commit blocks: %v", err)
 	}
 	if !ok {
-		t.Fatal("commit inode should report the row as still present")
+		t.Fatal("commit should report the row as still present")
 	}
 
 	meta, err = database.GetInode(id)
@@ -60,8 +63,12 @@ func TestCommitInodeDecrementsVolumeAtomically(t *testing.T) {
 	if meta.VolS3Key != "" {
 		t.Fatalf("vol_s3_key should be cleared, got %q", meta.VolS3Key)
 	}
-	if meta.S3Key != "bb/new-standalone-key" {
-		t.Fatalf("s3_key=%q, want bb/new-standalone-key", meta.S3Key)
+	blocks, err := database.BlocksForInode(id)
+	if err != nil {
+		t.Fatalf("blocks after commit: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].S3Key != "bb/new-block-key" {
+		t.Fatalf("blocks=%+v, want the single new block", blocks)
 	}
 
 	// The volume must now register as empty (live_count=0) so GC can reclaim it.
@@ -111,14 +118,14 @@ func TestDeleteInodeWithVolumeNoDoubleDecrement(t *testing.T) {
 		t.Fatalf("commit needles: %v", err)
 	}
 
-	// Overwrite id1 (CommitInode decrements live_count 2 -> 1 and clears its vol ref).
-	if _, err := database.CommitInode(id1, "dd/standalone", 10); err != nil {
-		t.Fatalf("commit inode: %v", err)
+	// Overwrite id1 (the commit decrements live_count 2 -> 1 and clears its vol ref).
+	if _, _, err := database.CommitBlocks(id1, []db.BlockCommit{{Index: 0, S3Key: "dd/block", Size: 10}}, 10); err != nil {
+		t.Fatalf("commit blocks: %v", err)
 	}
 
 	// Now delete id1 passing the STALE volKey it used to reference. Because the
 	// row's vol_s3_key is already NULL, no second decrement may happen.
-	if err := database.DeleteInodeWithVolume(id1, volKey); err != nil {
+	if _, err := database.DeleteInodeWithVolume(id1, volKey); err != nil {
 		t.Fatalf("delete inode with volume: %v", err)
 	}
 
@@ -134,7 +141,7 @@ func TestDeleteInodeWithVolumeNoDoubleDecrement(t *testing.T) {
 	}
 
 	// Deleting id2 (still references the volume) must bring it to 0.
-	if err := database.DeleteInodeWithVolume(id2, volKey); err != nil {
+	if _, err := database.DeleteInodeWithVolume(id2, volKey); err != nil {
 		t.Fatalf("delete inode 2: %v", err)
 	}
 	empty, err = database.GetEmptyVolumes(0)

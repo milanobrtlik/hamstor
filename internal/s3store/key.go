@@ -7,8 +7,3 @@ func NewKey() string {
 	id := uuid.New().String()
 	return id[:2] + "/" + id
 }
-
-// IsPrefixed reports whether the key has the 2-char prefix format (xx/uuid).
-func IsPrefixed(key string) bool {
-	return len(key) == 39 && key[2] == '/'
-}

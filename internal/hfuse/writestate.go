@@ -2,7 +2,6 @@ package hfuse
 
 import (
 	"context"
-	"io"
 	"log"
 	"os"
 	"sync"
@@ -94,11 +93,6 @@ type inodeWrite struct {
 	spillFile *os.File
 	spillSize int64
 
-	// Cache-backed read: when set, reads use ReadAt on this file instead of
-	// holding the whole file in buf. Shared across handles; concurrent ReadAt
-	// is safe (it is a pread and never moves the offset).
-	cacheFile *os.File
-
 	// cur is the most recent upload attempt, nil if there has never been one.
 	// It is published before Flush releases mu for the first time, so a
 	// concurrent load always knows to wait rather than read a key the in-flight
@@ -175,7 +169,7 @@ func (hfs *HamstorFS) readStaged(ctx context.Context, inodeID int64) ([]byte, in
 		if err != nil {
 			return nil, 0, toErrno(err)
 		}
-		if meta.VolS3Key != "" || meta.S3Key != "" {
+		if meta.VolS3Key != "" {
 			return nil, 0, 0 // no longer staged; caller re-reads and reloads
 		}
 		if meta.Size == 0 {
@@ -203,8 +197,8 @@ func (hfs *HamstorFS) readStaged(ctx context.Context, inodeID int64) ([]byte, in
 			// volume, or we are between our GetInode and an overwrite's rename.
 			//
 			// The block case must be tested here rather than with the metadata
-			// above: a file stored in blocks has neither an s3_key nor a
-			// vol_s3_key, so the "no longer staged" test at the top of the loop
+			// above: a file stored in blocks has no vol_s3_key either, so the
+			// "no longer staged" test at the top of the loop
 			// cannot see it, and we would spend every attempt hunting for a
 			// staging file that was correctly deleted before returning EIO for
 			// data sitting safely in S3. Down here it costs one query on a path
@@ -248,22 +242,7 @@ func truncateWriteState(st *inodeWrite, s int64) syscall.Errno {
 		return 0
 	}
 
-	// A cache-backed state holds no mutable buffer. Materialize it so the
-	// truncation is durable on the next Flush, instead of only changing the DB
-	// size while storage keeps the old bytes (which a later rewrite or append
-	// would then resurrect).
-	if st.cacheFile != nil {
-		if info, statErr := st.cacheFile.Stat(); statErr == nil {
-			b := make([]byte, info.Size())
-			if _, rerr := st.cacheFile.ReadAt(b, 0); rerr == nil || rerr == io.EOF {
-				st.buf = b
-				st.cacheFile.Close()
-				st.cacheFile = nil
-				st.loaded = true
-			}
-		}
-	}
-	if st.loaded && st.cacheFile == nil {
+	if st.loaded {
 		if s < int64(len(st.buf)) {
 			st.buf = st.buf[:s]
 		} else if s > int64(len(st.buf)) {
@@ -319,10 +298,6 @@ func (st *inodeWrite) free() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.buf = nil
-	if st.cacheFile != nil {
-		st.cacheFile.Close()
-		st.cacheFile = nil
-	}
 	// Spill ownership transfers to the upload goroutine in Flush; a spill file
 	// still here means Flush never ran (opened and written, never closed) or it
 	// bailed early, so this is the last chance to clean it up.

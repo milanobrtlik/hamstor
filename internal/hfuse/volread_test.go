@@ -56,7 +56,7 @@ func stagePackedVolume(t *testing.T, hfs *HamstorFS, names []string, contents []
 		// CommitInode sets the logical size and leaves the inode committed and
 		// unpacked (s3_key and vol_s3_key empty), which is what
 		// CommitNeedlesToVolume's onlyUnpacked path requires.
-		if _, err := hfs.DB.CommitInode(id, "", int64(len(content))); err != nil {
+		if _, err := hfs.DB.CommitInode(id, int64(len(content))); err != nil {
 			t.Fatalf("commit inode %s: %v", names[i], err)
 		}
 		ids[i] = id

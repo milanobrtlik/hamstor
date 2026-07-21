@@ -356,10 +356,11 @@ func TestWriteStateReleasedOnOpenError(t *testing.T) {
 	hfs, _ := setupTest(t)
 
 	id := mustInsert(t, hfs, "gone.txt")
-	// A committed inode naming an S3 key that cannot be fetched: the write
-	// preload in Open then fails and returns no handle.
-	if _, err := hfs.DB.CommitInode(id, "aa/does-not-exist-"+t.Name(), 10); err != nil {
-		t.Fatalf("commit inode: %v", err)
+	// A committed inode whose one block names an object that cannot be fetched:
+	// the write preload in Open then fails and returns no handle.
+	blocks := []db.BlockCommit{{Index: 0, S3Key: "aa/does-not-exist-" + t.Name(), Size: 10}}
+	if _, _, err := hfs.DB.CommitBlocks(id, blocks, 10); err != nil {
+		t.Fatalf("commit blocks: %v", err)
 	}
 	badStore, err := s3store.New(context.Background(), "hamstor-no-such-bucket-open",
 		cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, cfg.Region)
@@ -379,16 +380,22 @@ func TestWriteStateReleasedOnOpenError(t *testing.T) {
 	}
 }
 
-// TestOpenTruncWithCacheBackedSibling drives node.Open directly, which the other
+// TestOpenTruncWithLoadedSibling drives node.Open directly, which the other
 // tests do not: they build handles straight from the registry. O_TRUNC is the one
 // path sharing made unconditional, so it is exactly where a shared state left
-// over from a reader can be found in a shape Open did not expect.
+// over from a reader can be found in a shape Open did not expect: emptying only
+// part of what backs the contents truncates nothing, and `> file` comes back the
+// full length of the old file.
 //
-// A cache-backed state serves reads from cacheFile and rebuilds buf from it on
-// the first write. Emptying only buf therefore truncates nothing: `> file` comes
-// back the full length of the old file.
-func TestOpenTruncWithCacheBackedSibling(t *testing.T) {
-	hfs, _ := setupTest(t) // async path: >MaxNeedleSize file gets a standalone key
+// This used to build a legacy whole-file inode by hand, because the state it
+// covered (reads served straight from a cache file) was reachable only from the
+// s3_key branch of ensureLoaded. That state no longer exists — a block-stored
+// file loads into buf or a spill file, and nothing else can back a loaded state
+// — so the fixture is now just a normally written file. What is being guarded is
+// unchanged: a sibling with the contents already loaded must not survive the
+// truncation.
+func TestOpenTruncWithLoadedSibling(t *testing.T) {
+	hfs, _ := setupTest(t) // async path: the file is stored as blocks
 	cacheDir := t.TempDir()
 	dc, err := cache.New(cacheDir, 1<<30)
 	if err != nil {
@@ -398,38 +405,21 @@ func TestOpenTruncWithCacheBackedSibling(t *testing.T) {
 	hfs.SpillDir = t.TempDir()
 
 	id := mustInsert(t, hfs, "trunc-me.bin")
-
-	// Build a LEGACY whole-file inode by hand: one object named by inodes.s3_key,
-	// the shape every large file had before the block layout. It has to be built
-	// rather than written, because the write path no longer produces it — and the
-	// cache-backed state this test exists to catch is reachable only from that
-	// branch of ensureLoaded, since loading from blocks fills buf or a spill file
-	// instead. Writing the file normally would leave st.cacheFile nil and the test
-	// would skip itself, quietly guarding nothing.
-	//
-	// The read path still serves these, so the guard is still live. It retires
-	// together with the column.
 	orig := bytes.Repeat([]byte("O"), 300*1024)
-	legacyKey := s3store.NewKey()
-	if err := hfs.Store.Upload(context.Background(), legacyKey, orig); err != nil {
-		t.Fatalf("upload legacy object: %v", err)
-	}
-	t.Cleanup(func() { hfs.Store.Delete(context.Background(), legacyKey) })
-	if _, err := hfs.DB.CommitInode(id, legacyKey, int64(len(orig))); err != nil {
-		t.Fatalf("commit legacy inode: %v", err)
-	}
+	writeAt(t, hfs, id, orig, 0, true)
+	blocksOf(t, hfs, id)
 
-	// A reader holds the file open, populating the shared state's cacheFile.
+	// A reader holds the file open with its contents loaded into the shared state.
 	reader := NewTestHandle(hfs, id, false)
 	defer reader.TestRelease()
 	if _, errno := reader.TestRead(16, 0); errno != 0 {
 		t.Fatalf("reader read: %v", errno)
 	}
 	reader.h.st.mu.Lock()
-	cached := reader.h.st.cacheFile != nil
+	loaded := reader.h.st.loaded
 	reader.h.st.mu.Unlock()
-	if !cached {
-		t.Skip("state is not cache-backed; nothing for this test to catch")
+	if !loaded {
+		t.Fatal("reader did not load the shared state; the test would guard nothing")
 	}
 
 	// Now `> file` while the reader is still open.
@@ -587,8 +577,9 @@ func TestConcurrentAppendersViaOpen(t *testing.T) {
 			m, _ := hfs.DB.GetInode(id)
 			sp := hfs.VolumeBuilder.StagePath(id)
 			raw, rerr := os.ReadFile(sp)
-			t.Fatalf("round %d: %d lines, want 6: %q\n  DB: size=%d s3=%q vol=%q volsize=%d\n  staging file: %d bytes %q (err %v)",
-				round, lines, got, m.Size, m.S3Key, m.VolS3Key, m.VolSize, len(raw), raw, rerr)
+			nBlocks, _ := hfs.DB.BlocksForInode(id)
+			t.Fatalf("round %d: %d lines, want 6: %q\n  DB: size=%d vol=%q volsize=%d blocks=%d\n  staging file: %d bytes %q (err %v)",
+				round, lines, got, m.Size, m.VolS3Key, m.VolSize, len(nBlocks), len(raw), raw, rerr)
 		}
 		for _, who := range []string{"A", "B"} {
 			for i := 1; i <= 3; i++ {

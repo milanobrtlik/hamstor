@@ -250,7 +250,6 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		inodeID:    n.inodeID,
 		inode:      &n.Inode,
 		st:         st,
-		s3Key:      meta.S3Key,
 		fileSize:   meta.Size,
 		appendMode: flags&uint32(syscall.O_APPEND) != 0,
 	}
@@ -292,20 +291,19 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			return nil, 0, toErrno(err)
 		}
 		meta = m
-		handle.s3Key = meta.S3Key
 		handle.fileSize = meta.Size
 	}
 
 	// Preload data for files opened in write mode.
 	//
-	// A block-stored file has neither key, so it is found by looking for its
+	// A block-stored file has no vol_s3_key, so it is found by looking for its
 	// blocks — and it must be, twice over: hasData false would skip the preload
 	// and leave an empty shared buffer for the first write to append to (and
 	// then commit as the whole file), while hasData true without a block branch
 	// below would send it down the staging path to hunt for a staging file that
 	// never existed.
 	var blocks []db.BlockCommit
-	if meta.S3Key == "" && meta.VolS3Key == "" && meta.Size > 0 {
+	if meta.VolS3Key == "" && meta.Size > 0 {
 		b, bErr := n.hfs.DB.BlocksForInode(n.inodeID)
 		if bErr != nil {
 			return nil, 0, toErrno(bErr)
@@ -313,7 +311,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		blocks = b
 	}
 
-	hasData := meta.S3Key != "" || meta.VolS3Key != "" || len(blocks) > 0 ||
+	hasData := meta.VolS3Key != "" || len(blocks) > 0 ||
 		(meta.Size > 0 && n.hfs.VolumeBuilder != nil)
 
 	// O_TRUNC empties the file for everyone, so it applies even when another
@@ -331,13 +329,6 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			st.spillSize = 0
 		}
 		st.buf = nil
-		// A cache-backed state serves reads straight from cacheFile, and Write
-		// rebuilds buf from it on first write. Emptying buf alone would truncate
-		// nothing — the whole pre-truncate file comes back.
-		if st.cacheFile != nil {
-			st.cacheFile.Close()
-			st.cacheFile = nil
-		}
 		// Nothing written since the last flush survives an emptied file, and the
 		// commit at size 0 drops every block anyway.
 		st.dirtyBlocks = nil
@@ -352,53 +343,6 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			if errno := handle.loadFromBlocks(ctx, blocks, meta.Size); errno != 0 {
 				return nil, 0, errno
 			}
-		} else if meta.S3Key != "" {
-			// Try cache first for write preload
-			var data []byte
-			if n.hfs.Cache != nil {
-				if f, cacheErr := n.hfs.Cache.Open(meta.S3Key); cacheErr == nil {
-					info, _ := f.Stat()
-					data = make([]byte, info.Size())
-					f.ReadAt(data, 0)
-					f.Close()
-				}
-			}
-			if data == nil {
-				var dlErr error
-				data, dlErr = n.hfs.Store.Download(ctx, meta.S3Key)
-				if dlErr != nil {
-					return nil, 0, toErrno(dlErr)
-				}
-				if n.hfs.Encryptor != nil && crypto.IsEncrypted(data) {
-					data, dlErr = n.hfs.Encryptor.Decrypt(data)
-					if dlErr != nil {
-						log.Printf("hamstor: decrypt failed for inode %d: %v", n.inodeID, dlErr)
-						return nil, 0, syscall.EIO
-					}
-				}
-				if n.hfs.Cache != nil {
-					if putErr := n.hfs.Cache.Put(meta.S3Key, data); putErr != nil {
-						log.Printf("hamstor: cache put on open: %v", putErr)
-					}
-				}
-			}
-			// Spill large preloads to disk to avoid OOM
-			if int64(len(data)) > spillThreshold {
-				sf, sfErr := os.CreateTemp(n.hfs.SpillDir, "hamstor-spill-*")
-				if sfErr != nil {
-					return nil, 0, syscall.EIO
-				}
-				if _, sfErr = sf.Write(data); sfErr != nil {
-					sf.Close()
-					os.Remove(sf.Name())
-					return nil, 0, syscall.EIO
-				}
-				st.spillFile = sf
-				st.spillSize = int64(len(data))
-			} else {
-				st.buf = data
-			}
-			st.loaded = true
 		} else if meta.VolS3Key != "" {
 			// Preload from volume (file is packed in a volume S3 object)
 			data, dlErr := n.hfs.Store.DownloadRange(ctx, meta.VolS3Key, meta.VolOffset, meta.VolSize)
@@ -493,7 +437,7 @@ func (n *HamstorNode) openPreloadStaged(ctx context.Context, handle *HamstorHand
 			return nil, false, toErrno(err)
 		}
 		if meta.VolS3Key == "" {
-			if meta.S3Key == "" && meta.Size > 0 {
+			if meta.Size > 0 {
 				blocks, bErr := n.hfs.DB.BlocksForInode(n.inodeID)
 				if bErr != nil {
 					return nil, false, toErrno(bErr)
@@ -536,21 +480,20 @@ func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		}
 	}
 
-	if meta.S3Key != "" {
-		if n.hfs.Cache != nil {
-			n.hfs.Cache.Evict(meta.S3Key)
-		}
-		if err := n.hfs.Store.Delete(ctx, meta.S3Key); err != nil {
-			log.Printf("hamstor: unlink s3 delete %s: %v", meta.S3Key, err)
-		}
-	} else if meta.VolS3Key == "" && meta.Size > 0 && n.hfs.VolumeBuilder != nil {
-		// File staged but not yet packed — remove staging file
+	if meta.VolS3Key == "" && meta.Size > 0 && n.hfs.VolumeBuilder != nil {
+		// May be staged but not yet packed — remove the staging file. Harmless
+		// when the file is stored as blocks instead: there is no such file.
 		os.Remove(n.hfs.VolumeBuilder.StagePath(meta.ID))
 	}
 
-	if err := n.hfs.DB.DeleteInodeWithVolume(meta.ID, meta.VolS3Key); err != nil {
+	// The block keys come back FROM the delete, not from meta: the rows go away
+	// with the inode through ON DELETE CASCADE, so this call is the last moment
+	// anyone knows them.
+	orphaned, err := n.hfs.DB.DeleteInodeWithVolume(meta.ID, meta.VolS3Key)
+	if err != nil {
 		return toErrno(err)
 	}
+	n.hfs.dropObjects(ctx, orphaned)
 	return 0
 }
 
@@ -568,9 +511,14 @@ func (n *HamstorNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.ENOTEMPTY
 	}
 
-	if err := n.hfs.DB.DeleteInode(meta.ID); err != nil {
+	// A directory owns no blocks, but the keys still come back from the delete
+	// rather than being assumed empty: the one caller who assumes wrong is the
+	// one who leaks.
+	orphaned, err := n.hfs.DB.DeleteInode(meta.ID)
+	if err != nil {
 		return toErrno(err)
 	}
+	n.hfs.dropObjects(ctx, orphaned)
 	return 0
 }
 
@@ -586,14 +534,7 @@ func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 				return err
 			}
 		} else {
-			if child.S3Key != "" {
-				if hfs.Cache != nil {
-					hfs.Cache.Evict(child.S3Key)
-				}
-				if err := hfs.Store.Delete(ctx, child.S3Key); err != nil {
-					log.Printf("hamstor: rmdir delete s3 %s: %v", child.S3Key, err)
-				}
-			} else if child.VolS3Key == "" && child.Size > 0 && hfs.VolumeBuilder != nil {
+			if child.VolS3Key == "" && child.Size > 0 && hfs.VolumeBuilder != nil {
 				os.Remove(hfs.VolumeBuilder.StagePath(child.ID))
 			}
 			if thumb.IsImageExt(child.Name) {
@@ -605,13 +546,20 @@ func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 					}()
 				}
 			}
-			if err := hfs.DB.DeleteInodeWithVolume(child.ID, child.VolS3Key); err != nil {
-				return err
+			orphaned, delErr := hfs.DB.DeleteInodeWithVolume(child.ID, child.VolS3Key)
+			if delErr != nil {
+				return delErr
 			}
+			hfs.dropObjects(ctx, orphaned)
 		}
 	}
 
-	return hfs.DB.DeleteInode(dirID)
+	orphaned, err := hfs.DB.DeleteInode(dirID)
+	if err != nil {
+		return err
+	}
+	hfs.dropObjects(ctx, orphaned)
+	return nil
 }
 
 func (n *HamstorNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
@@ -725,19 +673,14 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 				}()
 			}
 		}
-		if existing.S3Key != "" {
-			if n.hfs.Cache != nil {
-				n.hfs.Cache.Evict(existing.S3Key)
-			}
-			if delErr := n.hfs.Store.Delete(ctx, existing.S3Key); delErr != nil {
-				log.Printf("hamstor: rename delete old s3 %s: %v", existing.S3Key, delErr)
-			}
-		} else if existing.VolS3Key == "" && existing.Size > 0 && n.hfs.VolumeBuilder != nil {
+		if existing.VolS3Key == "" && existing.Size > 0 && n.hfs.VolumeBuilder != nil {
 			os.Remove(n.hfs.VolumeBuilder.StagePath(existing.ID))
 		}
-		if delErr := n.hfs.DB.DeleteInodeWithVolume(existing.ID, existing.VolS3Key); delErr != nil {
+		orphaned, delErr := n.hfs.DB.DeleteInodeWithVolume(existing.ID, existing.VolS3Key)
+		if delErr != nil {
 			return toErrno(delErr)
 		}
+		n.hfs.dropObjects(ctx, orphaned)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return toErrno(err)
 	}

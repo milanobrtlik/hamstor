@@ -88,15 +88,27 @@ func TestRecoverPendingUploadsRetainedBytes(t *testing.T) {
 	if meta.Status != "committed" {
 		t.Errorf("status = %q, want committed", meta.Status)
 	}
-	if meta.S3Key == "" {
-		t.Fatal("no S3 key after recovery")
-	}
 	if meta.Size != logicalSize {
 		t.Errorf("size = %d, want the logical size %d (not the stored length %d)", meta.Size, logicalSize, len(stored))
 	}
-	t.Cleanup(func() { hfs.Store.Delete(context.Background(), meta.S3Key) })
 
-	got, err := hfs.Store.Download(context.Background(), meta.S3Key)
+	// Recovery has to commit the bytes the way a flush would: as block 0 of a
+	// block-stored file. Committing them as anything else produces an inode the
+	// read path cannot find, and then deletes the retained copy.
+	blocks, err := hfs.DB.BlocksForInode(id)
+	if err != nil {
+		t.Fatalf("blocks after recovery: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].Index != 0 {
+		t.Fatalf("blocks after recovery = %+v, want exactly block 0", blocks)
+	}
+	if blocks[0].Size != logicalSize {
+		t.Errorf("block size = %d, want the logical size %d — recording the stored length %d instead makes the file read long",
+			blocks[0].Size, logicalSize, len(stored))
+	}
+	t.Cleanup(func() { hfs.Store.Delete(context.Background(), blocks[0].S3Key) })
+
+	got, err := hfs.Store.Download(context.Background(), blocks[0].S3Key)
 	if err != nil {
 		t.Fatalf("download recovered object: %v", err)
 	}
@@ -123,7 +135,7 @@ func TestCheckStagedDataFindsRegularFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert lost: %v", err)
 	}
-	if _, err := hfs.DB.CommitInode(lost, "", 8); err != nil {
+	if _, err := hfs.DB.CommitInode(lost, 8); err != nil {
 		t.Fatalf("commit lost: %v", err)
 	}
 
@@ -132,7 +144,7 @@ func TestCheckStagedDataFindsRegularFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert staged: %v", err)
 	}
-	if _, err := hfs.DB.CommitInode(staged, "", 8); err != nil {
+	if _, err := hfs.DB.CommitInode(staged, 8); err != nil {
 		t.Fatalf("commit staged: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(stagingDir, fmt.Sprintf("%d", staged)), []byte("contents"), 0o600); err != nil {

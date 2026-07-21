@@ -51,8 +51,7 @@ func blockKeys(t *testing.T, hfs *HamstorFS, id int64) []string {
 
 // soleBlockKey is blockKeys for a file that must be exactly one block, which is
 // every file below db.BlockSize. It also proves the flush stored the file as
-// blocks at all: before this step it would have been one whole-file object named
-// by inodes.s3_key, which the async path no longer writes.
+// blocks at all — the only shape an inode's own data can take.
 func soleBlockKey(t *testing.T, hfs *HamstorFS, id int64) string {
 	t.Helper()
 	keys := blockKeys(t, hfs, id)
