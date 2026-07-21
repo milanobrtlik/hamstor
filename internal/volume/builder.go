@@ -26,8 +26,13 @@ var ErrBeingPacked = errors.New("file is being packed by builder")
 
 const (
 	// MaxNeedleSize is the maximum file size that gets packed into a volume.
-	// Files larger than this are uploaded as standalone S3 objects.
-	MaxNeedleSize = 256 << 10 // 256 KB
+	// Files larger than this are stored as blocks instead.
+	//
+	// It is an alias rather than its own value because db's SQL has to know it
+	// too: a file bigger than this can never have been staged, which is what lets
+	// "committed, no needle, no blocks" be read as a sparse file rather than as
+	// missing data. Two copies of the number would let that reasoning go stale.
+	MaxNeedleSize = db.MaxNeedleSize
 
 	// TargetVolumeSize is the buffer threshold that triggers a volume upload.
 	TargetVolumeSize = 8 << 20 // 8 MB

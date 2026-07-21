@@ -18,9 +18,24 @@ import (
 )
 
 const (
-	maxRetries      = 3
-	retryBaseWait   = 500 * time.Millisecond
-	MaxDownloadSize = 2 << 30 // 2 GB — safety limit for in-memory downloads
+	maxRetries    = 3
+	retryBaseWait = 500 * time.Millisecond
+
+	// MaxDownloadSize bounds one whole-object download. It used to be 2 GB and
+	// it used to be a ceiling on FILE size — an inode named one object, so a
+	// larger file could not be read back at all, and could not be opened for
+	// writing even to append a line.
+	//
+	// Under the block layout no object can reach it: a file is N blocks of at
+	// most db.BlockSize (8 MiB) plus 29 bytes of GCM overhead, and a volume is
+	// sealed at TargetVolumeSize (8 MB) plus at most one MaxNeedleSize needle.
+	// Both whole-object callers (fetchBlock, fetchVolume) therefore ask for far
+	// less than this, so it is now what it claims to be: a sanity check against a
+	// corrupt or hostile object, not a limit anyone can hit legitimately.
+	//
+	// Tied to UploadPartSize because that is the real structural bound — nothing
+	// hamstor writes is ever larger than one part (D1).
+	MaxDownloadSize = UploadPartSize
 
 	// UploadPartSize is the transfer manager's part size. It is deliberately
 	// twice the 8 MiB block size of the block layout, so that a single block is
