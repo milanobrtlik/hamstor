@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Hamstor is a FUSE filesystem daemon (Go 1.25+) that presents S3-compatible object storage as a local mountable filesystem. Files are buffered locally (memory for small files, temp files for large), uploaded to S3 on flush, with metadata stored in SQLite. Litestream replicates the database to S3 for recovery.
 
+**A storage-format change is designed but not implemented:** large files move from one object per file to fixed 8 MiB blocks, which is what retires the read-modify-write on every write and the 2 GB ceiling below. The decisions, the call-site inventory (including the ten ways to lose data by missing one) and the implementation order are settled in `claudedocs/block-layout-design.md`. Read it before touching the write path or anything that assumes `s3_key` names a whole file — do not re-derive it.
+
 ## Commands
 
 ```bash
