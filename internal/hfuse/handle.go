@@ -330,8 +330,13 @@ func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.
 		return h.readLoaded(dest, off)
 	}
 
-	// Chunk-based path: unencrypted, has S3 key, not dirty, cache available
-	if h.s3Key != "" && h.hfs.Encryptor == nil && !h.st.dirty && h.hfs.Cache != nil {
+	// Chunk-based path: unencrypted, has S3 key, not dirty, cache available —
+	// and the whole file is not already cached. Range-reading an object we hold
+	// in full locally would download bytes we have, and PutChunk deletes the
+	// whole-file entry to put its chunk directory at that path, so the first
+	// read after a flush would throw away the copy the flush just kept.
+	if h.s3Key != "" && h.hfs.Encryptor == nil && !h.st.dirty && h.hfs.Cache != nil &&
+		!h.hfs.Cache.Has(h.s3Key) {
 		if off >= h.fileSize {
 			return fuse.ReadResultData(nil), 0
 		}
@@ -1080,73 +1085,56 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 		var plainBuf []byte
 		var uploadData []byte
 
-		// thumbSrc is the on-disk plaintext a thumbnail is built from. The spill
-		// file already holds exactly that, so for images it is handed to the
-		// thumbnailer instead of being deleted here — no second copy, and no
-		// image kept on the heap while the job waits for a ThumbSem slot.
-		// Ownership passes to scheduleThumb; until then this defer covers every
-		// early return.
-		var thumbSrc string
+		// plainPath is the spill file, which holds the plaintext of exactly what
+		// we are uploading. It outlives the upload on every path: a failed one
+		// retains the bytes, and a committed one seeds the disk cache and the
+		// thumbnailer from it — the file is already here, so downloading it back
+		// on the next open is pure waste. Ownership passes to scheduleThumb at
+		// the end (it removes non-images itself); until then this defer covers
+		// every early return.
+		plainPath := ""
+		if uploadFile != nil {
+			plainPath = uploadFile.Name()
+		}
 		defer func() {
-			if thumbSrc != "" {
-				os.Remove(thumbSrc)
+			if plainPath != "" {
+				os.Remove(plainPath)
 			}
 		}()
-		keepThumbSrc := thumb.IsImageExt(fileName)
 
 		if uploadFile != nil && hfs.Encryptor != nil {
 			plainBuf = make([]byte, bufSize)
 			if _, err := uploadFile.ReadAt(plainBuf, 0); err != nil && err != io.EOF {
 				log.Printf("hamstor: spill read failed for inode %d: %v", inodeID, err)
 				uploadFile.Close()
-				os.Remove(uploadFile.Name())
 				att.err = fmt.Errorf("spill read: %w", err)
 				return
 			}
 			uploadFile.Close()
-			if keepThumbSrc {
-				thumbSrc = uploadFile.Name()
-			} else {
-				os.Remove(uploadFile.Name())
-			}
 			uploadFile = nil
 
 			encrypted, encErr := hfs.Encryptor.Encrypt(plainBuf)
+			// Release the plaintext buffer now that the ciphertext exists, so
+			// peak heap during an encrypted upload is ~one full-size buffer
+			// instead of two (plaintext + ciphertext held simultaneously).
+			// Nothing needs it on the heap any more: the cache and the
+			// thumbnailer both read the plaintext from plainPath.
+			plainBuf = nil
 			if encErr != nil {
 				log.Printf("hamstor: encrypt failed for inode %d: %v", inodeID, encErr)
 				att.err = fmt.Errorf("encrypt: %w", encErr)
 				return
 			}
 			uploadData = encrypted
-			// Release the plaintext buffer now that the ciphertext exists, so
-			// peak heap during an encrypted upload is ~one full-size buffer
-			// instead of two (plaintext + ciphertext held simultaneously). It is
-			// kept only when an update is about to be re-cached below; thumbnails
-			// no longer need it, they read thumbSrc from disk.
-			if hfs.Cache == nil || oldKey == "" {
-				plainBuf = nil
-			}
 		}
 
 		var uploadErr error
-		// spillPath outlives uploadFile so a failed upload can retain the bytes;
-		// on success it is removed (or handed to the thumbnailer) as before.
-		spillPath := ""
 		if uploadFile != nil {
 			// Stream from spill file on disk — no file data on Go heap
 			uploadFile.Seek(0, io.SeekStart)
 			uploadErr = hfs.Store.UploadReader(uploadCtx, newKey, uploadFile, bufSize)
-			spillPath = uploadFile.Name()
 			uploadFile.Close()
 			uploadFile = nil
-			if uploadErr == nil {
-				if keepThumbSrc {
-					thumbSrc = spillPath
-				} else {
-					os.Remove(spillPath)
-				}
-				spillPath = ""
-			}
 		} else if uploadData != nil {
 			uploadErr = hfs.Store.Upload(uploadCtx, newKey, uploadData)
 		} else {
@@ -1158,17 +1146,26 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			// loses the file with nothing but a log line to show for it. Retained
 			// bytes are re-uploaded by RecoverPending on the next start; the inode
 			// stays 'pending' until then, which is what makes it recoverable.
-			if bufSize > 0 && hfs.retainPendingUpload(inodeID, bufSize, uploadData, spillPath) {
+			//
+			// What gets retained must be what was destined for the object, byte
+			// for byte — recovery re-uploads it without the passphrase. So the
+			// spill file may only be handed over when it IS the object, i.e. when
+			// nothing encrypted it; otherwise the ciphertext goes and the
+			// plaintext file is dropped by the defer above.
+			retainSpill := ""
+			if uploadData == nil {
+				retainSpill = plainPath
+			}
+			if bufSize > 0 && hfs.retainPendingUpload(inodeID, bufSize, uploadData, retainSpill) {
+				if retainSpill != "" {
+					plainPath = "" // renamed into pending/, no longer ours to remove
+				}
 				log.Printf("hamstor: async upload failed for inode %d, data retained for retry on next start: %v", inodeID, uploadErr)
 			} else {
 				log.Printf("hamstor: async upload failed for inode %d, DATA LOST: %v", inodeID, uploadErr)
-				if spillPath != "" {
-					os.Remove(spillPath)
-				}
 			}
 			uploadData = nil
 			att.err = uploadErr
-			plainBuf = nil
 			return
 		}
 		uploadData = nil
@@ -1189,7 +1186,6 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 				log.Printf("hamstor: async cleanup failed: %v", delErr)
 			}
 			att.err = err
-			plainBuf = nil
 			return
 		}
 		if !committed {
@@ -1201,7 +1197,6 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			// that reported success here would be claiming durability for a
 			// file whose only copy was deleted two lines up.
 			att.err = fmt.Errorf("inode %d deleted during upload", inodeID)
-			plainBuf = nil
 			return
 		}
 
@@ -1227,22 +1222,16 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			}
 		}
 
-		// Only cache file updates (oldKey != ""). New files are cached lazily
-		// on first read, avoiding disk I/O and eviction scans during bulk copy.
-		// plainBuf may be nil when streaming from spill file.
-		if hfs.Cache != nil && oldKey != "" && plainBuf != nil {
-			hfs.Cache.Evict(oldKey)
-			if putErr := hfs.Cache.Put(newKey, plainBuf); putErr != nil {
-				log.Printf("hamstor: cache put after flush: %v", putErr)
-			}
-		}
-
-		plainBuf = nil // free after cache put; thumbnails read thumbSrc from disk
+		// Keep the local copy: the bytes we just sent are still on this disk, and
+		// without this the next open downloads them straight back from S3.
+		hfs.cacheUploaded(newKey, oldKey, plainPath, bufSize)
 
 		// Hand the plaintext spill file to the thumbnailer, which removes it when
-		// done. Clearing thumbSrc transfers ownership away from the defer above.
-		hfs.scheduleThumb(inodeID, fileName, thumbSrc)
-		thumbSrc = ""
+		// done — including when it is not an image, so this is also how a plain
+		// file's spill gets cleaned up. Clearing plainPath transfers ownership
+		// away from the defer above.
+		hfs.scheduleThumb(inodeID, fileName, plainPath)
+		plainPath = ""
 
 		// Periodically return freed pages to the OS to reduce RSS.
 		hfs.MaybeFreeMem()

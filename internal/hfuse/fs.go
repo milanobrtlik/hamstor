@@ -142,6 +142,66 @@ func (hfs *HamstorFS) retainPendingUpload(inodeID, logicalSize int64, data []byt
 	return true
 }
 
+// maxCacheShare caps how much of the disk cache one freshly uploaded file may
+// claim: at most 1/maxCacheShare of it. A file bigger than that would evict most
+// of the cache on the way in — and then, being the largest entry, buy little for
+// what it displaced. With the default 10 GB cache this still admits a 4 GB video,
+// which is the case that motivated caching at the write at all.
+const maxCacheShare = 2
+
+// cacheUploaded seeds the disk cache with the contents just committed under
+// newKey, so the next open reads them locally instead of downloading back bytes
+// that were on this disk moments ago. It is the standalone-object counterpart of
+// volume.Builder.cacheVolume; without it, writing a large file and reopening it
+// sends the data on a local disk -> S3 -> local disk round trip.
+//
+// plainPath must be the PLAINTEXT spill file, never what went to S3: under
+// encryption the object is a whole-file AES-GCM blob, while the cache is served
+// as file contents (ensureLoaded reads a cache entry directly and decrypts only
+// what came from Store.Download). Caching the ciphertext would hand encrypted
+// bytes back as the file.
+//
+// Call only after CommitInode reported the inode committed. On the paths that
+// bail out afterwards the object is deleted again, and caching it would serve
+// bytes nothing references. Failures are logged and ignored — this is an
+// optimisation, never correctness.
+func (hfs *HamstorFS) cacheUploaded(newKey, oldKey, plainPath string, size int64) {
+	if hfs.Cache == nil {
+		return
+	}
+	// Always drop the superseded version, even when the new one is not cached:
+	// its object has just been deleted from S3, so the entry is dead weight that
+	// only LRU would eventually clear.
+	if oldKey != "" && oldKey != newKey {
+		hfs.Cache.Evict(oldKey)
+	}
+
+	if size == 0 {
+		// Nothing on disk to copy (Flush hands the goroutine no spill file for an
+		// empty file), but the empty object still costs a GET on the next read.
+		if err := hfs.Cache.Put(newKey, nil); err != nil {
+			log.Printf("hamstor: cache put after flush %s: %v", newKey, err)
+		}
+		return
+	}
+	if plainPath == "" {
+		return
+	}
+	if size*maxCacheShare > hfs.Cache.MaxBytes() {
+		return
+	}
+
+	f, err := os.Open(plainPath)
+	if err != nil {
+		log.Printf("hamstor: cache put after flush %s: %v", newKey, err)
+		return
+	}
+	defer f.Close()
+	if err := hfs.Cache.PutReader(newKey, f); err != nil {
+		log.Printf("hamstor: cache put after flush %s: %v", newKey, err)
+	}
+}
+
 // thumbJob is a pending thumbnail, referenced by path so a queued job costs a
 // few strings rather than a full image buffer.
 type thumbJob struct {
