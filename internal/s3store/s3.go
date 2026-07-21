@@ -40,6 +40,38 @@ func New(ctx context.Context, bucket, endpoint, accessKey, secretKey, region str
 		))
 	}
 
+	// Do not validate response checksums unless a request asks for it.
+	//
+	// The SDK default is ResponseChecksumValidationWhenSupported: validate
+	// whenever the server reports a checksum. That is unusable for us, because
+	// for an object uploaded via multipart the reported CRC32 is the checksum of
+	// the concatenated PART checksums, not of the object's bytes — so a
+	// whole-object GET can never validate, and Download fails all three retries
+	// with "checksum did not match: algorithm CRC32". Measured 2026-07-21: a 9 MB
+	// object (multipart at the default 5 MiB part size) is undownloadable against
+	// Garage, while a range GET of the same object returns the correct bytes. The
+	// data is fine; only the whole-object validation is impossible.
+	//
+	// Whether it bites depends on how the backend reports the checksum, which is
+	// why this looked backend-specific for a while: B2 (production) appends the
+	// part count, the SDK recognises the composite and logs "Skipped validation of
+	// multipart checksum"; Garage reports a bare value and the SDK validates it.
+	// Relying on that difference is not a strategy — it makes the mount work or
+	// not depending on the S3 implementation behind it.
+	//
+	// What this gives up: no CRC check on GET for single-PUT objects either.
+	// Under encryption nothing is lost (AES-256-GCM is authenticated — a corrupted
+	// ciphertext fails to open); unencrypted mounts fall back to TLS plus the
+	// provider's own integrity. That is the accepted trade, and it is a far better
+	// one than large files being unreadable.
+	//
+	// A LoadOption wins over AWS_RESPONSE_CHECKSUM_VALIDATION in the environment
+	// (config resolution is first-match-wins with LoadOptions first), so this
+	// cannot be silently undone from outside.
+	cfgOpts = append(cfgOpts, config.WithResponseChecksumValidation(
+		aws.ResponseChecksumValidationWhenRequired,
+	))
+
 	cfg, err := config.LoadDefaultConfig(ctx, cfgOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("s3store: load config: %w", err)
