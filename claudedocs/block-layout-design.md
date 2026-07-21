@@ -1111,12 +1111,85 @@ Po tomhle kroku nemá pole existovat. Build vyjmenuje zbytek; opravit se musí:
 Testy, které spadnou kompilací a musí se přepsat: `rmdir_test.go:44` a `rmdir_test.go:106`
 (jediné dva testy, které dnes sahají na `S3Key` přímo).
 
+> Obojí se ukázalo být nepřesné: `CommitInode` se smazat nedá a testů je devět souborů.
+> Viz „Co Krok 4 zjistil navíc" níž.
+
 *Proč až tady:* dřív by to znamenalo mít rozbité čtení starých souborů. Po kroku 3 už
 žádné nové soubory sloupec nepoužívají, takže smazání je čistý řez.
 
 *Riziko:* střední, ale **nízké v tom smyslu, na kterém záleží** — chyby jsou build errory,
 ne runtime. Jediné, co compiler nechytí, jsou SQL predikáty ve stringu (Č7, Č8), a ty
 jsou v inventuře vyjmenované.
+
+#### Co Krok 4 zjistil navíc (zapsáno po implementaci)
+
+1. **Streaming byl rozbitý od Kroku 3 a nikdo to nevěděl.** `node.Open` zapínalo
+   `handle.streaming` na „read-only ∧ bez šifrování ∧ media přípona ∧ `StreamRate > 0`" —
+   **bez ohledu na to, jestli soubor má celofilový klíč.** `Read` volí streaming jako
+   první větev a `fetchStreamChunk` dělá `DownloadRange(ctx, h.s3Key, …)`. Jenže od
+   `5902a6b` je `h.s3Key` u každého nově zapsaného souboru prázdný, `--stream-rate` má
+   default **5**, a tak **každý `.mp4` na nešifrovaném mountu vracel EIO**
+   (`input member Key must not be empty`). Nechytil to žádný test, protože `setupTest`
+   nechává `StreamRate` na nule — streaming neměl pokrytí vůbec.
+
+   Krok 4 by to zabetonoval (vzal by `h.s3Key` poslednímu čtenáři, který by na to mohl
+   přijít), takže se řeší tady: enablement se vypíná, média padají na `ensureLoaded`.
+   Krok 6 ho zapne nad bloky. Nový `TestStreamingMediaFileReads` to hlídá oběma směry.
+
+2. **`RecoverPending` je build error, který návrh nezmiňoval.** `cleanup.go:160`
+   commitovalo přes `CommitInode(inodeID, key, logicalSize)`, tedy celofilovým klíčem.
+   Návrh přiřadil celou retenci Kroku 7, ale tenhle řádek musel padnout teď. Vyšlo to
+   levně, protože Krok 3 nechal retenci fungovat **jen pro `wholeFileInOneBlock`**:
+   zadržený soubor je přesně jeden blok, takže commit je `CommitBlocks` s `{Index: 0,
+   Size: logicalSize}`. `Size` musí být **logická** délka z názvu souboru, ne
+   `info.Size()` — pod šifrováním se liší a soubor by četl dlouze. Dluh Kroku 7
+   (adresář pro víceblokové sady) zůstal nedotčený. Přibyla pojistka: `logicalSize >
+   BlockSize` se odmítne a soubor se **nechá ležet**, protože je to jediná kopie.
+
+3. **`db.CommitInode` nešlo smazat**, jak návrh říkal — má tři živé volající
+   (`flushStaged`, prázdný soubor ve `Flush`, `RecoverPending`). Zůstává, jen bez
+   parametru klíče: nově znamená „commitni inode, který nevlastní žádný objekt".
+
+4. **Testů sahajících na `S3Key` bylo devět souborů, ne dva.** Kromě
+   `rmdir_test.go` i `recover_test.go` (čte pole přímo) a šest dalších, které si
+   stavěly legacy inode přes `CommitInode(id, key, size)`: `audit_test.go`,
+   `concurrent_test.go` (2×), `block_test.go`, `db/blocks_test.go` (2×),
+   `ops/gc_test.go` (3×), `volread_test.go`.
+
+   Dva z nich byly od Kroku 3 **prázdné**: `rmdir_test.go:44` sbíralo `c.S3Key` do
+   pole, které už bylo vždycky prázdné, a `:106` totéž pro jeden soubor. Teď čtou
+   `BlocksForInode` a `t.Fatal`ují, když nic nenajdou — takže se to nemůže zopakovat.
+   Ověřeno mutací (vypnout mazání v `deleteTree` ⇒ oba testy spadnou).
+
+   `ops/gc_test.go` přepsané na blokové sady dalo **Č3 první test vůbec**.
+
+5. **`cacheFile` šel celý pryč, `h.s3Key` zůstal.** Obě pole se po tomhle kroku stala
+   nedosažitelnými, ale nejsou to stejné případy. Kolem `cacheFile` byly **invarianty**
+   (zavřít při `O_TRUNC`, materializovat před `truncate`, překlopit na buf/spill při
+   prvním zápisu) a žádný pozdější krok ho neoživuje — Krok 5 cachuje **per blok** do
+   sestaveného bufferu, ne jako backing file celého stavu. `h.s3Key` je proti tomu
+   inertní string bez jediného pravidla, který drží zkompilované ty čtyři funkce, jež
+   má Krok 6 přepsat. Smazat ho = udělat Krok 6 tady.
+
+6. **Č4 se udělal vracením klíčů, jak návrh doporučoval, a hned se to vyplatilo:**
+   `Rmdir` a `Cleanup` by se na ně jinak nezeptaly. Rozšířeno i na `Fsync` a
+   `volume.Builder`, kde predikát „už je durable" testoval jen `vol_s3_key`: souběžný
+   přepis přes `MaxNeedleSize` commitne bloky, takže by `Fsync` protočil všech deset
+   backoffů a vrátil EIO za soubor bezpečně uložený v S3. Nově `Builder.durable`.
+
+7. **CLAUDE.md neobsahovala invariant o `cacheFile`**, jak předpokládalo zadání — žil
+   jen v komentářích `node.go` a v doc commentu testu, a zmizel s nimi. Zato v ní byl
+   **jiný zastaralý záznam z Kroku 3**: bod o cachování při zápisu mluvil o
+   `cacheUploaded` a `CommitInode`, přestože se ta funkce ve Kroku 3 přejmenovala na
+   `cacheBlock` a cachuje se per blok. Opraveno.
+
+8. **`TestLegacyWholeFileConvertsEntirely` nešlo jen smazat.** Byl jediný, kdo hlídal
+   pravidlo „konverze přepíše celý soubor" — `TestStagedFileGrowingIntoBlocksStays-
+   Readable` přepisuje od offsetu 0, což ušpiní všechny bloky tak jako tak a projde
+   i s rozbitým `converting`. Po zrušení sloupce jsou jediné tvary, ze kterých se
+   konvertuje, needle a staging soubor, a oba se vejdou do bloku 0 — takže jediný
+   způsob, jak tu chybu ještě vyjádřit, je **řídký** zápis za konec needlu. Nahrazeno
+   `TestConvertingToBlocksRewritesUntouchedData`.
 
 ---
 
@@ -1157,8 +1230,14 @@ patří vlastní regresní test: zmenšit **bez otevřeného handle**, zvětšit
 `cache.chunkPath`/`GetChunk`/`PutChunk`/`HasChunk` pryč; s nimi guardy na adresář v `Has`
 a `Open`. `readChunked`/`getOrFetchChunk`/`prefetchChunks`/`readStreaming` na bloky.
 In-memory ring v streaming módu zrušit (sekce 3.3), `readAheadChunks` přeladit v blocích.
-**Povolit streaming pod šifrováním** (`node.go:428`) a přepsat odpovídající „Known
-Limitation" v CLAUDE.md.
+**Povolit streaming pod šifrováním** a přepsat odpovídající „Known Limitation" v CLAUDE.md.
+
+**Pozor: streaming je od Kroku 4 vypnutý úplně**, ne jen pod šifrováním — `Open`
+nenastavuje `handle.streaming` vůbec, protože není do čeho rangovat (viz „Co Krok 4
+zjistil navíc", bod 1). Tenhle krok ho zapíná zpátky, nad bloky, pro **oba** případy
+naráz; `HamstorHandle.s3Key` (dnes vždycky `""`) přitom zaniká. Hlídá to
+`TestStreamingMediaFileReads`, který dnes prochází přes `ensureLoaded` a po tomhle
+kroku má procházet přes streaming — takže musí projít pořád.
 
 *Proč až tady:* je to čistý úklid mrtvého kódu — smysl dává teprve, když bloky reálně
 slouží čtení (krok 5). Dřív by to byla změna dvou cest najednou.
@@ -1186,8 +1265,9 @@ s vlastními testy a ne přílepek ke kroku 3.
 
 ### Co zbývá po posledním kroku
 
-- **Aktualizovat CLAUDE.md**: reader coherence (sekce 4), zrušené omezení range reads pod
-  šifrováním, nová sekce o blocích, smazané zmínky o `migrate` a o 2GB stropu.
+- **Aktualizovat CLAUDE.md**: reader coherence (sekce 4) a zrušené omezení range reads pod
+  šifrováním. *(Zmínky o `migrate`, 2GB stropu, sekce o blocích a stav kroků už hotové
+  v Kroku 4.)*
 - **`purge-s3` + reinit** produkčního bucketu.
 - Nezávisle a kdykoli: oprava `evictLRU` pro `volobj/` (sekce 3.3), HKDF subkeys (D6),
   writeback cache, split `dentries` z `inodes`.
