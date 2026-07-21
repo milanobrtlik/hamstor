@@ -102,11 +102,16 @@ const BlockSize = 8 << 20
 type BlockCommit struct {
 	Index int64
 	S3Key string
-	// Size is the plaintext length of the STORED OBJECT, not the live extent of
-	// the block and not a component of the file length. The two differ after a
-	// truncate that shrinks inodes.size without rewriting the last block.
-	// Deriving a file's length from SUM(size) is a new version of an old bug —
-	// inodes.size is the only authority.
+	// Size is how many of this block's plaintext bytes belong to the file.
+	// Everything after it reads as zeroes, and the stored object may well be
+	// longer: a truncate that cuts into a block does not rewrite it, it only
+	// shortens this number, so the bytes past it are dead until the block is
+	// next written. Reads must clamp to it — without that, growing a truncated
+	// file back serves the old tail where POSIX requires zeroes.
+	//
+	// It is NOT a component of the file's length. Deriving one from SUM(size) is
+	// a new version of an old bug: inodes.size (and at runtime inodeWrite.size)
+	// is the only authority on how long a file is.
 	Size int64
 }
 
@@ -829,16 +834,67 @@ type NeedleCommit struct {
 
 // --- Blocks ---
 
-// noBlockRows is the SQL for "this inode's data does not live in blocks".
+// MaxNeedleSize is the largest file the volume builder will pack, and therefore
+// the largest a staging file can ever be. volume.MaxNeedleSize aliases it; it
+// lives here because the SQL below has to know it and volume already imports db,
+// so the dependency cannot run the other way.
+const MaxNeedleSize = 256 << 10 // 256 KB
+
+// noBlockRows narrows "committed but has no data in S3" to the inodes that could
+// really be sitting in the staging directory.
 //
-// Three separate predicates mean "committed but has no data in S3". They used to
-// establish it from vol_s3_key alone, which under the block layout a large file
-// also lacks, so without this clause every one of them fires on healthy files:
-// GetStagedInodes/Fsck report them as unreadable at every boot, and
-// CommitNeedlesToVolume's onlyUnpacked clause lets the volume builder pack a
-// forgotten staging file over an inode whose real data is in blocks. Kept as one
-// constant so the three cannot drift apart.
-const noBlockRows = " AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocks.inode_id = inodes.id)"
+// Two things disqualify an inode, and both were learned the hard way. Data in
+// blocks disqualifies it: establishing "no data" from vol_s3_key alone fires on
+// every healthy large file, so GetStagedInodes/Fsck would report them unreadable
+// at every boot and CommitNeedlesToVolume's onlyUnpacked clause would let the
+// builder pack a forgotten staging file over an inode whose real data is in
+// blocks.
+//
+// Being larger than MaxNeedleSize disqualifies it too, and that clause is what
+// makes sparse files first-class. flushStaged is only reached below that size,
+// so a bigger file has never had a staging file — if it has no needle and no
+// blocks either, it is not missing its data, it is all holes. `truncate -s 4G`
+// and `dd seek=` produce exactly that, and without this every boot warned
+// "unreadable: sparse.bin (4294967296 bytes)" about a perfectly good file. That
+// warning matters: it is the signal for a DB restored onto a machine without its
+// staging disk, and a predicate that cries wolf on ordinary sparse files kills it.
+var noBlockRows = " AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocks.inode_id = inodes.id)" +
+	fmt.Sprintf(" AND inodes.size <= %d", MaxNeedleSize)
+
+// clampLastBlockSize records that a shrink cut INTO the last surviving block,
+// rather than cleanly between two of them.
+//
+// Dropping the blocks past the new end is only half of what a shrink has to do,
+// and the design only ever named that half. The other half is the block the new
+// end falls inside: its object is not rewritten (deliberately — that would cost
+// an upload per truncate), so it still holds the bytes past the cut. Reads stay
+// correct while the file is short because they clamp to inodes.size, which is
+// exactly why this hides. Grow the file again and those bytes are back inside
+// the size, and the old tail is served where POSIX requires zeroes.
+//
+// This is the case that was actually measured on the pre-block layout
+// (1048560 bytes resurrected on a 1 MiB file), and dropping whole blocks does
+// nothing for it: a 1 MiB file truncated to 16 bytes has exactly one block row,
+// so there is nothing past the end to delete.
+//
+// The fix is to shorten what the row claims is live. size then means "how many
+// of this block's plaintext bytes belong to the file"; the object may be longer,
+// and those extra bytes are dead until the block is next rewritten. Callers of
+// this must be exactly the two places a file's length changes: CommitBlocks and
+// SetAttr.
+func clampLastBlockSize(tx *sql.Tx, id, size, lastLive int64) error {
+	if lastLive < 0 {
+		return nil
+	}
+	live := size - lastLive*BlockSize
+	if _, err := tx.Exec(
+		"UPDATE blocks SET size = ? WHERE inode_id = ? AND block_index = ? AND size > ?",
+		live, id, lastLive, live,
+	); err != nil {
+		return fmt.Errorf("clamp last block of inode %d to %d: %w", id, live, err)
+	}
+	return nil
+}
 
 // CommitBlocks atomically replaces part of an inode's block set and marks the
 // inode committed at the given size. It is the N-key generalization of
@@ -978,6 +1034,14 @@ func (d *DB) commitBlocksTx(id int64, blocks []BlockCommit, size, lastLive, now 
 	if _, err := tx.Exec("DELETE FROM blocks WHERE inode_id = ? AND block_index > ?", id, lastLive); err != nil {
 		return false, nil, fmt.Errorf("commit blocks inode %d: truncate past %d: %w", id, lastLive, err)
 	}
+	// A shrink can also cut into the last surviving block, which is not covered
+	// by the DELETE above and which a flush does not necessarily rewrite: an
+	// ftruncate that dirties nothing commits an empty block set at a smaller
+	// size. A block just written in this same commit already records its live
+	// extent, so this is a no-op for it.
+	if err := clampLastBlockSize(tx, id, size, lastLive); err != nil {
+		return false, nil, err
+	}
 
 	res, err := tx.Exec(
 		"UPDATE inodes SET size = ?, status = 'committed', mtime_ns = ?,"+
@@ -1016,6 +1080,28 @@ func (d *DB) BlocksForInode(id int64) ([]BlockCommit, error) {
 		result = append(result, b)
 	}
 	return result, rows.Err()
+}
+
+// BlockAt returns one block's row, or ok=false when the inode has no row at that
+// index — which is a HOLE, not an error: it reads as zeroes and is never
+// fetched.
+//
+// This is the lookup lazy materialization faults through, and it must stay one
+// row rather than reusing BlocksForInode. A 4 TB file has 524288 block rows, so
+// loading the whole map to answer "where is block 7" would put the cost of the
+// file's size on every single fault — the opposite of what faulting is for.
+func (d *DB) BlockAt(id, index int64) (BlockCommit, bool, error) {
+	b := BlockCommit{Index: index}
+	err := d.db.QueryRow(
+		"SELECT s3_key, size FROM blocks WHERE inode_id = ? AND block_index = ?", id, index,
+	).Scan(&b.S3Key, &b.Size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return BlockCommit{}, false, nil
+	}
+	if err != nil {
+		return BlockCommit{}, false, fmt.Errorf("block %d of inode %d: %w", index, id, err)
+	}
+	return b, true, nil
 }
 
 // DeleteBlocksForInode drops the inode's block rows and returns the keys they
@@ -1097,29 +1183,85 @@ func (d *DB) SetConfig(key string, value []byte) error {
 	return err
 }
 
-func (d *DB) SetAttr(id int64, size *int64, mode *uint32, mtimeNs *int64) error {
+// SetAttr applies a metadata change and returns the block objects the new size
+// orphaned, for the caller to delete AFTER this returns — the same
+// "read keys -> drop rows -> delete objects" direction as DeleteBlocksForInode,
+// and for the same reason: the rows are the only record of those keys.
+//
+// Dropping the blocks past the new end is not bookkeeping, it is the difference
+// between a shrink and a lie. Flush reaches CommitBlocks, which truncates the
+// block set itself, but truncate(2) on a path with no open write handle never
+// gets there: tryAcquireWrite returns nil, only inodes.size moves, and the rows
+// beyond it survive. Reads stay correct (readLoaded clamps to the size), so
+// nothing looks wrong — until the file is grown again and the resurrected blocks
+// serve their old contents where the file should read as zeroes. Measured after
+// step 3: shrinking a 3-block file to 16 bytes and growing it back returned
+// 8 MiB of stale data.
+//
+// Growing selects nothing (a larger size can only raise lastLive), so this runs
+// unconditionally rather than branching on the direction of the change.
+func (d *DB) SetAttr(id int64, size *int64, mode *uint32, mtimeNs *int64) ([]string, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 	now := time.Now().UnixNano()
+	var orphaned []string
 	if size != nil {
+		if *size < 0 {
+			return nil, fmt.Errorf("set attr inode %d: negative size %d", id, *size)
+		}
+		// Highest index still inside the file; -1 when the file is empty.
+		lastLive := int64(-1)
+		if *size > 0 {
+			lastLive = (*size - 1) / BlockSize
+		}
+		rows, qErr := tx.Query(
+			"SELECT s3_key FROM blocks WHERE inode_id = ? AND block_index > ? ORDER BY block_index",
+			id, lastLive)
+		if qErr != nil {
+			return nil, fmt.Errorf("set attr inode %d: read blocks past %d: %w", id, lastLive, qErr)
+		}
+		for rows.Next() {
+			var key string
+			if sErr := rows.Scan(&key); sErr != nil {
+				rows.Close()
+				return nil, sErr
+			}
+			orphaned = append(orphaned, key)
+		}
+		qErr = rows.Err()
+		rows.Close()
+		if qErr != nil {
+			return nil, qErr
+		}
+		if _, err := tx.Exec(
+			"DELETE FROM blocks WHERE inode_id = ? AND block_index > ?", id, lastLive,
+		); err != nil {
+			return nil, fmt.Errorf("set attr inode %d: truncate past %d: %w", id, lastLive, err)
+		}
+		if err := clampLastBlockSize(tx, id, *size, lastLive); err != nil {
+			return nil, err
+		}
 		if _, err := tx.Exec("UPDATE inodes SET size = ?, mtime_ns = ? WHERE id = ?", *size, now, id); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if mode != nil {
 		if _, err := tx.Exec("UPDATE inodes SET mode = ?, ctime_ns = ? WHERE id = ?", *mode, now, id); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if mtimeNs != nil {
 		if _, err := tx.Exec("UPDATE inodes SET mtime_ns = ? WHERE id = ?", *mtimeNs, id); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return orphaned, nil
 }
 
 // FixDefaultOwnership updates all inodes with uid=0 AND gid=0 to the given values.

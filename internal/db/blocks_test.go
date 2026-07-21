@@ -119,11 +119,18 @@ func TestCommitBlocksReplacesAndTruncates(t *testing.T) {
 		t.Fatalf("after shrink: %d blocks, want 2", len(blocks))
 	}
 
-	// The stored object of block 1 is still a whole block even though the file
-	// now ends mid-block: blocks.size is the object's length, not the live
-	// extent, and the file length comes from inodes.size alone.
-	if blocks[1].Size != BlockSize {
-		t.Errorf("block 1 size = %d, want %d (the stored object was not rewritten)", blocks[1].Size, int64(BlockSize))
+	// The file now ends mid-block, and block 1's row must say so. Its stored
+	// object is still a whole block — a shrink deliberately does not rewrite it —
+	// so size is what tells the read path where the file stops inside it.
+	//
+	// This assertion used to read the other way, requiring size to stay at the
+	// object's full length. That was the shape of a real bug rather than a rule:
+	// reads clamp to inodes.size, so nothing looked wrong while the file was
+	// short, but growing it back put those bytes inside the size again and served
+	// the old tail where POSIX requires zeroes.
+	if blocks[1].Size != BlockSize/2 {
+		t.Errorf("block 1 claims %d live bytes, want %d: growing the file back would resurrect its tail",
+			blocks[1].Size, int64(BlockSize/2))
 	}
 	meta, err := d.GetInode(id)
 	if err != nil {
@@ -366,5 +373,116 @@ func TestDeleteInodeCascadesToBlocks(t *testing.T) {
 	}
 	if _, ok := set["k0"]; ok {
 		t.Error("k0 is still in AllS3KeySet after its inode was deleted")
+	}
+}
+
+// TestSetAttrDropsBlocksPastEndOfFile covers the last item of the design's
+// call-site inventory. truncate(2) on a path with no open write handle never
+// reaches a flush, so CommitBlocks never runs and nothing else trims the block
+// set — SetAttr has to do it, and hand the keys back for the caller to delete.
+//
+// Needs no S3, deliberately: the hfuse end-to-end version skips without
+// credentials, and the rule that a shrink stops referencing what it cut off must
+// not be skippable.
+func TestSetAttrDropsBlocksPastEndOfFile(t *testing.T) {
+	d := openTestDB(t)
+	id := newFile(t, d, "shrink.bin")
+
+	if _, _, err := d.CommitBlocks(id, []BlockCommit{
+		{Index: 0, S3Key: "aa/zero", Size: BlockSize},
+		{Index: 1, S3Key: "bb/one", Size: BlockSize},
+		{Index: 2, S3Key: "cc/two", Size: 4096},
+	}, 2*BlockSize+4096); err != nil {
+		t.Fatalf("commit blocks: %v", err)
+	}
+
+	size := int64(16)
+	orphaned, err := d.SetAttr(id, &size, nil, nil)
+	if err != nil {
+		t.Fatalf("set attr: %v", err)
+	}
+	slices.Sort(orphaned)
+	if !slices.Equal(orphaned, []string{"bb/one", "cc/two"}) {
+		t.Fatalf("SetAttr orphaned %v, want the two blocks past the new end", orphaned)
+	}
+
+	blocks, err := d.BlocksForInode(id)
+	if err != nil {
+		t.Fatalf("blocks for inode: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].Index != 0 {
+		t.Fatalf("after truncating to 16 bytes the inode has %d block(s), want just block 0", len(blocks))
+	}
+
+	// The surviving block was cut INTO, not cleanly before: its object still
+	// holds a whole BlockSize, so the row has to stop claiming those bytes. This
+	// is the half the design never named, and the only half that applies to a
+	// file which fits in one block — there, nothing is ever past the end to
+	// delete, so without this a truncate is invisible to the read path.
+	if blocks[0].Size != 16 {
+		t.Fatalf("block 0 still claims %d live bytes after truncating to 16; growing the file back would serve its old tail",
+			blocks[0].Size)
+	}
+
+	// Growing again must not un-clamp it.
+	back := int64(2 * BlockSize)
+	if _, err := d.SetAttr(id, &back, nil, nil); err != nil {
+		t.Fatalf("set attr grow: %v", err)
+	}
+	blocks, err = d.BlocksForInode(id)
+	if err != nil {
+		t.Fatalf("blocks for inode: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].Size != 16 {
+		t.Fatalf("after growing back, block 0 claims %d live bytes in %d row(s), want 16 in 1",
+			blocks[0].Size, len(blocks))
+	}
+}
+
+// TestCommitBlocksClampsLastBlock is the flush-path twin of the above. An
+// ftruncate through an open handle dirties no block, so the flush commits an
+// empty block set at a smaller size: the DELETE finds nothing to do for a file
+// inside one block, and only the clamp records the shrink.
+func TestCommitBlocksClampsLastBlock(t *testing.T) {
+	d := openTestDB(t)
+	id := newFile(t, d, "ftruncate.bin")
+
+	if _, _, err := d.CommitBlocks(id, []BlockCommit{
+		{Index: 0, S3Key: "aa/zero", Size: 1 << 20},
+	}, 1<<20); err != nil {
+		t.Fatalf("commit blocks: %v", err)
+	}
+
+	committed, orphaned, err := d.CommitBlocks(id, nil, 16)
+	if err != nil {
+		t.Fatalf("commit shrink: %v", err)
+	}
+	if !committed {
+		t.Fatal("commit reported the inode as gone")
+	}
+	if len(orphaned) != 0 {
+		t.Fatalf("the shrink orphaned %v; block 0 is still live and its object must not be deleted", orphaned)
+	}
+
+	blocks, err := d.BlocksForInode(id)
+	if err != nil {
+		t.Fatalf("blocks for inode: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].Size != 16 {
+		t.Fatalf("block 0 claims %d live bytes after the flush shrank the file to 16", blocks[0].Size)
+	}
+
+	// A later flush that rewrites the block restores its full extent.
+	if _, _, err := d.CommitBlocks(id, []BlockCommit{
+		{Index: 0, S3Key: "dd/rewritten", Size: 4096},
+	}, 4096); err != nil {
+		t.Fatalf("commit rewrite: %v", err)
+	}
+	blocks, err = d.BlocksForInode(id)
+	if err != nil {
+		t.Fatalf("blocks for inode: %v", err)
+	}
+	if blocks[0].Size != 4096 {
+		t.Fatalf("rewritten block claims %d live bytes, want 4096: the clamp outlived the rewrite", blocks[0].Size)
 	}
 }
