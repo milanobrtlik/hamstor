@@ -3,6 +3,7 @@ package hfuse
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -447,13 +448,20 @@ func TestConvertingToBlocksRewritesUntouchedData(t *testing.T) {
 	}
 }
 
-// TestMultiBlockUploadFailureRetainsNothing pins the deliberate debt this step
-// carries. retainPendingUpload still describes a single object as
-// "<inode>.<size>", so a multi-block file cannot be retained — and the honest
-// behaviour is to say DATA LOST in the log, not to quietly half-retain something
-// recovery would misread. The inode must stay pending and the state poisoned, so
-// no sibling can commit an empty file over the top of it.
-func TestMultiBlockUploadFailureRetainsNothing(t *testing.T) {
+// TestMultiBlockUploadFailureRetainsTheSet is the same test inverted, and it is
+// the artefact that shows the debt from the block-layout step 3 is paid.
+//
+// It used to assert that a multi-block file retained NOTHING: the pending format
+// was a single file named "<inode>.<size>", which cannot describe a set, so the
+// honest behaviour was to say DATA LOST rather than half-retain something
+// recovery would misread. Retention is now a directory of blocks, so the same
+// failure must keep every block it meant to upload — including the ones that had
+// already gone up before the failure, which nothing references and GC will
+// remove.
+//
+// The rest is unchanged: the inode stays pending and the state stays poisoned,
+// so no sibling can commit an empty file over the top of the retained copy.
+func TestMultiBlockUploadFailureRetainsTheSet(t *testing.T) {
 	cfg := testutil.RequireS3(t)
 	hfs, dbPath := setupTest(t)
 	hfs.SpillDir = t.TempDir()
@@ -480,13 +488,35 @@ func TestMultiBlockUploadFailureRetainsNothing(t *testing.T) {
 	th.TestFlush()
 	th.WaitUpload()
 
+	// The set is one directory named by the bare inode number, and nothing else:
+	// a leftover <id>.tmp-* would mean the commit rename never happened.
 	entries, err := os.ReadDir(pendingDir)
 	if err != nil {
 		t.Fatalf("read pending dir: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("a multi-block upload retained %d file(s); the pending format cannot describe a block set, "+
-			"so recovery would upload it as one whole-file object", len(entries))
+	if len(entries) != 1 || entries[0].Name() != fmt.Sprintf("%d", id) || !entries[0].IsDir() {
+		t.Fatalf("pending dir holds %v, want exactly the directory %d — a multi-block upload must retain its whole set",
+			entryNames(entries), id)
+	}
+	if !hasRetainedData(pendingDir, id) {
+		t.Fatal("hasRetainedData does not see the set, so Cleanup would delete the inode and orphan it")
+	}
+
+	set, err := readPendingSet(filepath.Join(pendingDir, fmt.Sprintf("%d", id)))
+	if err != nil {
+		t.Fatalf("retained set is unreadable, so recovery will refuse it: %v", err)
+	}
+	if set.FileSize != 2*db.BlockSize {
+		t.Errorf("retained file size %d, want %d", set.FileSize, 2*db.BlockSize)
+	}
+	if len(set.Blocks) != 2 {
+		t.Fatalf("retained %d block(s), want both — the blocks that uploaded before the failure are not in the "+
+			"blocks table, so GC removes them and recovery cannot rely on them", len(set.Blocks))
+	}
+	for i, b := range set.Blocks {
+		if b.Index != int64(i) || b.Size != db.BlockSize {
+			t.Errorf("retained block %d = %+v, want index %d with a full extent", i, b, i)
+		}
 	}
 
 	meta, err := hfs.DB.GetInode(id)

@@ -3,6 +3,7 @@ package hfuse
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -63,36 +64,23 @@ func Cleanup(d *db.DB, store *s3store.Store, pendingDir string) error {
 	return nil
 }
 
-// hasRetainedData reports whether pendingDir holds bytes for inodeID that a
-// later start could still upload.
-func hasRetainedData(pendingDir string, inodeID int64) bool {
-	if pendingDir == "" {
-		return false
-	}
-	matches, err := filepath.Glob(filepath.Join(pendingDir, fmt.Sprintf("%d.*", inodeID)))
-	if err != nil {
-		return false
-	}
-	for _, m := range matches {
-		if !strings.HasSuffix(m, ".tmp") {
-			return true
-		}
-	}
-	return false
-}
-
 // RecoverPending finishes uploads that failed in a previous run. The async
-// upload path retains the exact bytes it meant to send under pendingDir, keyed
-// by inode; here they are uploaded and the inode committed, turning what used to
-// be silent data loss into a delay.
+// upload path retains the exact bytes it meant to send under
+// pendingDir/<inodeID>/ (see pending.go); here the whole set is uploaded and the
+// inode committed, turning what used to be silent data loss into a delay.
 //
 // Must run BEFORE Cleanup, which deletes every remaining pending inode.
 //
 // Retained bytes are uploaded verbatim: under encryption they are already
-// ciphertext, so this neither needs nor consults the passphrase. A file whose
-// inode is gone (unlinked, or already cleaned up by an older build) is dropped.
-// Anything that fails to upload is left in place to try again next boot rather
-// than deleted — a full disk is a better outcome than a lost file.
+// ciphertext, so this neither needs nor consults the passphrase.
+//
+// It deletes bytes in exactly two cases, both of which prove them redundant: the
+// set was uploaded and committed, or the inode it belongs to is gone or already
+// committed by a later write. Everything else it can only name — a set whose
+// meta will not parse, a half-built <id>.tmp-* directory, a file left by an
+// older build — because those bytes are still somebody's only copy, and a
+// startup path is the wrong place to decide otherwise. The nag repeats every
+// boot until a human clears it, which is the intent.
 func RecoverPending(d *db.DB, store *s3store.Store, pendingDir string) error {
 	if pendingDir == "" {
 		return nil
@@ -105,106 +93,139 @@ func RecoverPending(d *db.DB, store *s3store.Store, pendingDir string) error {
 		return err
 	}
 
-	recovered, failed := 0, 0
+	recovered, failed, stranded := 0, 0, 0
 	for _, e := range entries {
-		if e.IsDir() || strings.HasSuffix(e.Name(), ".tmp") {
-			continue
-		}
 		path := filepath.Join(pendingDir, e.Name())
 
-		// "<inodeID>.<logicalSize>"
-		dot := strings.LastIndex(e.Name(), ".")
-		if dot <= 0 {
-			log.Printf("hamstor: recover: unrecognized file %s, removing", e.Name())
-			os.Remove(path)
+		// A retained set is a DIRECTORY named by a bare inode number. Anything
+		// else is either a set still being built when the process died
+		// (<id>.tmp-*), or a leftover from a build that retained differently.
+		if !e.IsDir() {
+			log.Printf("hamstor: recover: %s is not a retained set (older format?) — left in place, nothing will read it", path)
+			stranded++
 			continue
 		}
-		inodeID, err1 := strconv.ParseInt(e.Name()[:dot], 10, 64)
-		logicalSize, err2 := strconv.ParseInt(e.Name()[dot+1:], 10, 64)
-		if err1 != nil || err2 != nil {
-			log.Printf("hamstor: recover: unrecognized file %s, removing", e.Name())
-			os.Remove(path)
+		inodeID, parseErr := strconv.ParseInt(e.Name(), 10, 64)
+		if parseErr != nil {
+			log.Printf("hamstor: recover: %s is an unfinished retained set — left in place, nothing will read it", path)
+			stranded++
+			continue
+		}
+
+		set, err := readPendingSet(path)
+		if err != nil {
+			// Only a complete set is recoverable, and only a rename makes one
+			// visible — so this is a set corrupted after the fact, not one caught
+			// mid-write. Either way nobody can commit it.
+			log.Printf("hamstor: recover: retained set %s is unusable (%v) — left in place, nothing will read it", path, err)
+			stranded++
 			continue
 		}
 
 		meta, err := d.GetInode(inodeID)
 		if err != nil {
-			// Inode gone (unlinked, or an older build already cleaned it up).
-			os.Remove(path)
+			// Inode gone (unlinked, or already cleaned up by an earlier run).
+			os.RemoveAll(path)
 			continue
 		}
 		if meta.Status == "committed" {
 			// A later write already made this inode durable; the retained copy is
-			// stale and must not overwrite it.
-			os.Remove(path)
+			// stale and must not overwrite it. This is also why retention only
+			// ever runs for a 'pending' inode in the first place.
+			os.RemoveAll(path)
 			continue
 		}
 
-		// The retained file describes exactly ONE block: the flush only retains
-		// when the whole file fits in block 0 (see wholeFileInOneBlock), because
-		// the <id>.<size> format cannot name a set. A file bigger than a block is
-		// therefore a leftover from a build with different rules — refuse it
-		// rather than commit it as a truncated block 0, and leave it on disk,
-		// since these bytes are the file's only copy.
-		if logicalSize > db.BlockSize {
-			log.Printf("hamstor: recover: %s claims %d bytes, more than one block — kept, not recovered",
-				e.Name(), logicalSize)
-			failed++
-			continue
-		}
-
-		f, err := os.Open(path)
+		committed, err := recoverSet(d, store, path, inodeID, meta.Name, set)
 		if err != nil {
-			log.Printf("hamstor: recover: open %s: %v", e.Name(), err)
+			log.Printf("hamstor: recover: %s: %v (kept, will retry next start)", meta.Name, err)
 			failed++
 			continue
 		}
-		info, err := f.Stat()
-		if err != nil {
-			f.Close()
-			failed++
+		os.RemoveAll(path)
+		if !committed {
 			continue
 		}
-
-		key := s3store.NewKey()
-		err = store.UploadReader(context.Background(), key, f, info.Size())
-		f.Close()
-		if err != nil {
-			log.Printf("hamstor: recover: upload %s: %v (kept, will retry next start)", meta.Name, err)
-			failed++
-			continue
-		}
-
-		// Commit it the way the flush would have: as block 0 of a block-stored
-		// file. The block's size is the LOGICAL length from the filename, not the
-		// length of the file on disk — under encryption the stored object carries
-		// a version byte, a nonce and a tag on top of the plaintext, and recording
-		// that as the block's extent would make the file read long.
-		//
-		// Orphans should be empty here: a retained set only ever belongs to an
-		// inode that was never committed (RecoverPending drops the retained copy
-		// of a 'committed' inode above), so there is no previous storage to
-		// replace. Delete whatever does come back rather than assume.
-		blocks := []db.BlockCommit{{Index: 0, S3Key: key, Size: logicalSize}}
-		_, orphaned, err := d.CommitBlocks(inodeID, blocks, logicalSize)
-		if err != nil {
-			log.Printf("hamstor: recover: commit %s: %v (kept, will retry next start)", meta.Name, err)
-			store.Delete(context.Background(), key)
-			failed++
-			continue
-		}
-		for _, o := range orphaned {
-			store.Delete(context.Background(), o)
-		}
-		os.Remove(path)
-		log.Printf("hamstor: recovered %s (inode %d, %d bytes) from a failed upload", meta.Name, inodeID, logicalSize)
+		log.Printf("hamstor: recovered %s (inode %d, %d bytes in %d block(s)) from a failed upload",
+			meta.Name, inodeID, set.FileSize, len(set.Blocks))
 		recovered++
 	}
 
-	if recovered > 0 || failed > 0 {
-		log.Printf("hamstor: recovery: %d file(s) restored, %d still pending", recovered, failed)
+	if recovered > 0 || failed > 0 || stranded > 0 {
+		log.Printf("hamstor: recovery: %d file(s) restored, %d still pending, %d unreadable leftover(s)",
+			recovered, failed, stranded)
 	}
 	return nil
+}
+
+// recoverSet uploads a retained set and commits it in one transaction. On any
+// error it deletes what this attempt uploaded and returns, leaving the retained
+// directory for the caller to keep. It reports false with no error when the
+// inode vanished mid-recovery: nothing to keep, nothing recovered.
+//
+// Every block goes up under a FRESH key, including blocks the failed flush had
+// already uploaded. Those never reached the blocks table, so they are not in
+// AllS3KeySet() either and GC phase 1 removes them once gcGracePeriod has
+// passed: a daemon down for a weekend comes back to a bucket that no longer has
+// them. There is nothing here to skip and nothing to reuse.
+func recoverSet(d *db.DB, store *s3store.Store, dir string, inodeID int64, name string, set *pendingMeta) (bool, error) {
+	ctx := context.Background()
+
+	data, err := os.Open(filepath.Join(dir, "data"))
+	if err != nil {
+		return false, err
+	}
+	defer data.Close()
+
+	uploaded := make([]string, 0, len(set.Blocks))
+	blocks := make([]db.BlockCommit, 0, len(set.Blocks))
+	drop := func() {
+		for _, key := range uploaded {
+			if delErr := store.Delete(ctx, key); delErr != nil {
+				log.Printf("hamstor: recover: cleanup %s: %v", key, delErr)
+			}
+		}
+	}
+
+	// All of it, or none of it: a set committed halfway is a file half old and
+	// half zeroes, which is exactly the silent corruption this layout exists to
+	// avoid.
+	for _, b := range set.Blocks {
+		key := s3store.NewKey()
+		body := io.NewSectionReader(data, b.Off, b.Stored)
+		if err := store.UploadReader(ctx, key, body, b.Stored); err != nil {
+			drop()
+			return false, fmt.Errorf("upload block %d: %w", b.Index, err)
+		}
+		uploaded = append(uploaded, key)
+		// Size is the LOGICAL extent from the meta, never b.Stored: under
+		// encryption the object carries a version byte, a nonce and a tag on top
+		// of the plaintext, and recording that as the block's extent makes the
+		// file read long.
+		blocks = append(blocks, db.BlockCommit{Index: b.Index, S3Key: key, Size: b.Size})
+	}
+
+	// Orphans should be empty: a retained set only ever belongs to an inode that
+	// was never committed, so there is no previous storage to replace. Delete
+	// whatever does come back rather than assume.
+	committed, orphaned, err := d.CommitBlocks(inodeID, blocks, set.FileSize)
+	if err != nil {
+		drop()
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	if !committed {
+		// The inode went away between the lookup above and here. Nothing
+		// references these objects now, and the bytes belong to a file the user
+		// deleted.
+		log.Printf("hamstor: recover: inode %d (%s) disappeared during recovery, dropping %d object(s)",
+			inodeID, name, len(uploaded))
+		drop()
+		return false, nil
+	}
+	for _, o := range orphaned {
+		store.Delete(ctx, o)
+	}
+	return true, nil
 }
 
 // CheckStagedData returns committed files whose data is neither in S3 nor in the

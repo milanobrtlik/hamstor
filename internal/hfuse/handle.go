@@ -1231,6 +1231,14 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 		return toErrno(err)
 	}
 	fileName := meta.Name
+	// Retention is only worth anything for an inode Cleanup would otherwise
+	// delete, and Cleanup only looks at pending ones. For a committed inode the
+	// previous version survives a failed flush untouched — the needle, staging
+	// file or older blocks are all still there, and only the keys this attempt
+	// uploaded get dropped — while RecoverPending would discard the retained copy
+	// as stale anyway (see cleanup.go). Retaining there would mean re-encrypting
+	// and copying the whole file to disk to build something the next boot deletes.
+	wasPending := meta.Status == "pending"
 
 	// Which blocks must this upload write?
 	//
@@ -1359,12 +1367,6 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			}
 		}()
 
-		// wholeFileInOneBlock is the only shape this step can still retain after a
-		// failed upload: one block, at index 0, spanning the entire file, so the
-		// object IS the file and the existing <id>.<size> pending format describes
-		// it exactly. See the retention branch below.
-		wholeFileInOneBlock := len(indexes) == 1 && indexes[0] == 0 && bufSize <= db.BlockSize
-
 		blocks := make([]db.BlockCommit, 0, len(indexes))
 		uploaded := make([]string, 0, len(indexes))
 
@@ -1372,7 +1374,6 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 		// whose object does not exist is an unreadable file with no error path —
 		// the GET fails whenever someone reads it, perhaps months later.
 		var uploadErr error
-		var retainData []byte
 		for _, idx := range indexes {
 			start := idx * db.BlockSize
 			extent := min(int64(db.BlockSize), bufSize-start)
@@ -1415,13 +1416,6 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 				}
 				if err := hfs.Store.Upload(uploadCtx, blockKey, body); err != nil {
 					uploadErr = err
-					if wholeFileInOneBlock {
-						// Retention needs the bytes destined for the object
-						// verbatim — recovery re-uploads them without the
-						// passphrase — so under encryption that is the ciphertext,
-						// never the plaintext snapshot.
-						retainData = body
-					}
 					break
 				}
 			}
@@ -1440,35 +1434,42 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			}
 
 			// Keep the data: cp has already reported success, so dropping it here
-			// loses the file with nothing but a log line to show for it. Retained
-			// bytes are re-uploaded by RecoverPending on the next start; the inode
-			// stays 'pending' until then, which is what makes it recoverable.
+			// loses the file with nothing but a log line to show for it. The
+			// retained set is re-uploaded by RecoverPending on the next start; the
+			// inode stays 'pending' until then, which is what makes it recoverable.
 			//
-			// retainPendingUpload still describes ONE object as <id>.<size>, so
-			// only a single whole-file block fits it. A multi-block file retains
-			// NOTHING and must say so — this is a deliberate two-step debt, not an
-			// oversight, and the honest log line is the whole point of leaving it
-			// visible until the retention format grows to a directory of blocks.
+			// The whole set is retained, not just the blocks that had yet to go
+			// up. The ones that did upload are not in the blocks table, so GC will
+			// remove them — see pending.go. And only for an inode that was pending
+			// when this upload started: see wasPending above.
 			retained := false
-			if wholeFileInOneBlock && bufSize > 0 {
-				retainSpill := ""
-				if retainData == nil {
-					// Nothing encrypted it, so the snapshot IS the object.
-					retainSpill = snapPath
-				}
-				if hfs.retainPendingUpload(inodeID, bufSize, retainData, retainSpill) {
-					retained = true
-					if retainSpill != "" {
-						snapPath = "" // renamed into pending/, no longer ours to remove
-						uploadFile.Close()
-						uploadFile = nil
+			if wasPending && bufSize > 0 {
+				retain := make([]pendingBlock, 0, len(indexes))
+				for _, idx := range indexes {
+					extent := min(int64(db.BlockSize), bufSize-idx*db.BlockSize)
+					if extent <= 0 {
+						continue
 					}
+					retain = append(retain, pendingBlock{Index: idx, Size: extent})
+				}
+				ok, tookSnapshot := hfs.retainPendingUpload(inodeID, bufSize, retain, uploadFile, snapPath)
+				retained = ok
+				if tookSnapshot {
+					snapPath = "" // moved into pending/, no longer ours to remove
+					uploadFile.Close()
+					uploadFile = nil
 				}
 			}
-			if retained {
+			switch {
+			case retained:
 				log.Printf("hamstor: async upload failed for inode %d, data retained for retry on next start: %v", inodeID, uploadErr)
-			} else {
-				log.Printf("hamstor: async upload failed for inode %d, DATA LOST: %v", inodeID, uploadErr)
+			case !wasPending:
+				// Nothing was lost that S3 ever held: the file still reads as its
+				// previous version, which is all close(2) without fsync promised.
+				log.Printf("hamstor: async upload failed for inode %d (%s), previous version kept, this write lost: %v",
+					inodeID, fileName, uploadErr)
+			default:
+				log.Printf("hamstor: async upload failed for inode %d (%s), DATA LOST: %v", inodeID, fileName, uploadErr)
 			}
 			att.err = uploadErr
 			return

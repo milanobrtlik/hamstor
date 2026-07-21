@@ -516,6 +516,22 @@ pravidel, jejichž porušení vrací tichou ztrátu.
 > sady na existující bloky proto nikdy nenastane, což je přesně to, co drží recovery mimo
 > nebezpečí z bodu 5 v D5.
 
+> ✅ **Vyřešeno Krokem 7**, se dvěma odchylkami od návrhu výše — detaily v sekci 5,
+> Krok 7.
+>
+> - Místo souboru na blok je v adresáři jedno `data` (těla za sebou) a `meta`
+>   s `off`/`stored` u každého bloku. Bez šifrování je pak `data` přímo snapshot,
+>   přejmenovaný dovnitř, tedy nulová kopie.
+> - **Rada o globu výše je špatně.** „Glob musí pokrýt i holé `<id>`" vede na vzor
+>   `<id>*`, a ten matchuje i `1234` a `12345`: inode 123 by pak držel při životě
+>   retenci cizího inodu, který by se nikdy neobnovil. Past není tečka, je to prefix.
+>   `hasRetainedData` proto negloBuje vůbec — `os.Stat` na přesné jméno + `IsDir()`.
+>   Pin: `TestHasRetainedDataMatchesExactInode`.
+>
+> Zjednodušující invariant se ukázal být silnější, než jak je popsaný: retence se
+> **vůbec nespouští** pro inode, který není `'pending'`. Tím odpadá i přešifrování
+> a kopie celého souboru při každém selhaném přepisu.
+
 ---
 
 **Č3 — `ops.GC` fáze 2, `internal/ops/gc.go:90-106`.** Zrcadlový bug k Č1: sbírá se jen
@@ -1440,9 +1456,79 @@ doby platí dluh z kroku 3 (selhaný upload = `DATA LOST` v logu).
 *Riziko:* střední. Nízká pravděpodobnost, vysoký dopad — proto samostatný krok
 s vlastními testy a ne přílepek ke kroku 3.
 
+> ✅ **Hotovo.** Sedm rozhodnutí, z nichž tři návrh neměl:
+>
+> 1. **Jedno `data` + jedno `meta`, ne soubor na blok.** Návrh psal
+>    `pending/<id>/<blockIndex>`. Vyšlo lépe těla objektů zřetězit za sebe a
+>    v `meta` u každého bloku vést `off`+`stored`, protože to sjednotí obě cesty:
+>    **bez šifrování je `data` přímo snapshot, přejmenovaný dovnitř** — nulová
+>    kopie, soubor zůstává řídký — a se šifrováním se skládá z per-blok
+>    zapečetěných těl. Obnova je pak jedna smyčka
+>    `io.NewSectionReader(data, off, stored)` a nic o tom rozdílu neví.
+> 2. **Bod commitu je přejmenování adresáře**, ne atomický zápis `meta`. Návrh
+>    (a zadání) chtěl `meta` přes temp+rename; sada se staví v
+>    `<id>.tmp-XXXX/` a jedním `rename(2)` se zviditelní celá. Je to striktně
+>    silnější — pokrývá i pád uprostřed zápisu `data` — a vrací to vlastnost,
+>    kterou měl starý tvar `<id>.<size>` zadarmo tím, že nesl metadata v názvu.
+>    Testuje to `TestRetainedSetCommitsAtomically` (po návratu je `meta` validní
+>    a žádný `.tmp-*` nezbyl) plus `TestRecoverPendingRefusesIncompleteSet`,
+>    který ručně vyrobí všechny čtyři tvary rozestavěnosti.
+> 3. **Ciphertext vlastnost zachována přešifrováním ze snapshotu.** Po lazy
+>    materializaci je nejbližší zdroj bajtů plaintextový spill soubor a retenovat
+>    ho by tiše zabilo „`RecoverPending` nikdy nepotřebuje heslo" (CLAUDE.md).
+>    Zapečetěná těla už nahraných bloků držet nejde — uvolňují se po jednom, aby
+>    halda zůstala ohraničená — takže **přešifrovat na selhané cestě je jediná
+>    ohraničená varianta**. Cena: jeden AES průchod a plná kopie, jen při selhání
+>    a jen pod šifrováním. Důkaz je end-to-end:
+>    `TestRetainedSetIsCiphertext` retenuje pod rozbitým bucketem, zavolá
+>    `RecoverPending` (které encryptor nemá a mít nemůže) a pak soubor přečte
+>    zpátky přes encryptor. Kdyby se retenoval plaintext, projde retence i obnova
+>    a spadne teprve čtení — přesně ta tichá cesta, kvůli které to má test.
+> 4. **`meta` neobsahuje žádný S3 klíč.** To je odpověď na „obnova nesmí věřit
+>    dřív nahraným blokům": klíče, které stihl selhaný flush nahrát, nejsou
+>    v `blocks`, tedy ani v `AllS3KeySet()`, a GC fáze 1 je po `gcGracePeriod`
+>    smaže — démon ležící přes víkend se vrátí do bucketu, kde nejsou.
+>    Optimalizace „přeskoč nahrané" tak není jen špatná, ale **nevyjádřitelná**,
+>    což je lepší obrana než test.
+> 5. **Přesné jméno místo globu (Č2), a past není tečka.** `hasRetainedData`
+>    globovalo `<id>.*`; kdyby se to jen předělalo na `<id>*`, matchovalo by to
+>    i `1234` a `12345` — tedy jeden inode by držel při životě retenci úplně
+>    cizího inodu, který by se pak nikdy neobnovil. `os.Stat` na přesné jméno
+>    ruší celou tu třídu chyb. Pin: `TestHasRetainedDataMatchesExactInode`, bez
+>    S3, tedy neskipnutelný. (`CheckStagedData` má stejný latentní `%d*`; mimo
+>    rozsah tohoto kroku.)
+> 6. **Retence jen pro `'pending'` inode.** `Cleanup` sahá jen na `GetPending()`
+>    a `RecoverPending` retenci `'committed'` inodu stejně zahodí jako stale
+>    (zjednodušující invariant z Č2), přičemž po selhaném přepisu zůstává
+>    předchozí verze nedotčená — smažou se jen klíče toho pokusu. Retenovat tam
+>    znamená přešifrovat a zkopírovat celý soubor kvůli něčemu, co příští boot
+>    smaže. Log tam říká „previous version kept", ne `DATA LOST`.
+> 7. **Co nejde přečíst, se nemaže — pojmenuje se.** Nečitelné `meta`,
+>    nedokončený `.tmp-*`, soubor starého tvaru `<id>.<size>`: `RecoverPending`
+>    je vypíše a nechá ležet. Maže jen ve dvou případech, kdy jsou bajty
+>    prokazatelně nadbytečné (sada nahrána a commitnuta; inode zmizel nebo je
+>    `committed`). Hlášení se opakuje každý boot, dokud to člověk neuklidí —
+>    záměr, ne opomenutí. Starý tvar tedy **nemá kompatibilní cestu**, v souladu
+>    s politikou jinde v projektu, ale ani tichou likvidaci.
+>
+> **Vynecháno:** `mtime_ns` z návrhového `meta`. `CommitBlocks` si razítkuje
+> vlastní `mtime` i dnes, takže by ho `meta` nesla jen aby ji nikdo nepoužil;
+> zachovat původní čas znamená přidat `CommitBlocks` parametr, což je samostatná
+> změna.
+>
+> **Test, který se obrátil:** `TestMultiBlockUploadFailureRetainsNothing` →
+> `...RetainsTheSet` (`block_test.go`). Byl to jediný artefakt, na kterém byl dluh
+> z Kroku 3 vidět, takže se přepsal místo smazání a jméno dál říká pravdu.
+> Přibylo `TestCrashBetweenBlockUploadAndCommit` (`crash_test.go`): pád v okně
+> mezi uploady a transakcí nesmí nechat ani jeden řádek v `blocks`, a **nesmí nic
+> retenovat** — retence běží ve větvi chyby uploadu, a smrt není chyba.
+
 ---
 
 ### Co zbývá po posledním kroku
+
+*Řada skončila: Kroky 0–7 jsou hotové. Následující položky jsou samostatná
+rozhodnutí, ne pokračování.*
 
 - ~~**Aktualizovat CLAUDE.md**: reader coherence (sekce 4) a zrušené omezení range reads
   pod šifrováním.~~ *(Hotovo v Kroku 6, spolu s README. Zmínky o `migrate`, 2GB stropu,
