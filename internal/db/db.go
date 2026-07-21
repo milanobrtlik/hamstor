@@ -503,6 +503,7 @@ func (d *DB) GetStagedInodes() ([]InodeMeta, error) {
 	rows, err := d.db.Query(
 		"SELECT "+inodeCols+" FROM inodes WHERE status = 'committed'"+
 			" AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '')"+
+			noBlockRows+
 			" AND mode & ? = ? AND id > 1 AND size > 0",
 		uint32(syscall.S_IFMT), uint32(syscall.S_IFREG),
 	)
@@ -745,7 +746,7 @@ func (d *DB) CommitNeedlesToVolume(volS3Key string, totalSize int64, needles []N
 
 	query := "UPDATE inodes SET vol_s3_key = ?, vol_offset = ?, vol_size = ? WHERE id = ? AND status = 'committed'"
 	if onlyUnpacked {
-		query += " AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '')"
+		query += " AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '')" + noBlockRows
 	}
 
 	liveSize := int64(0)
@@ -801,6 +802,17 @@ type NeedleCommit struct {
 }
 
 // --- Blocks ---
+
+// noBlockRows is the SQL for "this inode's data does not live in blocks".
+//
+// Three separate predicates used to mean "committed but has no data in S3" by
+// testing s3_key and vol_s3_key alone. Under the block layout a large file has
+// neither, so without this clause every one of them fires on healthy files:
+// GetStagedInodes/Fsck report them as unreadable at every boot, and
+// CommitNeedlesToVolume's onlyUnpacked clause lets the volume builder pack a
+// forgotten staging file over an inode whose real data is in blocks. Kept as one
+// constant so the three cannot drift apart.
+const noBlockRows = " AND NOT EXISTS (SELECT 1 FROM blocks WHERE blocks.inode_id = inodes.id)"
 
 // CommitBlocks atomically replaces part of an inode's block set and marks the
 // inode committed at the given size. It is the N-key generalization of
@@ -1027,6 +1039,28 @@ func (d *DB) DeleteBlocksForInode(id int64) ([]string, error) {
 	return keys, nil
 }
 
+// HasBlocks reports whether the inode's data lives in blocks. It is the cheap
+// form of the question BlocksForInode answers expensively: callers that only
+// need to route (Flush choosing a storage shape, Fsync deciding whether the
+// volume builder owns this inode, CleanupStagingDir deciding whether a staging
+// file is stale) must not pull 512 rows to learn one bit.
+//
+// A file that has blocks keeps using them even when a later write shrinks it
+// below MaxNeedleSize. Falling back to the staging path would commit through
+// CommitInode, which knows nothing about blocks: the rows would survive and the
+// read path — which checks blocks first — would serve the pre-shrink version.
+func (d *DB) HasBlocks(id int64) (bool, error) {
+	var one int
+	err := d.db.QueryRow("SELECT 1 FROM blocks WHERE inode_id = ? LIMIT 1", id).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("has blocks for inode %d: %w", id, err)
+	}
+	return true, nil
+}
+
 func (d *DB) UpdateS3Key(id int64, newKey string) error {
 	_, err := d.db.Exec("UPDATE inodes SET s3_key = ? WHERE id = ?", newKey, id)
 	return err
@@ -1198,7 +1232,7 @@ func (d *DB) Fsck() (*FsckResult, error) {
 	// "mode & S_IFLNK = 0" excludes regular files, because S_IFREG (0x8000) and
 	// S_IFLNK (0xA000) share a bit — this counter always reported 0.
 	if err := d.db.QueryRow(
-		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '') AND mode & ? = ? AND id > 1 AND size > 0",
+		"SELECT COUNT(*) FROM inodes WHERE status = 'committed' AND (s3_key IS NULL OR s3_key = '') AND (vol_s3_key IS NULL OR vol_s3_key = '')"+noBlockRows+" AND mode & ? = ? AND id > 1 AND size > 0",
 		uint32(syscall.S_IFMT), uint32(syscall.S_IFREG),
 	).Scan(&r.StagedFiles); err != nil {
 		return nil, fmt.Errorf("fsck staged: %w", err)

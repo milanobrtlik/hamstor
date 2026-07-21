@@ -305,6 +305,11 @@ zapsal. Množina je přesně:
 A naopak **`vol_s3_key` v seznamu nikdy být nesmí**: volume objekt sdílí víc needles a
 smazat ho smí jedině GC fáze 3 podle `live_count`. Dekrementuje se, nemaže.
 
+**Právě proto, že `CommitBlocks` zahodí předchozí úložiště vcelku, musí flush, který inode
+na bloky teprve převádí, nahrát celý soubor** — ne jen špinavé bloky. To je nález Kroku 3
+a je to jediná věc v celé řadě, kde se z „nahraj jen změněné" stane tichá ztráta zbytku
+souboru. Detail a podmínka jsou u Kroku 3 v sekci 5.
+
 **Přechodné období Kroků 2–3: `CommitBlocks` musí vynulovat `inodes.s3_key`** (a vrátit ho
 v `orphaned`). Dokument to jinde neuvádí, protože od Kroku 4 sloupec neexistuje — jenže do
 té doby existuje a čtecí cesta z něj čte staré soubory. Kdyby ho commit nechal být, přepis
@@ -755,6 +760,19 @@ zkopíruje špinavé bloky do snapshot souboru** a goroutině předá ten. Gorou
 výhradně na data, která nikdo jiný nezná. `uploadAttempt` zůstává neměnný po publikaci
 (`err` se píše jen před `close(done)`) — a zůstává **jeden na flush**, ne na blok.
 
+> **Stav po Kroku 3:** kopie zavedená není a zatím být nemusí. Dokud je čtení hloupé
+> (`loaded = false` po flushi, příští přístup načítá znovu z bloků), spill file živá
+> materializace *není* a odevzdání vlastnictví drží pravidlo stejně jako dnes. Goroutina
+> tedy sahá na soubor, který stav pustil z ruky. **Krok 5 tenhle předpoklad ruší** — jakmile
+> spill file přežívá flush jako řídká materializace, musí se kopie zavést, jinak nastane
+> přesně ta směs dvou verzí bloku. Viz poznámka 2 u Kroku 3 v sekci 5.
+>
+> Praktický důsledek pro Krok 5: uploadovaný blok se nešifrovaného mountu posílá jako
+> `io.NewSectionReader(snapshot, start, extent)`, ne jako `[]byte`. Drží to dvě věci
+> najednou — nulovou stopu na haldě (`UploadSem` pouští 32 uploadů proti limitu 150 MB)
+> a bezalokační větev SDK z D1, která chce `ReaderAt+Seeker`. Šifrovaný blok přes haldu
+> jít musí, ale je to jeden blok, ne celý soubor jako dřív.
+
 **3. Attempt je publikován před prvním uvolněním `st.mu`; `oldKey` se čte až po čekání.**
 *Platí, s N klíči.* Publikace se nemění. `oldKey` se mění na `orphaned []string` — a
 zpřísňuje se: klíče se čtou **uvnitř commit transakce**, ne po `awaitUpload` mimo ni. Je
@@ -984,6 +1002,12 @@ je čistě aditivní, nikdo nové API nevolá, filesystem se chová identicky.
 ---
 
 **Krok 3 — zápis vyrábí bloky, čtení je pořád slepuje celé.**
+> ✅ **HOTOVO 2026-07-21.** `loadFromBlocks`/`fetchBlock`, `dirtyBlocks` +
+> `markDirtyRange`, `flushAsync` na N bloků přes `CommitBlocks`, per-blok šifrování,
+> `db.HasBlocks`. Testy: `internal/hfuse/block_test.go` (10 funkcí), `concurrent_test.go`
+> prošel beze změny sémantiky. Nenasazeno samostatně. **Sedm věcí vyšlo jinak, než tenhle
+> dokument předpokládal — jsou zapsané níž a v sekci 4.**
+
 `Flush`/`flushAsync` nahrají špinavé bloky a commitnou přes `CommitBlocks` (D5).
 `inodes.s3_key` se **přestane zapisovat**, ale sloupec ještě existuje a čtecí cesta z něj
 umí číst staré soubory. `ensureLoaded` pro soubor s bloky načte **všechny** bloky a slepí
@@ -1003,6 +1027,61 @@ pokud některý začne padat, je to signál, ne úklid.
 selhaný upload vícebokového souboru zatím **nezadrží nic**. Musí to logovat jako
 `DATA LOST` (větev `handle.go:1165` už existuje) a krok 7 to opraví. Je to vědomý dluh
 na dva kroky, ne přehlédnutí — a proto je krok 7 v seznamu, ne v „někdy potom".
+> Provedeno takto: retence proběhne, právě když je špinavý jediný blok s indexem 0 a
+> velikost souboru ≤ `BlockSize` — tehdy je objekt totožný se souborem a formát
+> `<id>.<size>` ho popisuje přesně. Cokoli vícebokového loguje `DATA LOST`.
+> Hlídá to `TestMultiBlockUploadFailureRetainsNothing`, aby to nikdo „neopravil" tiše.
+
+#### Co Krok 3 zjistil navíc (zapsáno po implementaci)
+
+1. **Konverze z jiného tvaru úložiště musí přepsat celý soubor, ne jen špinavé bloky.**
+   Dokument to nikde neříká a je to nejnebezpečnější věc v celém kroku: `CommitBlocks`
+   zahodí předchozí úložiště *vcelku* (vynuluje `s3_key`, dekrementuje volume, vyčistí
+   `vol_*`). Kdyby se u legacy celofilového souboru commitly jen dotčené bloky, zbytek
+   souboru nemá po commitu **žádné** úložiště — změna jednoho bajtu ve 100MB souboru
+   z 92 MB tiše udělá díry. Podmínka je
+   `converting := !hasBlocks && (S3Key != "" || VolS3Key != "" || Size > 0)`; nový soubor
+   konverzí *není*, jinak by řídký zápis na offset 1 GB nahrál 128 bloků nul.
+   Ověřeno negativně: s vypnutým `converting` padá `TestLegacyWholeFileConvertsEntirely`
+   hláškou „the untouched 16777216 bytes have no storage now".
+2. **D4 snapshot: kopie se v Kroku 3 nedělá, a je to bezpečné.** Návrh ji vyžaduje proto,
+   že spill file je „živá lokální materializace, ze které se dál čte a píše". V Kroku 3
+   to ještě neplatí — čtení je hloupé, po `Flush`i je `loaded = false` a příští přístup
+   načítá znovu z bloků, takže odevzdání vlastnictví je dnešní ověřený mechanismus.
+   **Povinnou se kopie stává v Kroku 5**, kdy se spill file změní v řídkou živou
+   materializaci; kdo Krok 5 dělá, musí ji zavést, jinak goroutina čte směs dvou verzí
+   bloku. Cena opaku (proč se to nedělalo hned): nově zapsaný 4GB soubor = 4 GB kopie
+   navíc na každý flush.
+3. **Č7 se musel udělat teď, ne v Kroku 4.** Predikátu „commitnutý bez dat v S3" vyhoví
+   každý blokový soubor. Změřeno na živém mountu: 20MB soubor `big.bin` starým predikátem
+   vyjde jako `unreadable`, `fsck` skončí exit 1 a boot vypíše WARNING. Řeší to konstanta
+   `db.noBlockRows`, sdílená `GetStagedInodes`, `Fsck` **a** `CommitNeedlesToVolume`.
+4. **`onlyUnpacked` v `CommitNeedlesToVolume` přestal chránit.** Znamená „inode nemá
+   úložiště" a testuje `s3_key`/`vol_s3_key` — jenže blokový inode má obojí prázdné, takže
+   by builder směl zapakovat zapomenutý staging soubor na inode, který má bloky, a
+   `vol_s3_key` by pak servíroval starou verzi. Struktura obrany je trojitá: blokový
+   commit staging soubor **maže**, `CommitNeedlesToVolume` ho odmítne, a
+   `CleanupStagingDir` ho po pádu uklidí (jinak by ho přejmenoval zpátky a builder by ho
+   claimoval a restoroval na každý notify, s osiřelým volume pokaždé).
+5. **`Fsync` na blokovém souboru vracel `EIO`.** Inventura ho vede jako „NE (jeden attempt
+   na flush)", ale staged větev na `handle.go:1264` má stejný predikát jako Č7: poslala by
+   blokový soubor do `VolumeBuilder.FlushInode`, který hledá staging soubor, co nikdy
+   neexistoval.
+6. **Nový invariant „jednou bloky, vždycky bloky".** Zmenšení pod `MaxNeedleSize` nesmí
+   spadnout zpátky do stagingu: `CommitInode` o blocích neví, řádky by commit přežily a
+   čtecí cesta (bloky napřed) by servírovala předchozí verzi. Stojí to jeden `HasBlocks`
+   dotaz na flush existujícího souboru; `isNew` ho přeskakuje, takže bulk copy neplatí nic.
+7. **`concurrent_test.go` má 11 funkcí, ne 12.** A `TestOpenTruncWithCacheBackedSibling`
+   se po tomhle kroku sám **skipoval**: `st.cacheFile` plní jen legacy `s3_key` větev,
+   kterou zápisová cesta už nevyrábí. Fixture se proto staví ručně (`Upload` +
+   `CommitInode`), aby test dál hlídal to, co hlídal. Je to jediná změna v tom souboru a
+   je to zároveň důkaz, že „zelená" a „něco se testuje" nejsou totéž.
+
+*Ještě dvě věci, které Krok 3 vědomě nechává rozbité, protože patří Kroku 4:*
+`Unlink`/`deleteTree`/`Rename` (Č5) blokové objekty nemažou — nejsou to ztracená data,
+protože cascade smaže řádky a GC fáze 1 objekty uklidí, ale do prvního GC to leakuje.
+A `rmdir_test.go:106` tím tiše zvakuovatěl (čte `meta.S3Key`, který je nově prázdný);
+Krok 4 opraví obojí naráz, protože právě on ten sloupec maže.
 
 ---
 

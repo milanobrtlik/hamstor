@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/milan/hamstor/internal/crypto"
+	"github.com/milan/hamstor/internal/db"
 )
 
 // uploadAttempt is one attempt to put an inode's contents into S3.
@@ -73,6 +74,21 @@ type inodeWrite struct {
 	// when it opened. Only meaningful while loaded is true.
 	size int64
 
+	// dirtyBlocks holds the indexes written since the last Flush, so a flush
+	// uploads the blocks that changed instead of the whole file. Guarded by mu
+	// like the rest of the state — NOT by writeMu, which stays a leaf lock
+	// covering only the registry map and the refcounts.
+	//
+	// Its counterpart presentBlocks (which blocks are materialized locally)
+	// belongs to lazy materialization and deliberately does not exist yet: while
+	// reads still assemble the whole file, the backing store is always complete
+	// and "present" is not yet a per-block question.
+	//
+	// An empty set with dirty set is meaningful, not a contradiction: a truncate
+	// changes the file without dirtying any block, and CommitBlocks still has to
+	// run to record the new size and drop the blocks past the new end.
+	dirtyBlocks map[int64]struct{}
+
 	// Spill file for large writes: when total size exceeds spillThreshold,
 	// contents live here instead of on the heap.
 	spillFile *os.File
@@ -113,6 +129,24 @@ type inodeWrite struct {
 	// handleRefs and uploadRefs are guarded by HamstorFS.writeMu, NOT by mu.
 	handleRefs int // live file handles
 	uploadRefs int // in-flight upload goroutines
+}
+
+// markDirtyRange records that [off, off+n) was written, so the next Flush
+// uploads exactly the blocks it touched. Must be called with mu held.
+//
+// A zero-length write marks nothing: it changes no block, and rounding it to
+// "the block at off" would upload a block that did not change (and, at off ==
+// size, one that does not exist).
+func (st *inodeWrite) markDirtyRange(off, n int64) {
+	if n <= 0 || off < 0 {
+		return
+	}
+	if st.dirtyBlocks == nil {
+		st.dirtyBlocks = make(map[int64]struct{})
+	}
+	for b := off / db.BlockSize; b <= (off+n-1)/db.BlockSize; b++ {
+		st.dirtyBlocks[b] = struct{}{}
+	}
 }
 
 // stagedReadAttempts bounds readStaged's retries. The transitions it rides out
@@ -162,9 +196,22 @@ func (hfs *HamstorFS) readStaged(ctx context.Context, inodeID int64) ([]byte, in
 			}
 		}
 		if err != nil {
-			// Nothing at any of the paths: the builder is mid-transition between
-			// removing its claim and committing the volume, or between our
-			// GetInode and an overwrite's rename. Both resolve in moments.
+			// Nothing at any of the paths. Either the file is no longer staged at
+			// all — an overwrite grew it past MaxNeedleSize, so it committed as
+			// blocks and removed the staging file — or the builder is
+			// mid-transition between removing its claim and committing the
+			// volume, or we are between our GetInode and an overwrite's rename.
+			//
+			// The block case must be tested here rather than with the metadata
+			// above: a file stored in blocks has neither an s3_key nor a
+			// vol_s3_key, so the "no longer staged" test at the top of the loop
+			// cannot see it, and we would spend every attempt hunting for a
+			// staging file that was correctly deleted before returning EIO for
+			// data sitting safely in S3. Down here it costs one query on a path
+			// that was about to sleep anyway.
+			if has, hErr := hfs.DB.HasBlocks(inodeID); hErr == nil && has {
+				return nil, 0, 0 // stored in blocks; caller re-reads and reloads
+			}
 			lastErr = err
 			time.Sleep(time.Duration(attempt+1) * time.Millisecond)
 			continue

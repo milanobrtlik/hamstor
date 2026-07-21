@@ -27,13 +27,47 @@ func setupAsyncCache(t *testing.T, maxBytes int64) (*HamstorFS, *cache.DiskCache
 	return hfs, c
 }
 
+// blockKeys returns the inode's block object keys in index order, and arranges
+// for them to be deleted when the test ends. A flush now commits a SET of
+// objects rather than one, so "the file's key" is only meaningful for a file
+// small enough to be a single block — see soleBlockKey.
+func blockKeys(t *testing.T, hfs *HamstorFS, id int64) []string {
+	t.Helper()
+	blocks, err := hfs.DB.BlocksForInode(id)
+	if err != nil {
+		t.Fatalf("blocks for inode %d: %v", id, err)
+	}
+	keys := make([]string, len(blocks))
+	for i, b := range blocks {
+		keys[i] = b.S3Key
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			hfs.Store.Delete(context.Background(), k)
+		}
+	})
+	return keys
+}
+
+// soleBlockKey is blockKeys for a file that must be exactly one block, which is
+// every file below db.BlockSize. It also proves the flush stored the file as
+// blocks at all: before this step it would have been one whole-file object named
+// by inodes.s3_key, which the async path no longer writes.
+func soleBlockKey(t *testing.T, hfs *HamstorFS, id int64) string {
+	t.Helper()
+	keys := blockKeys(t, hfs, id)
+	if len(keys) != 1 {
+		t.Fatalf("want exactly 1 block, got %d", len(keys))
+	}
+	return keys[0]
+}
+
 // writeAndFlush writes content to a new inode through a handle and waits for the
 // async upload to run to completion — not just to publish its result, which is
 // what WaitUpload alone gives (close(att.done) fires before the goroutine's last
-// defers). Returns the committed S3 key.
+// defers). Returns the file's single block key.
 func writeAndFlush(t *testing.T, hfs *HamstorFS, name string, content []byte) (int64, string) {
 	t.Helper()
-	ctx := context.Background()
 
 	id := mustInsert(t, hfs, name)
 	th := NewTestHandle(hfs, id, true)
@@ -47,15 +81,7 @@ func writeAndFlush(t *testing.T, hfs *HamstorFS, name string, content []byte) (i
 	th.TestRelease()
 	hfs.InflightUploads.Wait()
 
-	meta, err := hfs.DB.GetInode(id)
-	if err != nil {
-		t.Fatalf("get inode: %v", err)
-	}
-	if meta.S3Key == "" {
-		t.Fatal("flush committed no S3 key")
-	}
-	t.Cleanup(func() { hfs.Store.Delete(ctx, meta.S3Key) })
-	return id, meta.S3Key
+	return id, soleBlockKey(t, hfs, id)
 }
 
 // TestFlushCachesUploadedFile proves the write-side copy is kept: the bytes we
@@ -151,23 +177,29 @@ func TestFlushCachesSpilledFile(t *testing.T) {
 	th.TestRelease()
 	hfs.InflightUploads.Wait()
 
-	meta, err := hfs.DB.GetInode(id)
-	if err != nil {
-		t.Fatalf("get inode: %v", err)
+	// Only the two blocks that were written exist: everything between them is a
+	// hole. That is the sparse-file property the layout is supposed to have, and
+	// it is worth asserting here — the alternative (uploading the gap as zeroes)
+	// would be seven 8 MiB objects of nothing.
+	keys := blockKeys(t, hfs, id)
+	if len(keys) != 2 {
+		t.Fatalf("want 2 blocks (the head and the tail), got %d — the hole between them was materialized", len(keys))
 	}
-	t.Cleanup(func() { hfs.Store.Delete(ctx, meta.S3Key) })
-
-	if !c.Has(meta.S3Key) {
-		t.Fatal("flush did not cache the spilled file")
+	for _, k := range keys {
+		if !c.Has(k) {
+			t.Fatalf("flush did not cache block %s of the spilled file", k)
+		}
 	}
 	if _, err := os.Stat(spillName); !os.IsNotExist(err) {
 		t.Fatalf("spill file %s outlived the flush (stat err %v)", spillName, err)
 	}
 
-	// With the object gone the reopen has nothing to download, so a correct
+	// With the objects gone the reopen has nothing to download, so a correct
 	// preload can only come from the cache.
-	if err := hfs.Store.Delete(ctx, meta.S3Key); err != nil {
-		t.Fatalf("delete S3 object: %v", err)
+	for _, k := range keys {
+		if err := hfs.Store.Delete(ctx, k); err != nil {
+			t.Fatalf("delete S3 object: %v", err)
+		}
 	}
 	got := readBack(t, hfs, id, len(head))
 	if !bytes.Equal(got, head) {
@@ -218,19 +250,20 @@ func TestFlushEvictsSupersededKey(t *testing.T) {
 	th.TestRelease()
 	hfs.InflightUploads.Wait()
 
-	meta, err := hfs.DB.GetInode(id)
-	if err != nil {
-		t.Fatalf("get inode: %v", err)
-	}
-	t.Cleanup(func() { hfs.Store.Delete(ctx, meta.S3Key) })
-	if meta.S3Key == oldKey {
-		t.Fatal("overwrite reused the S3 key")
+	newKey := soleBlockKey(t, hfs, id)
+	if newKey == oldKey {
+		t.Fatal("overwrite reused the block's S3 key")
 	}
 	if c.Has(oldKey) {
 		t.Fatal("superseded key left in the cache")
 	}
-	if !c.Has(meta.S3Key) {
+	if !c.Has(newKey) {
 		t.Fatal("new version not cached")
+	}
+	// The superseded object must be gone from S3 too — CommitBlocks reports it as
+	// orphaned from inside its own transaction, and the flush deletes it after.
+	if _, err := hfs.Store.Download(ctx, oldKey); err == nil {
+		t.Fatal("superseded block object still in the bucket")
 	}
 	if got := readBack(t, hfs, id, len(updated)); !bytes.Equal(got, updated) {
 		t.Fatalf("read back %q..., want the updated content", got[:min(8, len(got))])

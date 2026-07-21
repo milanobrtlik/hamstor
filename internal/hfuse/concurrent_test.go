@@ -399,16 +399,25 @@ func TestOpenTruncWithCacheBackedSibling(t *testing.T) {
 
 	id := mustInsert(t, hfs, "trunc-me.bin")
 
-	// Write a file large enough to become a standalone S3 object, so that a
-	// later load goes through the disk cache and leaves cacheFile set.
+	// Build a LEGACY whole-file inode by hand: one object named by inodes.s3_key,
+	// the shape every large file had before the block layout. It has to be built
+	// rather than written, because the write path no longer produces it — and the
+	// cache-backed state this test exists to catch is reachable only from that
+	// branch of ensureLoaded, since loading from blocks fills buf or a spill file
+	// instead. Writing the file normally would leave st.cacheFile nil and the test
+	// would skip itself, quietly guarding nothing.
+	//
+	// The read path still serves these, so the guard is still live. It retires
+	// together with the column.
 	orig := bytes.Repeat([]byte("O"), 300*1024)
-	w := NewTestHandle(hfs, id, true)
-	if errno := w.TestWriteAt(orig, 0); errno != 0 {
-		t.Fatalf("write: %v", errno)
+	legacyKey := s3store.NewKey()
+	if err := hfs.Store.Upload(context.Background(), legacyKey, orig); err != nil {
+		t.Fatalf("upload legacy object: %v", err)
 	}
-	w.TestFlush()
-	w.WaitUpload()
-	w.TestRelease()
+	t.Cleanup(func() { hfs.Store.Delete(context.Background(), legacyKey) })
+	if _, err := hfs.DB.CommitInode(id, legacyKey, int64(len(orig))); err != nil {
+		t.Fatalf("commit legacy inode: %v", err)
+	}
 
 	// A reader holds the file open, populating the shared state's cacheFile.
 	reader := NewTestHandle(hfs, id, false)

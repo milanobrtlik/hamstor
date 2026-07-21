@@ -1,7 +1,9 @@
 package hfuse
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -149,56 +151,52 @@ func (hfs *HamstorFS) retainPendingUpload(inodeID, logicalSize int64, data []byt
 // which is the case that motivated caching at the write at all.
 const maxCacheShare = 2
 
-// cacheUploaded seeds the disk cache with the contents just committed under
-// newKey, so the next open reads them locally instead of downloading back bytes
-// that were on this disk moments ago. It is the standalone-object counterpart of
-// volume.Builder.cacheVolume; without it, writing a large file and reopening it
-// sends the data on a local disk -> S3 -> local disk round trip.
+// cacheBlock seeds the disk cache with one block just committed under key, read
+// straight out of the snapshot file the upload streamed from, so the next open
+// reads it locally instead of downloading back bytes that were on this disk
+// moments ago. It is the block-layout counterpart of volume.Builder.cacheVolume;
+// without it, writing a large file and reopening it sends the data on a local
+// disk -> S3 -> local disk round trip.
 //
-// plainPath must be the PLAINTEXT spill file, never what went to S3: under
-// encryption the object is a whole-file AES-GCM blob, while the cache is served
-// as file contents (ensureLoaded reads a cache entry directly and decrypts only
-// what came from Store.Download). Caching the ciphertext would hand encrypted
-// bytes back as the file.
+// src must hold the PLAINTEXT, never what went to S3: each block object is
+// encrypted individually, while the cache is served as file contents (fetchBlock
+// decrypts only what came from Store.Download). Caching the ciphertext would
+// hand encrypted bytes back as the file. The section is read lazily by
+// PutReader, so a whole file's worth of blocks never lands on the heap.
 //
-// Call only after CommitInode reported the inode committed. On the paths that
-// bail out afterwards the object is deleted again, and caching it would serve
-// bytes nothing references. Failures are logged and ignored — this is an
+// Call only after CommitBlocks reported the inode committed. On the paths that
+// bail out afterwards the objects are deleted again, and caching them would
+// serve bytes nothing references. Failures are logged and ignored — this is an
 // optimisation, never correctness.
-func (hfs *HamstorFS) cacheUploaded(newKey, oldKey, plainPath string, size int64) {
-	if hfs.Cache == nil {
-		return
-	}
-	// Always drop the superseded version, even when the new one is not cached:
-	// its object has just been deleted from S3, so the entry is dead weight that
-	// only LRU would eventually clear.
-	if oldKey != "" && oldKey != newKey {
-		hfs.Cache.Evict(oldKey)
-	}
-
-	if size == 0 {
-		// Nothing on disk to copy (Flush hands the goroutine no spill file for an
-		// empty file), but the empty object still costs a GET on the next read.
-		if err := hfs.Cache.Put(newKey, nil); err != nil {
-			log.Printf("hamstor: cache put after flush %s: %v", newKey, err)
-		}
-		return
-	}
-	if plainPath == "" {
+func (hfs *HamstorFS) cacheBlock(key string, src *os.File, off, size int64) {
+	if hfs.Cache == nil || src == nil || size <= 0 {
 		return
 	}
 	if size*maxCacheShare > hfs.Cache.MaxBytes() {
 		return
 	}
-
-	f, err := os.Open(plainPath)
-	if err != nil {
-		log.Printf("hamstor: cache put after flush %s: %v", newKey, err)
-		return
+	if err := hfs.Cache.PutReader(key, io.NewSectionReader(src, off, size)); err != nil {
+		log.Printf("hamstor: cache put block %s: %v", key, err)
 	}
-	defer f.Close()
-	if err := hfs.Cache.PutReader(newKey, f); err != nil {
-		log.Printf("hamstor: cache put after flush %s: %v", newKey, err)
+}
+
+// dropObjects deletes the objects a commit orphaned and drops their cache
+// entries. Call only AFTER the transaction that stopped referencing them: a
+// crash in this order leaves objects for GC, while the reverse deletes live
+// data. The keys come from inside that transaction, never from a snapshot taken
+// before it — a snapshot is how a losing flush deletes what a winning flush just
+// committed.
+func (hfs *HamstorFS) dropObjects(ctx context.Context, keys []string) {
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if hfs.Cache != nil {
+			hfs.Cache.Evict(key)
+		}
+		if err := hfs.Store.Delete(ctx, key); err != nil {
+			log.Printf("hamstor: delete superseded object %s: %v", key, err)
+		}
 	}
 }
 
