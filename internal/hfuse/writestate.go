@@ -78,15 +78,55 @@ type inodeWrite struct {
 	// like the rest of the state — NOT by writeMu, which stays a leaf lock
 	// covering only the registry map and the refcounts.
 	//
-	// Its counterpart presentBlocks (which blocks are materialized locally)
-	// belongs to lazy materialization and deliberately does not exist yet: while
-	// reads still assemble the whole file, the backing store is always complete
-	// and "present" is not yet a per-block question.
-	//
 	// An empty set with dirty set is meaningful, not a contradiction: a truncate
 	// changes the file without dirtying any block, and CommitBlocks still has to
 	// run to record the new size and drop the blocks past the new end.
 	dirtyBlocks map[int64]struct{}
+
+	// blockBacked says the backing store is materialized per block out of the
+	// blocks table, so a region of it is real data only if presentBlocks says so.
+	// False for every other shape — a needle, a staging file, a new or empty file
+	// are loaded whole, so every byte of them is present by construction, and
+	// present() answers true without consulting the map.
+	//
+	// presentBlocks is what loaded split into once "loaded" stopped being a
+	// property of the file and became one of each block.
+	//
+	// The two absences it distinguishes are NOT the same thing, and confusing
+	// them is a bug in either direction:
+	//
+	//   - no row in blocks   = a HOLE. Reads as zeroes, never fetched. This is
+	//     what makes a write at offset 1 GB cost one object, not 128.
+	//   - not in presentBlocks = not local yet. Must be fetched if a row exists,
+	//     and reading it without fetching serves zeroes for real data.
+	//
+	// Invariant: dirtyBlocks is a subset of presentBlocks. A dirty block that is
+	// not fully present would be uploaded with zeroes wherever the write did not
+	// reach — silent, and only visible months later. Write holds it by faulting
+	// before it writes; Flush asserts it before handing anything to an upload.
+	blockBacked   bool
+	presentBlocks map[int64]struct{}
+
+	// wholeLoaded says the backing store was filled from a storage shape that
+	// the next block commit will throw away wholesale — a volume needle or a
+	// staging file. The flush must then rewrite the ENTIRE file rather than the
+	// blocks that were touched, or everything it does not rewrite ends up with no
+	// storage at all.
+	//
+	// It records how the store was populated instead of inferring it from the
+	// inode, because inodes.size cannot tell the two apart. A file of 4 GiB with
+	// no blocks and no needle is either a staged file (all of it must be
+	// rewritten) or one enormous hole (none of it should be) — and `dd seek=`,
+	// truncate(1) and any preallocating downloader produce the second by calling
+	// ftruncate before the first write. Reading size alone, a one-kilobyte sparse
+	// write into a 4 GiB file uploaded 513 objects of zeroes; measured on a live
+	// mount, and the reason this flag exists.
+	//
+	// Only ever set where data is really loaded from one of those shapes. Getting
+	// it wrong in that direction loses the untouched part of a converted file,
+	// which is why the needle case is also cross-checked against vol_s3_key at
+	// the flush.
+	wholeLoaded bool
 
 	// Spill file for large writes: when total size exceeds spillThreshold,
 	// contents live here instead of on the heap.
@@ -138,8 +178,65 @@ func (st *inodeWrite) markDirtyRange(off, n int64) {
 	if st.dirtyBlocks == nil {
 		st.dirtyBlocks = make(map[int64]struct{})
 	}
+	if st.presentBlocks == nil {
+		st.presentBlocks = make(map[int64]struct{})
+	}
 	for b := off / db.BlockSize; b <= (off+n-1)/db.BlockSize; b++ {
 		st.dirtyBlocks[b] = struct{}{}
+		// Marking present here is what keeps dirtyBlocks a subset of
+		// presentBlocks. It is only truthful because Write faults every block it
+		// partially overwrites BEFORE it writes: after the write the block is
+		// wholly local, either because it was fetched or because the write
+		// covered everything that was stored in it.
+		st.presentBlocks[b] = struct{}{}
+	}
+}
+
+// present reports whether block b's bytes are really in the backing store.
+//
+// Always true for a state that is not block-backed: a needle, a staging file and
+// a new file are loaded whole, so there is no per-block question to ask. Must be
+// called with mu held.
+func (st *inodeWrite) present(b int64) bool {
+	if !st.blockBacked {
+		return true
+	}
+	_, ok := st.presentBlocks[b]
+	return ok
+}
+
+// markPresent records that block b is now materialized. Must be called with mu
+// held.
+func (st *inodeWrite) markPresent(b int64) {
+	if st.presentBlocks == nil {
+		st.presentBlocks = make(map[int64]struct{})
+	}
+	st.presentBlocks[b] = struct{}{}
+}
+
+// dropBlocksPast forgets everything recorded about blocks that a file of size s
+// no longer has. Must be called with mu held.
+//
+// Both sets have to be trimmed, for different reasons. A dirty index past the
+// end would be trimmed by Flush anyway, but leaving it means carrying an index
+// that CommitBlocks rejects outright. A stale PRESENT index is worse: shrink
+// then grow again and the block reads back as "already local" while the backing
+// store has only the zeroes the re-extension left there, so real data behind a
+// surviving row would never be fetched.
+func (st *inodeWrite) dropBlocksPast(s int64) {
+	lastLive := int64(-1)
+	if s > 0 {
+		lastLive = (s - 1) / db.BlockSize
+	}
+	for b := range st.dirtyBlocks {
+		if b > lastLive {
+			delete(st.dirtyBlocks, b)
+		}
+	}
+	for b := range st.presentBlocks {
+		if b > lastLive {
+			delete(st.presentBlocks, b)
+		}
 	}
 }
 
@@ -227,7 +324,7 @@ func (hfs *HamstorFS) readStaged(ctx context.Context, inodeID int64) ([]byte, in
 // truncateWriteState resizes an inode's shared contents to s, taking the lock
 // itself. A no-op when nothing is loaded: there is no buffer to correct, and the
 // DB size that Setattr writes is then the whole truth.
-func truncateWriteState(st *inodeWrite, s int64) syscall.Errno {
+func (hfs *HamstorFS) truncateWriteState(st *inodeWrite, s int64) syscall.Errno {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
@@ -239,18 +336,43 @@ func truncateWriteState(st *inodeWrite, s int64) syscall.Errno {
 		st.spillSize = s
 		st.size = s
 		st.dirty = true
+		st.dropBlocksPast(s)
 		return 0
 	}
 
-	if st.loaded {
-		if s < int64(len(st.buf)) {
-			st.buf = st.buf[:s]
-		} else if s > int64(len(st.buf)) {
-			st.buf = append(st.buf, make([]byte, s-int64(len(st.buf)))...)
-		}
-		st.dirty = true
-		st.size = s
+	if !st.loaded {
+		return 0
 	}
+
+	// Growing a heap-backed file past the spill threshold must not allocate the
+	// difference. ftruncate UP is a metadata change — `truncate -s 5T` on a
+	// mounted file is legal and instant — but appending the zeroes to buf asks
+	// for five terabytes of heap and kills the mount. A sparse file charges
+	// nothing for the hole, which is also exactly what the block layout wants:
+	// the gap has no rows, so it stays a hole all the way to S3.
+	if s > spillThreshold && s > int64(len(st.buf)) {
+		if err := hfs.spillState(st); err != nil {
+			log.Printf("hamstor: spill on grow failed: %v", err)
+			return syscall.EIO
+		}
+		if err := st.spillFile.Truncate(s); err != nil {
+			log.Printf("hamstor: spill truncate failed: %v", err)
+			return syscall.EIO
+		}
+		st.spillSize = s
+		st.size = s
+		st.dirty = true
+		return 0
+	}
+
+	if s < int64(len(st.buf)) {
+		st.buf = st.buf[:s]
+	} else if s > int64(len(st.buf)) {
+		st.buf = append(st.buf, make([]byte, s-int64(len(st.buf)))...)
+	}
+	st.dirty = true
+	st.size = s
+	st.dropBlocksPast(s)
 	return 0
 }
 

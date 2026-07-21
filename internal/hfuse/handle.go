@@ -152,13 +152,24 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	//
 	// size == 0 skips the query because a zero-length file cannot have blocks —
 	// CommitBlocks deletes them all at size 0.
+	//
+	// HasBlocks, not BlocksForInode: this only has to route, and a 4 TB file has
+	// 524288 rows. Pulling them to learn one bit would put the cost of the file's
+	// size back on every open, which is the cost this step exists to remove.
 	if meta.Size > 0 {
-		blocks, bErr := h.hfs.DB.BlocksForInode(h.inodeID)
+		has, bErr := h.hfs.DB.HasBlocks(h.inodeID)
 		if bErr != nil {
 			return toErrno(bErr)
 		}
-		if len(blocks) > 0 {
-			return h.loadFromBlocks(ctx, blocks, meta.Size)
+		// Larger than a needle means it was never staged (flushStaged is only
+		// reached below that size), so with no needle and no blocks it is not a
+		// file whose data went missing — it is one big hole. `truncate -s 4G` and
+		// `dd seek=` both produce exactly that shape, and treating it as staged
+		// sent the read hunting for a staging file that never existed and
+		// answered EIO after five retries. Attaching gives it a sparse store
+		// whose blocks all resolve to holes, which is what it is.
+		if has || meta.Size > volume.MaxNeedleSize {
+			return h.attachBlocks(meta.Size)
 		}
 	}
 
@@ -180,18 +191,19 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 				return h.loadFromVolume(ctx, meta2)
 			}
 			if meta2.Size > 0 {
-				blocks, bErr := h.hfs.DB.BlocksForInode(h.inodeID)
+				has, bErr := h.hfs.DB.HasBlocks(h.inodeID)
 				if bErr != nil {
 					return toErrno(bErr)
 				}
-				if len(blocks) > 0 {
-					return h.loadFromBlocks(ctx, blocks, meta2.Size)
+				if has || meta2.Size > volume.MaxNeedleSize {
+					return h.attachBlocks(meta2.Size)
 				}
 			}
 			return syscall.EIO
 		}
 		h.st.buf = data
 		h.st.loaded = true
+		h.st.wholeLoaded = true // a staging file: the next block commit drops it
 		h.st.size = size
 		h.fileSize = size
 		return 0
@@ -237,102 +249,169 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 
 	h.st.buf = data
 	h.st.loaded = true
+	h.st.wholeLoaded = true // a needle: the next block commit drops it wholesale
 	h.st.size = meta.Size
 	return 0
 }
 
-// loadFromBlocks assembles a block-stored file into the shared state's backing
-// store: a heap buffer for small files, a spill file above spillThreshold so
-// peak memory stays at one block regardless of file size.
+// attachBlocks gives the shared state a backing store for a block-stored file
+// WITHOUT fetching anything: a zeroed heap buffer for small files, a sparse
+// temp file above spillThreshold. Blocks arrive later, one at a time, through
+// faultBlock.
 //
-// Reading stays deliberately whole-file in this step — every block is fetched
-// even for a one-byte read. Lazy per-block faulting is a separate change, and
-// keeping it separate is what makes a bug here show up as zeroes or EIO rather
-// than as a silently stale version.
+// This is where the whole layout finally pays: opening a 3 GB log to append one
+// line used to download 3 GB first, and a file above the download limit could
+// not be opened for writing at all. Now opening costs one file creation, and the
+// append touches one block.
 //
-// Two different absences must not be confused. A block with no row is a HOLE:
-// it reads as zeroes and is never fetched, which is what makes a write at offset
-// 1 GB cost one object instead of 128 of them. A block whose stored object is
-// shorter than its live extent is a truncate that shrank the file without
-// rewriting the tail; the remainder is zeroes too. Only size is authoritative
-// for the file's length — never the sum of the blocks' sizes.
-func (h *HamstorHandle) loadFromBlocks(ctx context.Context, blocks []db.BlockCommit, size int64) syscall.Errno {
-	var place func(data []byte, off int64) error
-	var buf []byte
-	var sf *os.File
-
+// The store is exactly size bytes long, and that is load-bearing rather than
+// tidy: logicalSize() reports the end of file from it, and readLoaded and Write
+// index into it by absolute offset. A store shorter than the file would silently
+// truncate; longer, and a flush would commit bytes past the end.
+func (h *HamstorHandle) attachBlocks(size int64) syscall.Errno {
 	if size > spillThreshold {
 		f, err := os.CreateTemp(h.hfs.SpillDir, "hamstor-spill-*")
 		if err != nil {
 			log.Printf("hamstor: block spill create for inode %d: %v", h.inodeID, err)
 			return syscall.EIO
 		}
-		// Sparse: holes cost no disk and read as zeroes, exactly as they should.
+		// Sparse: the hole costs no disk and reads as zeroes, which is exactly
+		// what an unfaulted block and a real hole both need it to do.
 		if err := f.Truncate(size); err != nil {
 			f.Close()
 			os.Remove(f.Name())
 			log.Printf("hamstor: block spill size for inode %d: %v", h.inodeID, err)
 			return syscall.EIO
 		}
-		sf = f
-		place = func(data []byte, off int64) error {
-			_, werr := sf.WriteAt(data, off)
-			return werr
-		}
-	} else {
-		buf = make([]byte, size)
-		place = func(data []byte, off int64) error {
-			copy(buf[off:], data)
-			return nil
-		}
-	}
-
-	// Install the backing store only once every block is in it. Handing a
-	// half-filled buffer to the shared state on an error path would publish a
-	// file with zeroes where its data should be, and the next flush would commit
-	// those zeroes over the real blocks.
-	ok := false
-	defer func() {
-		if !ok && sf != nil {
-			sf.Close()
-			os.Remove(sf.Name())
-		}
-	}()
-
-	for _, b := range blocks {
-		start := b.Index * db.BlockSize
-		if start >= size {
-			// Past EOF: CommitBlocks drops these, so reaching one means the file
-			// was shrunk by a path that only moved inodes.size. Its bytes are not
-			// part of the file.
-			continue
-		}
-		extent := min(int64(db.BlockSize), size-start)
-		data, err := h.fetchBlock(ctx, b)
-		if err != nil {
-			log.Printf("hamstor: block read failed for inode %d block %d (%s): %v",
-				h.inodeID, b.Index, b.S3Key, err)
-			return toErrno(err)
-		}
-		if int64(len(data)) > extent {
-			data = data[:extent]
-		}
-		if err := place(data, start); err != nil {
-			log.Printf("hamstor: block place for inode %d block %d: %v", h.inodeID, b.Index, err)
-			return syscall.EIO
-		}
-	}
-
-	ok = true
-	if sf != nil {
-		h.st.spillFile = sf
+		h.st.spillFile = f
 		h.st.spillSize = size
 	} else {
-		h.st.buf = buf
+		h.st.buf = make([]byte, size)
 	}
+
+	h.st.blockBacked = true
+	h.st.wholeLoaded = false // sparse by construction: blocks arrive one by one
+	h.st.presentBlocks = nil // nothing is materialized yet
 	h.st.loaded = true
 	h.st.size = size
 	h.fileSize = size
+	return 0
+}
+
+// faultBlock materializes one block into the backing store. Must be called with
+// st.mu held.
+//
+// Two different absences meet here and must not be confused. A block with no row
+// is a HOLE: the store already reads as zeroes there, so it is marked present
+// without a fetch — which is what keeps a write at offset 1 GB costing one
+// object rather than 128. A block that has a row but is not present is simply
+// not local yet, and serving it without fetching would hand back zeroes for real
+// data.
+//
+// The fetched object is clamped TWICE, against two different over-lengths, and
+// dropping either one resurrects data a truncate was supposed to remove:
+//
+//   - to the block's live extent within the file, min(BlockSize, size-start),
+//     because st.size is the only authority on how long the file is;
+//   - to b.Size, how many of the block's bytes the file still claims. A truncate
+//     that cut into this block only shortened that number — the object was not
+//     rewritten — so the object still holds the old tail. Grow the file back and
+//     the live extent alone would happily place all of it.
+func (h *HamstorHandle) faultBlock(ctx context.Context, idx int64) syscall.Errno {
+	if h.st.present(idx) {
+		return 0
+	}
+	start := idx * db.BlockSize
+	if start >= h.st.size {
+		// Wholly past the end of file: nothing to serve, and nothing to fetch.
+		h.st.markPresent(idx)
+		return 0
+	}
+
+	b, ok, err := h.hfs.DB.BlockAt(h.inodeID, idx)
+	if err != nil {
+		return toErrno(err)
+	}
+	if !ok {
+		h.st.markPresent(idx) // hole
+		return 0
+	}
+
+	data, err := h.fetchBlock(ctx, b)
+	if err != nil {
+		log.Printf("hamstor: block read failed for inode %d block %d (%s): %v",
+			h.inodeID, idx, b.S3Key, err)
+		return toErrno(err)
+	}
+	if extent := min(int64(db.BlockSize), h.st.size-start, b.Size); int64(len(data)) > extent {
+		data = data[:extent]
+	}
+
+	if h.st.spillFile != nil {
+		if _, werr := h.st.spillFile.WriteAt(data, start); werr != nil {
+			log.Printf("hamstor: block place for inode %d block %d: %v", h.inodeID, idx, werr)
+			return syscall.EIO
+		}
+	} else {
+		copy(h.st.buf[start:], data)
+	}
+	h.st.markPresent(idx)
+	return 0
+}
+
+// materializeRange faults in every block overlapping [off, off+n) that a read is
+// about to serve. Must be called with st.mu held.
+func (h *HamstorHandle) materializeRange(ctx context.Context, off, n int64) syscall.Errno {
+	if !h.st.blockBacked || n <= 0 || off < 0 {
+		return 0
+	}
+	last := off + n - 1
+	if last >= h.st.size {
+		last = h.st.size - 1
+	}
+	if last < off {
+		return 0
+	}
+	for b := off / db.BlockSize; b <= last/db.BlockSize; b++ {
+		if errno := h.faultBlock(ctx, b); errno != 0 {
+			return errno
+		}
+	}
+	return 0
+}
+
+// materializeForWrite faults in the blocks a write is about to overwrite only in
+// part. Must be called with st.mu held and BEFORE the write lands.
+//
+// This is the sharpest edge of lazy materialization, and it fails silently. A
+// flush uploads a whole dirty block; if the block was never fetched, everything
+// the write did not itself cover is a zero in the backing store, and those
+// zeroes go to S3 as the file's contents. Nothing errors, nothing logs, and the
+// damage surfaces whenever someone next reads that region.
+//
+// A block is skipped only when nothing can be lost: either it stored nothing
+// (the write is past the old end of file, so the region is a hole either way),
+// or the write covers every byte that was stored in it. Sequential writes —
+// cp, a fresh copy, a whole-file rewrite — hit the second case for every full
+// block, so the common path still fetches nothing.
+func (h *HamstorHandle) materializeForWrite(ctx context.Context, off, n int64) syscall.Errno {
+	if !h.st.blockBacked || n <= 0 || off < 0 {
+		return 0
+	}
+	oldSize := h.st.size
+	for b := off / db.BlockSize; b <= (off+n-1)/db.BlockSize; b++ {
+		start := b * db.BlockSize
+		stored := min(start+int64(db.BlockSize), oldSize)
+		if start >= stored {
+			continue // nothing stored in this block yet
+		}
+		if off <= start && off+n >= stored {
+			continue // the write replaces everything that was stored in it
+		}
+		if errno := h.faultBlock(ctx, b); errno != 0 {
+			return errno
+		}
+	}
 	return 0
 }
 
@@ -452,9 +531,10 @@ func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.
 		return h.readStreaming(ctx, dest, off)
 	}
 
-	// Fast path: already loaded (full file in buf/cache/spill)
+	// Fast path: the state is attached, so the read is served from the backing
+	// store — faulting in whatever part of it this read needs and no more.
 	if h.st.loaded {
-		return h.readLoaded(dest, off)
+		return h.readLoaded(ctx, dest, off)
 	}
 
 	// Chunk-based path: unencrypted, has S3 key, not dirty, cache available —
@@ -477,7 +557,7 @@ func (h *HamstorHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.
 	if errno := h.ensureLoaded(ctx); errno != 0 {
 		return nil, errno
 	}
-	return h.readLoaded(dest, off)
+	return h.readLoaded(ctx, dest, off)
 }
 
 // readChunked serves a read from chunk-based cache, fetching missing chunks from S3.
@@ -615,7 +695,14 @@ func (h *HamstorHandle) prefetchChunks(startIndex int64, count int) {
 	}
 }
 
-func (h *HamstorHandle) readLoaded(dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (h *HamstorHandle) readLoaded(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	// Fetch what this read actually needs, and only that. For a block-backed
+	// state the store is sparse: a region that was never faulted reads as zeroes,
+	// which is indistinguishable from a hole until presentBlocks is consulted.
+	if errno := h.materializeRange(ctx, off, int64(len(dest))); errno != 0 {
+		return nil, errno
+	}
+
 	// Clamp clean (non-dirty) reads to the logical size. A truncate that shrank
 	// the inode may not have rewritten the backing object (e.g. truncate() on a
 	// path with no open write handle), so the cache file / buffer can hold stale
@@ -792,25 +879,32 @@ func (h *HamstorHandle) putStreamChunk(index int64, data []byte) {
 	h.streamChunks = append(h.streamChunks, streamChunk{index: index, data: data})
 }
 
-// spillToDisk moves in-memory buf to a temp file for large file writes.
-func (h *HamstorHandle) spillToDisk() error {
-	if h.st.spillFile != nil {
+// spillState moves an inode's in-memory contents to a temp file, for large
+// writes and for growing a file past the point where holding it on the heap
+// makes sense. Must be called with st.mu held.
+//
+// It moves the backing store and nothing else: the bytes keep their offsets, so
+// presentBlocks and dirtyBlocks stay true of the result and must not be reset
+// here. Clearing them would make a materialized block look absent (a re-fetch,
+// harmless) or a dirty one look clean (a lost write, not harmless).
+func (hfs *HamstorFS) spillState(st *inodeWrite) error {
+	if st.spillFile != nil {
 		return nil
 	}
-	f, err := os.CreateTemp(h.hfs.SpillDir, "hamstor-spill-*")
+	f, err := os.CreateTemp(hfs.SpillDir, "hamstor-spill-*")
 	if err != nil {
 		return err
 	}
-	if len(h.st.buf) > 0 {
-		if _, err := f.Write(h.st.buf); err != nil {
+	if len(st.buf) > 0 {
+		if _, err := f.Write(st.buf); err != nil {
 			f.Close()
 			os.Remove(f.Name())
 			return err
 		}
 	}
-	h.st.spillFile = f
-	h.st.spillSize = int64(len(h.st.buf))
-	h.st.buf = nil // free memory
+	st.spillFile = f
+	st.spillSize = int64(len(st.buf))
+	st.buf = nil // free memory
 	return nil
 }
 
@@ -833,16 +927,27 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		off = h.st.logicalSize()
 	}
 
+	// Fetch what this write is about to overwrite only in part, before it lands.
+	// Skipping this does not fail here — it fails at the next flush, which
+	// uploads the whole dirty block and so writes zeroes over everything the
+	// write did not cover. Must come after the O_APPEND resolution above, which
+	// is what settles where the write really goes.
+	if errno := h.materializeForWrite(ctx, off, int64(len(data))); errno != 0 {
+		return 0, errno
+	}
+
 	// If writing to spill file
 	if h.st.spillFile != nil {
 		end := off + int64(len(data))
 		if end > h.st.spillSize {
 			if err := h.st.spillFile.Truncate(end); err != nil {
+				log.Printf("hamstor: spill grow to %d for inode %d: %v", end, h.inodeID, err)
 				return 0, syscall.EIO
 			}
 			h.st.spillSize = end
 		}
 		if _, err := h.st.spillFile.WriteAt(data, off); err != nil {
+			log.Printf("hamstor: spill write %d bytes at %d for inode %d: %v", len(data), off, h.inodeID, err)
 			return 0, syscall.EIO
 		}
 		h.st.dirty = true
@@ -854,17 +959,19 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 	// Check if we should spill to disk
 	end := off + int64(len(data))
 	if end > spillThreshold {
-		if err := h.spillToDisk(); err != nil {
+		if err := h.hfs.spillState(h.st); err != nil {
 			log.Printf("hamstor: spill to disk failed: %v", err)
 			return 0, syscall.EIO
 		}
 		if end > h.st.spillSize {
 			if err := h.st.spillFile.Truncate(end); err != nil {
+				log.Printf("hamstor: spill grow to %d for inode %d: %v", end, h.inodeID, err)
 				return 0, syscall.EIO
 			}
 			h.st.spillSize = end
 		}
 		if _, err := h.st.spillFile.WriteAt(data, off); err != nil {
+			log.Printf("hamstor: spill write %d bytes at %d for inode %d: %v", len(data), off, h.inodeID, err)
 			return 0, syscall.EIO
 		}
 		h.st.dirty = true
@@ -898,7 +1005,20 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	// one — the first close to find the state dirty uploads, the rest no-op.
 	if !h.st.dirty {
 		if h.st.isNew {
-			if _, err := h.hfs.DB.CommitInode(h.inodeID, 0); err != nil {
+			// Commit at whatever size the inode already has, not at zero. A
+			// brand-new file usually is empty, but ftruncate can have set a size
+			// without dirtying anything: nothing is loaded, so truncateWriteState
+			// had no buffer to resize and only the DB knows. Passing 0 here made
+			// `truncate -s 5T newfile` end up as a 0-byte file — the kernel sends
+			// a FLUSH straight after CREATE, and a second one on close then
+			// committed over the size the truncate had just written.
+			size := int64(0)
+			if h.st.loaded {
+				size = h.st.size
+			} else if m, err := h.hfs.DB.GetInode(h.inodeID); err == nil {
+				size = m.Size
+			}
+			if _, err := h.hfs.DB.CommitInode(h.inodeID, size); err != nil {
 				return toErrno(err)
 			}
 			h.st.isNew = false
@@ -988,6 +1108,33 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	dirty := h.st.dirtyBlocks
 	h.st.dirtyBlocks = nil
 
+	// The presence map describes the backing store, so it is handed over with it
+	// rather than kept. This is the deliberate answer to D4's snapshot copy: the
+	// state does NOT keep a live sparse materialization across a flush, it gives
+	// the store up exactly as it always has, so the upload goroutine still holds
+	// bytes nobody else can reach and "the goroutine never takes st.mu" needs no
+	// new mechanism to stay true. The next access re-attaches and re-faults, from
+	// the disk cache that cacheBlock just seeded. Keeping the materialization
+	// would buy a re-fault after a mid-write fsync and cost two invariants whose
+	// violation is silent.
+	blockBacked := h.st.blockBacked
+	present := h.st.presentBlocks
+	wholeLoaded := h.st.wholeLoaded
+	h.st.presentBlocks = nil
+	h.st.blockBacked = false
+	h.st.wholeLoaded = false
+
+	// materialized answers, for the upload, whether a block really was in the
+	// store when this flush took it. A state that was not block-backed was loaded
+	// whole, so every block of it is present by construction.
+	materialized := func(b int64) bool {
+		if !blockBacked {
+			return true
+		}
+		_, ok := present[b]
+		return ok
+	}
+
 	// Small files: stage to disk, commit immediately, volume builder packs later.
 	if bufSize > 0 && bufSize <= int64(volume.MaxNeedleSize) && canStage {
 		errno := h.flushStaged(uploadFile, bufSize)
@@ -1004,7 +1151,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		return errno
 	}
 
-	return h.flushAsync(att, uploadFile, bufSize, dirty, hasBlocks)
+	return h.flushAsync(att, uploadFile, bufSize, dirty, hasBlocks, wholeLoaded, materialized)
 }
 
 // flushStaged writes a small file to the volume staging directory and commits it
@@ -1132,7 +1279,10 @@ func (h *HamstorHandle) flushStaged(uploadFile *os.File, bufSize int64) syscall.
 // dirty is the set of block indexes written since the last flush. hasBlocks says
 // whether the inode was ALREADY stored as blocks, which decides whether the
 // dirty set is a complete description of what must be uploaded — see below.
-func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufSize int64, dirty map[int64]struct{}, hasBlocks bool) syscall.Errno {
+// materialized reports whether a block was really in the snapshot when Flush
+// took it, which is what the check below turns from a silent corruption into an
+// error.
+func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufSize int64, dirty map[int64]struct{}, hasBlocks, wholeLoaded bool, materialized func(int64) bool) syscall.Errno {
 	// Now wait for upload slot — this goroutine holds no file data in RAM.
 	h.st.mu.Unlock()
 	h.hfs.UploadSem <- struct{}{}
@@ -1167,10 +1317,19 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 	// and everything but that byte silently becomes holes. So converting to
 	// blocks rewrites the whole file, once.
 	//
-	// A brand-new file is not converting — it has no prior storage to lose — and
-	// must NOT be forced to write every block, or a sparse write at offset 1 GB
-	// would upload 128 blocks of zeroes instead of one block.
-	converting := !hasBlocks && (meta.VolS3Key != "" || meta.Size > 0)
+	// A file with no prior storage is NOT converting, and must not be forced to
+	// write every block: a sparse write at offset 1 GB would then upload 128
+	// blocks of zeroes instead of one.
+	//
+	// The test for that is how the backing store was filled, never inodes.size.
+	// Size cannot tell a staged file from a hole — both are "size > 0, no blocks,
+	// no needle" — and every real tool that writes sparsely calls ftruncate
+	// FIRST, so the size is already set before the first write arrives. Measured
+	// on a live mount with size as the test: `dd bs=1M seek=4096 count=1` on a
+	// new file committed 513 block rows and uploaded 4 GiB of zeroes for one
+	// kilobyte of data. vol_s3_key stays in as a cross-check on the needle case,
+	// where guessing wrong costs data rather than bandwidth.
+	converting := !hasBlocks && (meta.VolS3Key != "" || wholeLoaded)
 
 	lastLive := int64(-1)
 	if bufSize > 0 {
@@ -1192,6 +1351,34 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			}
 		}
 		slices.Sort(indexes)
+	}
+
+	// Every block about to be uploaded must really be in the snapshot. Under lazy
+	// materialization the store is sparse, so a block that was dirtied without
+	// first being faulted — or a `converting` file that was only partially
+	// materialized — would upload zeroes over everything the write did not cover.
+	// That failure is silent and permanent: nothing errors, and the damage
+	// surfaces whenever someone next reads that region, possibly months later.
+	//
+	// The invariant is held by construction (Write faults before it writes, and
+	// conversion only ever happens from a needle or a staging file, both loaded
+	// whole), which is exactly why it needs a check rather than a comment: the
+	// previous steps each retired an assumption the compiler could not see.
+	for _, idx := range indexes {
+		if materialized(idx) {
+			continue
+		}
+		aErr := fmt.Errorf("inode %d: block %d is dirty but was never materialized", h.inodeID, idx)
+		log.Printf("hamstor: refusing to upload an unmaterialized block: %v", aErr)
+		<-h.hfs.UploadSem
+		if uploadFile != nil {
+			uploadFile.Close()
+			os.Remove(uploadFile.Name())
+		}
+		att.err = aErr
+		h.st.poisoned = aErr
+		close(att.done)
+		return syscall.EIO
 	}
 
 	hfs := h.hfs
@@ -1439,11 +1626,10 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 		// snapshot gets cleaned up. Clearing snapPath transfers ownership away
 		// from the defer above.
 		//
-		// Only a snapshot that covers the whole file is a valid thumbnail source.
-		// After a partial overwrite it holds just the rewritten blocks at their
-		// natural offsets, with holes everywhere else — a picture of nothing.
-		// Freshly copied images are fully dirty, which is the case that matters.
-		if len(blocks) > 0 && blocks[0].Index == 0 && int64(len(blocks)) == lastLive+1 {
+		// Only a snapshot that covers the whole file is a valid thumbnail source
+		// (see wholeFileSnapshot). Freshly copied images are fully dirty, which
+		// is the case that matters.
+		if wholeFileSnapshot(blocks, lastLive) {
 			uploadFile.Close()
 			uploadFile = nil
 			hfs.scheduleThumb(inodeID, fileName, snapPath)
@@ -1455,6 +1641,39 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 	}()
 
 	return 0
+}
+
+// wholeFileSnapshot reports whether a committed block set covers the file
+// entirely — blocks 0 through lastLive with no gaps — and therefore whether the
+// snapshot the upload streamed from holds the file's complete plaintext.
+//
+// This is the thumbnail contract under lazy materialization, and it is the one
+// place where getting it wrong is both silent and permanent. scheduleThumb's
+// source must hold the WHOLE file: after a partial overwrite the snapshot has
+// only the rewritten blocks at their natural offsets and holes everywhere else,
+// so a thumbnail built from it renders those holes as black and is then stored
+// in the freedesktop cache as a perfectly valid-looking preview of the file.
+// Nothing breaks at build time and nothing ever corrects it.
+//
+// Skipping is the right answer rather than materializing the rest first: pulling
+// a whole 2 GB PSD back to make a 256px preview is exactly the full download this
+// layout removed. The cost of skipping is a STALE thumbnail, which the
+// freedesktop mtime check makes the viewer regenerate on demand by reading the
+// file through the mount, where it is complete. Stale and self-correcting beats
+// wrong and permanent.
+//
+// A sparse file never qualifies (its holes have no rows, so the set has gaps),
+// which is correct for the same reason.
+func wholeFileSnapshot(blocks []db.BlockCommit, lastLive int64) bool {
+	if lastLive < 0 || int64(len(blocks)) != lastLive+1 {
+		return false
+	}
+	for i, b := range blocks {
+		if b.Index != int64(i) {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *HamstorHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
