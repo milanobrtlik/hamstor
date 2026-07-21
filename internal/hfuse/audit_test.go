@@ -1,6 +1,7 @@
 package hfuse
 
 import (
+	"context"
 	"syscall"
 	"testing"
 
@@ -177,7 +178,7 @@ func TestReadLoadedClampsToLogicalSize(t *testing.T) {
 	h.st.dirty = false
 
 	dest := make([]byte, 100)
-	res, errno := h.readLoaded(dest, 0)
+	res, errno := h.readLoaded(context.Background(), dest, 0)
 	if errno != 0 {
 		t.Fatalf("read errno %v", errno)
 	}
@@ -187,7 +188,7 @@ func TestReadLoadedClampsToLogicalSize(t *testing.T) {
 	}
 
 	// A read starting past the logical EOF returns nothing.
-	res, errno = h.readLoaded(dest, 7)
+	res, errno = h.readLoaded(context.Background(), dest, 7)
 	if errno != 0 {
 		t.Fatalf("read past EOF errno %v", errno)
 	}
@@ -199,7 +200,7 @@ func TestReadLoadedClampsToLogicalSize(t *testing.T) {
 	// A dirty state is authoritative on its buffer length (writes may extend
 	// past the stored size), so no clamp is applied.
 	h.st.dirty = true
-	res, errno = h.readLoaded(dest, 0)
+	res, errno = h.readLoaded(context.Background(), dest, 0)
 	if errno != 0 {
 		t.Fatalf("dirty read errno %v", errno)
 	}

@@ -192,7 +192,7 @@ func TestShrinkDropsBlocksPastEndOfFile(t *testing.T) {
 	if errno := th.TestWriteAt([]byte("x"), 0); errno != 0 {
 		t.Fatalf("write: %v", errno)
 	}
-	errno := truncateWriteState(th.h.st, 16)
+	errno := hfs.truncateWriteState(th.h.st, 16)
 	if errno != 0 {
 		t.Fatalf("truncate: %v", errno)
 	}
@@ -372,7 +372,7 @@ func TestBlockFileShrinkingStaysBlocks(t *testing.T) {
 	if errno := th.TestWriteAt(small, 0); errno != 0 {
 		t.Fatalf("overwrite: %v", errno)
 	}
-	errno := truncateWriteState(th.h.st, int64(len(small)))
+	errno := hfs.truncateWriteState(th.h.st, int64(len(small)))
 	if errno != 0 {
 		t.Fatalf("truncate: %v", errno)
 	}

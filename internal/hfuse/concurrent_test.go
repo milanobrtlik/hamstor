@@ -331,7 +331,7 @@ func TestPathTruncateReachesOpenHandle(t *testing.T) {
 	if st == nil {
 		t.Fatal("no shared state for an inode with an open handle")
 	}
-	if errno := truncateWriteState(st, 5); errno != 0 {
+	if errno := hfs.truncateWriteState(st, 5); errno != 0 {
 		t.Fatalf("truncate shared state: %v", errno)
 	}
 	hfs.releaseWrite(id, st)
@@ -356,11 +356,25 @@ func TestWriteStateReleasedOnOpenError(t *testing.T) {
 	hfs, _ := setupTest(t)
 
 	id := mustInsert(t, hfs, "gone.txt")
-	// A committed inode whose one block names an object that cannot be fetched:
-	// the write preload in Open then fails and returns no handle.
-	blocks := []db.BlockCommit{{Index: 0, S3Key: "aa/does-not-exist-" + t.Name(), Size: 10}}
-	if _, _, err := hfs.DB.CommitBlocks(id, blocks, 10); err != nil {
-		t.Fatalf("commit blocks: %v", err)
+	// A committed inode packed into a volume object that cannot be fetched: the
+	// write preload in Open then fails and returns no handle.
+	//
+	// This used to be a block-stored inode naming an object that was not there,
+	// which stopped failing once the preload went lazy — a block-stored file now
+	// attaches a sparse store and fetches nothing, so Open succeeds and the leak
+	// this test exists to catch would go unnoticed. The needle path still
+	// downloads at open, so the fixture moved there rather than the test being
+	// weakened to match the new behaviour.
+	volKey := "aa/does-not-exist-" + t.Name()
+	if err := hfs.DB.InsertVolume(volKey, 10, 0, 0, 0, "open"); err != nil {
+		t.Fatalf("insert volume: %v", err)
+	}
+	if _, err := hfs.DB.CommitInode(id, 10); err != nil {
+		t.Fatalf("commit inode: %v", err)
+	}
+	if _, err := hfs.DB.CommitNeedlesToVolume(volKey, 10,
+		[]db.NeedleCommit{{InodeID: id, Offset: 0, Size: 10}}, true, ""); err != nil {
+		t.Fatalf("commit needle: %v", err)
 	}
 	badStore, err := s3store.New(context.Background(), "hamstor-no-such-bucket-open",
 		cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, cfg.Region)
