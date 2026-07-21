@@ -399,6 +399,16 @@ blok se nepřepisuje (stejně jako se dnes nepřepisuje celý objekt — proto e
 v `readLoaded`, `handle.go:503-515`). **Odvozovat délku souboru ze `SUM(blocks.size)` je
 nová verze staré chyby.** `inodes.size` (a za běhu `inodeWrite.size`) je jediná autorita.
 
+**Nezaměňovat se dvěma věcmi, které se sem podobají:**
+
+- *Poslední* blok, jehož uložený objekt je delší než jeho živý rozsah, je v pořádku a
+  řeší ho clamp. To je tenhle odstavec.
+- Blok **celý za** koncem souboru v pořádku není. Ten se musí smazat — clamp ho sice
+  nezobrazí, ale příští zvětšení souboru by ho vzkřísilo se starým obsahem místo nul.
+  `CommitBlocks` to dělá (`DELETE ... WHERE block_index > ?`); bezhandlová cesta
+  `truncate(2)` → `SetAttr` ne, a je to jediná díra, kterou po Kroku 3 zbývá zalepit —
+  viz Krok 5.
+
 Naopak `ftruncate` **nahoru** nesmí nic materializovat: zvětšení na 5 TB je jen
 `UPDATE inodes SET size`, žádné bloky nul.
 
@@ -631,7 +641,7 @@ Sloupec „bloky rozbijí" rozlišuje: **ANO** = po změně nefunguje nebo je ne
 | `:525-558` `AllS3KeySet` | inodes ∪ volumes = vše | **ANO — Č1**; ✅ hotovo v Kroku 2 |
 | `:643` `DeleteInodeWithVolume` | maže jen needle účetnictví | ANO — Č4 |
 | `:758` `UpdateS3Key` | klíč je updatovatelné pole inodu | ANO — ruší se |
-| `:780-803` `SetAttr` | zmenšení = jen změna čísla | ANO — musí mazat bloky za koncem |
+| `:780-803` `SetAttr` | zmenšení = jen změna čísla | ANO — musí mazat bloky za koncem; **Krok 5**, měřeno níž |
 | `:912-963` `Fsck` | predikát „nemá data" | ANO — Č7 |
 | `:690-748` `CommitNeedlesToVolume` | needles | NE |
 | `:591` `GetEmptyVolumes`, `:600` `GetVolumesForCompaction` | volumes | NE |
@@ -1083,6 +1093,11 @@ protože cascade smaže řádky a GC fáze 1 objekty uklidí, ale do prvního GC
 A `rmdir_test.go:106` tím tiše zvakuovatěl (čte `meta.S3Key`, který je nově prázdný);
 Krok 4 opraví obojí naráz, protože právě on ten sloupec maže.
 
+*A jedna, která patří Kroku 5:* `db.SetAttr` při zmenšení nemaže bloky za koncem, takže
+`truncate(2)` **bez otevřeného handle** nechá řádky ležet a příští zvětšení vydá stará
+data místo nul. Ověřeno, že to **není regrese** — `dcf14b0` dělá totéž — a proto to Krok 3
+nezdržovalo. Podrobnosti a míra u Kroku 5.
+
 ---
 
 **Krok 4 — smazat `InodeMeta.S3Key` a `inodes.s3_key`, ať mluví compiler.**
@@ -1110,12 +1125,31 @@ jsou v inventuře vyjmenované.
 (`node.go:332-361`) přestane cokoli stahovat. `MaxDownloadSize` se překlopí na sanity
 check bloku.
 
+**Sem patří i `db.SetAttr` (`:780-803`), jediná položka z inventury 3.2, kterou dosud
+neměl žádný krok.** Zmenšení souboru **bez otevřeného handle** (`truncate(2)` po cestě,
+`tryAcquireWrite` vrátí `nil`) neprojde flushem, takže `CommitBlocks` se nikdy nezavolá a
+řádky bloků za novým koncem přežijí. `SetAttr` proto při zmenšení musí sám smazat
+`blocks WHERE block_index > lastLive` a vrátit klíče volajícímu k smazání — stejným
+směrem „přečti klíče → smaž řádky → smaž objekty" jako `DeleteBlocksForInode`.
+
+Změřeno po Kroku 3 (3 bloky → `truncate` na 16 B): řádky zůstanou **3**, čtení vrátí
+správných 16 B (clamp funguje), ale zvětšení zpátky vydá **8 MiB staré dat místo nul**.
+
+*Tohle není regrese blokového layoutu.* Týž test na `dcf14b0` (celofilové objekty)
+resurrektuje přesně týchž 1 048 560 bajtů — zkrácení nikdy nepřepsalo objekt a
+`readLoaded` se clampuje na `st.size`. Bloky ten bug **zlevňují**: opravit ho znamená
+smazat pár řádků, kdežto u jednoho celofilového objektu by se musel přepsat celý.
+S otevřeným handlem je to už teď v pořádku (`Flush` → `CommitBlocks` ořeže podle
+velikosti, hlídá `TestShrinkDropsBlocksPastEndOfFile`) — chybí právě jen bezhandlová cesta.
+
 *Proč tady:* je to teprve tenhle krok, který plní cíl dokumentu — do teď se jen měnil
 tvar úložiště. Odděleně od kroku 3 proto, že chybu v lazy faultu jde poznat: soubor čte
 nuly nebo `EIO`, ne tiše starou verzi.
 
 *Riziko:* střední. Testovat sparse soubory (`dd seek=`), čtení přes hranici bloku,
-čtení díry a `truncate` nahoru na velikost, kterou by nešlo materializovat.
+čtení díry a `truncate` nahoru na velikost, kterou by nešlo materializovat. K `SetAttr`
+patří vlastní regresní test: zmenšit **bez otevřeného handle**, zvětšit zpátky a ověřit,
+že se čtou nuly — ne starý ocas.
 
 ---
 
