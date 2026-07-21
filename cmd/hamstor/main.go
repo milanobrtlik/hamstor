@@ -125,7 +125,7 @@ func main() {
 	defer stop()
 
 	// Take an exclusive advisory lock on the DB so a mount and a mutating
-	// subcommand (gc/compact/migrate/purge-s3/restore) cannot run against the
+	// subcommand (gc/compact/purge-s3/restore) cannot run against the
 	// same database/bucket concurrently — which would let one delete S3 volume
 	// objects out from under the other. fsck/cache/version returned earlier and
 	// do not take the lock.
@@ -176,12 +176,6 @@ func main() {
 	}
 
 	switch subcmd {
-	case "migrate":
-		if err := ops.Migrate(ctx, database, store); err != nil {
-			log.Fatalf("migrate: %v", err)
-		}
-		database.Close()
-		return
 	case "gc":
 		result, err := ops.GC(ctx, database, store, *dryRun)
 		if err != nil {

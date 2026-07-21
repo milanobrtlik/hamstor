@@ -102,33 +102,38 @@ func gcScoped(ctx context.Context, database *db.DB, store *s3store.Store, dryRun
 		return nil, fmt.Errorf("gc: find orphaned inodes: %w", err)
 	}
 
-	// Batch-delete S3 keys for DB orphans, then atomically remove inode+volume stats
-	var dbOrphanS3Keys []string
 	for _, meta := range orphanedInodes {
 		result.DBOrphans++
 		if dryRun {
-			log.Printf("gc: db orphan (dry-run): inode %d %q s3_key=%s vol_s3_key=%s", meta.ID, meta.Name, meta.S3Key, meta.VolS3Key)
-			continue
-		}
-		if meta.S3Key != "" {
-			dbOrphanS3Keys = append(dbOrphanS3Keys, meta.S3Key)
-		}
-	}
-	if len(dbOrphanS3Keys) > 0 {
-		if _, err := store.DeleteBatch(ctx, dbOrphanS3Keys); err != nil {
-			log.Printf("gc: batch delete db orphan s3 keys: %v", err)
-			result.Errors += len(dbOrphanS3Keys)
+			log.Printf("gc: db orphan (dry-run): inode %d %q vol_s3_key=%s", meta.ID, meta.Name, meta.VolS3Key)
 		}
 	}
 
-	// Delete DB inode rows (atomically with volume stats update)
+	// Delete DB inode rows (atomically with volume stats update), then the block
+	// objects they owned.
+	//
+	// The keys are collected FROM the delete, not before it. An orphaned inode's
+	// blocks are removed by ON DELETE CASCADE, so after this call nobody knows
+	// them any more — collecting them from the inode row, the way this used to,
+	// found nothing at all and left every block of every orphaned file in the
+	// bucket forever. Phase 1 would eventually sweep them, but only because it
+	// now knows about blocks: the two omissions used to mask each other.
 	if !dryRun {
+		var dbOrphanS3Keys []string
 		for _, meta := range orphanedInodes {
-			if err := database.DeleteInodeWithVolume(meta.ID, meta.VolS3Key); err != nil {
+			orphaned, err := database.DeleteInodeWithVolume(meta.ID, meta.VolS3Key)
+			if err != nil {
 				log.Printf("gc: delete orphan inode %d: %v", meta.ID, err)
 				result.Errors++
-			} else {
-				result.OrphansDeleted++
+				continue
+			}
+			dbOrphanS3Keys = append(dbOrphanS3Keys, orphaned...)
+			result.OrphansDeleted++
+		}
+		if len(dbOrphanS3Keys) > 0 {
+			if _, err := store.DeleteBatch(ctx, dbOrphanS3Keys); err != nil {
+				log.Printf("gc: batch delete db orphan block keys: %v", err)
+				result.Errors += len(dbOrphanS3Keys)
 			}
 		}
 	}

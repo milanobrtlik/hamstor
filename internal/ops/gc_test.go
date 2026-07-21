@@ -135,16 +135,20 @@ func TestGCOrphanedInodes(t *testing.T) {
 		t.Fatalf("upload key2: %v", err)
 	}
 
-	// Commit files with S3 keys
-	if _, err := database.CommitInode(fileID1, key1, 5); err != nil {
+	// Commit the files as blocks — the only shape an inode's own data can take.
+	// This is what makes the test cover phase 2's real hazard: the block rows go
+	// away with the inode through ON DELETE CASCADE, so GC has to collect the
+	// keys FROM the delete. Reading them off the inode row, as it used to, finds
+	// nothing and leaves both objects in the bucket.
+	if _, _, err := database.CommitBlocks(fileID1, []db.BlockCommit{{Index: 0, S3Key: key1, Size: 5}}, 5); err != nil {
 		t.Fatalf("commit file1: %v", err)
 	}
-	if _, err := database.CommitInode(fileID2, key2, 5); err != nil {
+	if _, _, err := database.CommitBlocks(fileID2, []db.BlockCommit{{Index: 0, S3Key: key2, Size: 5}}, 5); err != nil {
 		t.Fatalf("commit file2: %v", err)
 	}
 
 	// Simulate the bug: delete directory WITHOUT deleting children
-	if err := database.DeleteInode(dirID); err != nil {
+	if _, err := database.DeleteInode(dirID); err != nil {
 		t.Fatalf("delete dir: %v", err)
 	}
 
@@ -200,7 +204,7 @@ func TestGCOrphanedInodesDryRun(t *testing.T) {
 	if err := store.Upload(ctx, key, []byte("data")); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
-	if _, err := database.CommitInode(fileID, key, 4); err != nil {
+	if _, _, err := database.CommitBlocks(fileID, []db.BlockCommit{{Index: 0, S3Key: key, Size: 4}}, 4); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 

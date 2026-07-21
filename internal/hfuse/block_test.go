@@ -103,10 +103,6 @@ func TestBlocksSpanBlockBoundary(t *testing.T) {
 	if meta.Size != int64(size) {
 		t.Fatalf("inode size %d, want %d", meta.Size, size)
 	}
-	if meta.S3Key != "" {
-		t.Errorf("s3_key = %q, want empty: the write path must not name a whole-file object any more", meta.S3Key)
-	}
-
 	if got := readBack(t, hfs, id, size); !bytes.Equal(got, content) {
 		t.Fatalf("read back %d bytes; content differs from what was written", len(got))
 	}
@@ -403,57 +399,51 @@ func TestBlockFileShrinkingStaysBlocks(t *testing.T) {
 	}
 }
 
-// TestLegacyWholeFileConvertsEntirely is the migration trap. Files written
-// before this step are one object named by inodes.s3_key, and committing blocks
-// drops that object wholesale. Uploading only the blocks the writer touched
-// would leave the rest of the file with no storage at all — change one byte of a
-// large legacy file and the remainder silently becomes holes.
-func TestLegacyWholeFileConvertsEntirely(t *testing.T) {
-	hfs, _ := setupTest(t)
+// TestConvertingToBlocksRewritesUntouchedData guards the "converting rewrites
+// the whole file" rule, which no other test reaches.
+//
+// CommitBlocks drops the previous storage wholesale, so a flush that converts an
+// inode to blocks must write every block, not just the dirty ones — otherwise
+// the part the writer never touched is left with no storage at all and reads
+// back as a hole full of zeroes.
+//
+// The write has to be SPARSE to catch it. TestStagedFileGrowingIntoBlocksStays-
+// Readable also converts, but by overwriting from offset 0, which dirties every
+// block anyway and so passes either way. Here only block 1 is written, and block
+// 0 survives solely because the flush noticed it was converting.
+//
+// This replaces a version built on a hand-made whole-file object. That shape is
+// gone with inodes.s3_key; a needle or staging file is the only thing left to
+// convert FROM, and both fit in block 0 — which is exactly what makes the
+// sparse write the one way to still express the bug.
+func TestConvertingToBlocksRewritesUntouchedData(t *testing.T) {
+	hfs, _ := setupStaging(t)
 	hfs.SpillDir = t.TempDir()
-	ctx := context.Background()
 
-	size := 2*db.BlockSize + 512
-	content := make([]byte, size)
-	for i := range content {
-		content[i] = byte('m' + (i / db.BlockSize))
-	}
+	// A small file, committed as a staging file — under MaxNeedleSize, so all of
+	// it lives inside block 0.
+	id := mustInsert(t, hfs, "grows-sparsely.bin")
+	head := bytes.Repeat([]byte("h"), 1024)
+	writeAt(t, hfs, id, head, 0, true)
 
-	// Build the legacy shape by hand — the write path no longer produces it.
-	id := mustInsert(t, hfs, "legacy.bin")
-	legacyKey := s3store.NewKey()
-	if err := hfs.Store.Upload(ctx, legacyKey, content); err != nil {
-		t.Fatalf("upload legacy object: %v", err)
-	}
-	t.Cleanup(func() { hfs.Store.Delete(ctx, legacyKey) })
-	if _, err := hfs.DB.CommitInode(id, legacyKey, int64(size)); err != nil {
-		t.Fatalf("commit legacy inode: %v", err)
-	}
-
-	// Touch one byte in the LAST block only.
-	patch := []byte("!")
-	patchOff := int64(2 * db.BlockSize)
-	writeAt(t, hfs, id, patch, patchOff, false)
-	copy(content[patchOff:], patch)
+	// Now write far past the end, in block 1. Only block 1 is dirty; block 0 is
+	// carried over from the staging file the commit is about to drop.
+	tailOff := int64(db.BlockSize) + 4096
+	tail := bytes.Repeat([]byte("t"), 512)
+	writeAt(t, hfs, id, tail, tailOff, false)
 
 	blocks := blocksOf(t, hfs, id)
-	if len(blocks) != 3 {
-		t.Fatalf("want all 3 blocks written when converting from a whole-file object, got %d: "+
-			"the untouched %d bytes have no storage now", len(blocks), 2*db.BlockSize)
-	}
-	if objectExists(t, hfs, legacyKey) {
-		t.Error("the superseded whole-file object was not deleted")
+	if len(blocks) != 2 {
+		t.Fatalf("got %d blocks, want 2: converting from a staging file must rewrite block 0 too, "+
+			"or the first %d bytes have no storage left", len(blocks), len(head))
 	}
 
-	meta, err := hfs.DB.GetInode(id)
-	if err != nil {
-		t.Fatalf("get inode: %v", err)
-	}
-	if meta.S3Key != "" {
-		t.Errorf("s3_key = %q, want empty after converting to blocks", meta.S3Key)
-	}
-	if got := readBack(t, hfs, id, size); !bytes.Equal(got, content) {
-		t.Fatal("converted file does not read back as it was written")
+	size := int(tailOff) + len(tail)
+	want := make([]byte, size)
+	copy(want, head)
+	copy(want[tailOff:], tail)
+	if got := readBack(t, hfs, id, size); !bytes.Equal(got, want) {
+		t.Fatal("converted file does not read back as it was written: the untouched head became a hole")
 	}
 }
 

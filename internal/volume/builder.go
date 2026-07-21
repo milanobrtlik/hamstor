@@ -183,6 +183,26 @@ func (b *Builder) cacheVolume(volKey string, data []byte) {
 	}
 }
 
+// durable reports whether the inode is gone, and whether its data is in S3.
+//
+// "In S3" is two shapes, not one: a volume needle, or a set of blocks. Testing
+// vol_s3_key alone would miss a file that an overwrite grew past MaxNeedleSize
+// while we were looking — that flush commits blocks and deletes the staging
+// file, so a needle-only test concludes "staged but missing" and reports either
+// ErrBeingPacked (Fsync then spins out every backoff) or an outright durability
+// failure, for a file that is safely stored.
+func (b *Builder) durable(inodeID int64) (gone, durable bool) {
+	meta, err := b.db.GetInode(inodeID)
+	if err != nil {
+		return true, false
+	}
+	if meta.VolS3Key != "" {
+		return false, true
+	}
+	has, hErr := b.db.HasBlocks(inodeID)
+	return false, hErr == nil && has
+}
+
 // FlushInode packs a single staged file into a volume and uploads it to S3,
 // providing on-demand S3 durability for Fsync.
 func (b *Builder) FlushInode(inodeID int64) error {
@@ -196,22 +216,14 @@ func (b *Builder) FlushInode(inodeID int64) error {
 			packingPath := path + ".packing"
 			if _, statErr := os.Stat(packingPath); statErr == nil {
 				// Builder has claimed it but may not have finished yet.
-				meta, dbErr := b.db.GetInode(inodeID)
-				if dbErr != nil {
-					return nil // inode deleted, ok
-				}
-				if meta.VolS3Key != "" || meta.S3Key != "" {
-					return nil // already durable
+				if gone, durable := b.durable(inodeID); gone || durable {
+					return nil // inode deleted, or already durable
 				}
 				return fmt.Errorf("flush inode %d: %w", inodeID, ErrBeingPacked)
 			}
 			// No staging file, no .packing — verify data is durable.
-			meta, dbErr := b.db.GetInode(inodeID)
-			if dbErr != nil {
-				return nil // inode deleted, ok
-			}
-			if meta.VolS3Key != "" || meta.S3Key != "" {
-				return nil // already durable
+			if gone, durable := b.durable(inodeID); gone || durable {
+				return nil
 			}
 			return fmt.Errorf("flush inode %d: staging file missing and no S3 reference", inodeID)
 		}
@@ -268,8 +280,10 @@ func (b *Builder) FlushInode(inodeID int64) error {
 	// otherwise signal ErrBeingPacked so Fsync keeps waiting for the new data to
 	// be packed rather than falsely reporting durability.
 	if len(committedIDs) == 0 {
-		if m, dbErr := b.db.GetInode(inodeID); dbErr == nil && m.VolS3Key == "" && m.S3Key == "" && m.Size > 0 {
-			return ErrBeingPacked
+		if m, dbErr := b.db.GetInode(inodeID); dbErr == nil && m.Size > 0 {
+			if gone, isDurable := b.durable(inodeID); !gone && !isDurable {
+				return ErrBeingPacked
+			}
 		}
 	}
 	return nil

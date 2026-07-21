@@ -46,13 +46,18 @@ func Cleanup(d *db.DB, store *s3store.Store, pendingDir string) error {
 	log.Printf("hamstor: %d pending entries have no recoverable data, removing them:", len(lost))
 	for _, meta := range lost {
 		log.Printf("hamstor:   lost: %s (inode %d)", meta.Name, meta.ID)
-		if meta.S3Key != "" {
-			if err := store.Delete(context.Background(), meta.S3Key); err != nil {
-				log.Printf("hamstor: cleanup s3 delete %s: %v", meta.S3Key, err)
-			}
-		}
-		if err := d.DeleteInode(meta.ID); err != nil {
+		// Whatever blocks this half-finished upload managed to commit are
+		// unreachable once the row is gone, and this is the last place their keys
+		// are known.
+		orphaned, err := d.DeleteInode(meta.ID)
+		if err != nil {
 			log.Printf("hamstor: cleanup delete inode %d: %v", meta.ID, err)
+			continue
+		}
+		for _, key := range orphaned {
+			if err := store.Delete(context.Background(), key); err != nil {
+				log.Printf("hamstor: cleanup s3 delete %s: %v", key, err)
+			}
 		}
 	}
 	return nil
@@ -135,6 +140,19 @@ func RecoverPending(d *db.DB, store *s3store.Store, pendingDir string) error {
 			continue
 		}
 
+		// The retained file describes exactly ONE block: the flush only retains
+		// when the whole file fits in block 0 (see wholeFileInOneBlock), because
+		// the <id>.<size> format cannot name a set. A file bigger than a block is
+		// therefore a leftover from a build with different rules — refuse it
+		// rather than commit it as a truncated block 0, and leave it on disk,
+		// since these bytes are the file's only copy.
+		if logicalSize > db.BlockSize {
+			log.Printf("hamstor: recover: %s claims %d bytes, more than one block — kept, not recovered",
+				e.Name(), logicalSize)
+			failed++
+			continue
+		}
+
 		f, err := os.Open(path)
 		if err != nil {
 			log.Printf("hamstor: recover: open %s: %v", e.Name(), err)
@@ -157,11 +175,26 @@ func RecoverPending(d *db.DB, store *s3store.Store, pendingDir string) error {
 			continue
 		}
 
-		if _, err := d.CommitInode(inodeID, key, logicalSize); err != nil {
+		// Commit it the way the flush would have: as block 0 of a block-stored
+		// file. The block's size is the LOGICAL length from the filename, not the
+		// length of the file on disk — under encryption the stored object carries
+		// a version byte, a nonce and a tag on top of the plaintext, and recording
+		// that as the block's extent would make the file read long.
+		//
+		// Orphans should be empty here: a retained set only ever belongs to an
+		// inode that was never committed (RecoverPending drops the retained copy
+		// of a 'committed' inode above), so there is no previous storage to
+		// replace. Delete whatever does come back rather than assume.
+		blocks := []db.BlockCommit{{Index: 0, S3Key: key, Size: logicalSize}}
+		_, orphaned, err := d.CommitBlocks(inodeID, blocks, logicalSize)
+		if err != nil {
 			log.Printf("hamstor: recover: commit %s: %v (kept, will retry next start)", meta.Name, err)
 			store.Delete(context.Background(), key)
 			failed++
 			continue
+		}
+		for _, o := range orphaned {
+			store.Delete(context.Background(), o)
 		}
 		os.Remove(path)
 		log.Printf("hamstor: recovered %s (inode %d, %d bytes) from a failed upload", meta.Name, inodeID, logicalSize)
@@ -255,7 +288,7 @@ func CleanupStagingDir(d *db.DB, stagingDir string) error {
 	// hasStorage answers "is this staging file stale?" for both the .packing
 	// branch and the plain one, so the two cannot drift apart.
 	hasStorage := func(meta *db.InodeMeta) bool {
-		if meta.S3Key != "" || meta.VolS3Key != "" {
+		if meta.VolS3Key != "" {
 			return true
 		}
 		has, err := d.HasBlocks(meta.ID)
