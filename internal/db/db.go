@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -83,6 +84,29 @@ type InodeMeta struct {
 	VolS3Key      string
 	VolOffset     int64
 	VolSize       int64
+}
+
+// BlockSize is the step of the block layout for large files: block b covers the
+// plaintext range [b*BlockSize, min((b+1)*BlockSize, inodes.size)). Blocks are
+// not padded — the last block of a 300 KB file is a 300 KB object.
+//
+// It lives here because CommitBlocks is given only the new file size and has to
+// derive the last live index itself. s3store.UploadPartSize is deliberately
+// twice this value, so one block is always one PutObject.
+// See claudedocs/block-layout-design.md, D1.
+const BlockSize = 8 << 20
+
+// BlockCommit is one row of the blocks table, both when writing and when
+// reading it back.
+type BlockCommit struct {
+	Index int64
+	S3Key string
+	// Size is the plaintext length of the STORED OBJECT, not the live extent of
+	// the block and not a component of the file length. The two differ after a
+	// truncate that shrinks inodes.size without rewriting the last block.
+	// Deriving a file's length from SUM(size) is a new version of an old bug —
+	// inodes.size is the only authority.
+	Size int64
 }
 
 // VolumeRecord holds metadata for a volume S3 object.
@@ -192,6 +216,27 @@ func (d *DB) runVersionedMigrations() error {
 			key: "idx_vol_s3_key_v1",
 			fn: func() error {
 				_, err := d.db.Exec("CREATE INDEX IF NOT EXISTS idx_inodes_vol_s3_key ON inodes(vol_s3_key)")
+				return err
+			},
+		},
+		{
+			// One row per block of a large file. WITHOUT ROWID makes the
+			// primary key the table itself: no second B-tree and no implicit
+			// rowid, so a (inode, block_index) lookup is one probe and the
+			// write footprint is half that of a rowid table with a UNIQUE
+			// index. Deliberately no index on s3_key — nobody needs the
+			// reverse lookup (GC and fsck both scan the whole set), and it
+			// would cost a write on every block commit.
+			// See claudedocs/block-layout-design.md, D2 and section 2.
+			key: "blocks_table_v1",
+			fn: func() error {
+				_, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS blocks (
+					inode_id     INTEGER NOT NULL REFERENCES inodes(id) ON DELETE CASCADE,
+					block_index  INTEGER NOT NULL,
+					s3_key       TEXT    NOT NULL,
+					size         INTEGER NOT NULL,
+					PRIMARY KEY (inode_id, block_index)
+				) WITHOUT ROWID`)
 				return err
 			},
 		},
@@ -522,39 +567,39 @@ func (d *DB) AllS3Keys() ([]S3KeyRecord, error) {
 	return result, rows.Err()
 }
 
+// AllS3KeySet returns every S3 key the database still references. GC deletes
+// every object in the bucket that is NOT in this set (ops/gc.go), so a storage
+// shape missing from here is not a leak but a delete: the next `hamstor gc`
+// removes live data in one batch, silently. Any new place that stores an S3 key
+// belongs in this union on the same commit that introduces it.
 func (d *DB) AllS3KeySet() (map[string]struct{}, error) {
-	rows, err := d.db.Query("SELECT s3_key FROM inodes WHERE s3_key IS NOT NULL AND s3_key != ''")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
 	set := make(map[string]struct{})
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, err
-		}
-		set[key] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 
-	// Include volume S3 keys
-	vrows, err := d.db.Query("SELECT s3_key FROM volumes")
-	if err != nil {
-		return nil, err
-	}
-	defer vrows.Close()
-	for vrows.Next() {
-		var key string
-		if err := vrows.Scan(&key); err != nil {
+	// Whole-file objects, volume objects, and blocks of large files.
+	for _, q := range []string{
+		"SELECT s3_key FROM inodes WHERE s3_key IS NOT NULL AND s3_key != ''",
+		"SELECT s3_key FROM volumes",
+		"SELECT s3_key FROM blocks",
+	} {
+		rows, err := d.db.Query(q)
+		if err != nil {
+			return nil, fmt.Errorf("all s3 keys (%s): %w", q, err)
+		}
+		for rows.Next() {
+			var key string
+			if err := rows.Scan(&key); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			set[key] = struct{}{}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
 			return nil, err
 		}
-		set[key] = struct{}{}
 	}
-	return set, vrows.Err()
+	return set, nil
 }
 
 // --- Volume packing ---
@@ -753,6 +798,233 @@ type NeedleCommit struct {
 	Offset  int64
 	Size    int64 // encrypted (on-disk) size of the needle
 	MtimeNs int64 // expected mtime_ns at claim time; 0 means skip check
+}
+
+// --- Blocks ---
+
+// CommitBlocks atomically replaces part of an inode's block set and marks the
+// inode committed at the given size. It is the N-key generalization of
+// CommitInode and follows the same rules (block-layout-design.md, D5):
+//
+//   - Every upload must already have succeeded when this is called. A committed
+//     row whose object does not exist is an unreadable file with no error path:
+//     the GET fails whenever someone reads it, which may be months later.
+//   - The keys being replaced are read INSIDE the transaction, never from a
+//     snapshot the caller took earlier. A snapshot is how a losing flush deletes
+//     the object a winning flush just committed.
+//   - The volume the inode used to reference is decremented in this same
+//     transaction. Needle -> blocks happens every time a small file grows past
+//     MaxNeedleSize, so skipping it leaves the volume inflated by a dead needle
+//     nobody will ever subtract.
+//
+// blocks holds only the blocks that changed; any block not listed and still
+// within the new size keeps its current key. Blocks past the new end of file
+// are deleted.
+//
+// Returned orphaned keys are exactly the objects nothing references any more:
+// replaced blocks, blocks cut off by the new size, and the old whole-file
+// s3_key. The caller deletes them AFTER this returns — never before, since a
+// crash in between only leaves orphans for GC, while the reverse order deletes
+// live data. The volume object is never in that list: it is shared with other
+// needles and only GC phase 3 may remove it.
+//
+// committed is false when the inode is gone (unlinked during an upload); the
+// caller must then clean up whatever it uploaded.
+func (d *DB) CommitBlocks(id int64, blocks []BlockCommit, size int64) (bool, []string, error) {
+	if size < 0 {
+		return false, nil, fmt.Errorf("commit blocks inode %d: negative size %d", id, size)
+	}
+	// Highest index still inside the file; -1 when the file is empty.
+	lastLive := int64(-1)
+	if size > 0 {
+		lastLive = (size - 1) / BlockSize
+	}
+	for _, b := range blocks {
+		if b.Index < 0 || b.Index > lastLive {
+			return false, nil, fmt.Errorf(
+				"commit blocks inode %d: block %d is outside a file of %d bytes (last live block is %d)",
+				id, b.Index, size, lastLive)
+		}
+		if b.S3Key == "" || b.Size <= 0 {
+			return false, nil, fmt.Errorf("commit blocks inode %d: block %d has key %q and size %d",
+				id, b.Index, b.S3Key, b.Size)
+		}
+	}
+
+	now := time.Now().UnixNano()
+	var committed bool
+	var orphaned []string
+	var err error
+	for attempt := range 5 {
+		committed, orphaned, err = d.commitBlocksTx(id, blocks, size, lastLive, now)
+		if err == nil {
+			return committed, orphaned, nil
+		}
+		if !isBusy(err) {
+			return false, nil, err
+		}
+		time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond)
+	}
+	return false, nil, err
+}
+
+func (d *DB) commitBlocksTx(id int64, blocks []BlockCommit, size, lastLive, now int64) (bool, []string, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return false, nil, err
+	}
+	defer tx.Rollback()
+
+	var curVolKey, curS3Key sql.NullString
+	var volSize int64
+	err = tx.QueryRow(
+		"SELECT vol_s3_key, COALESCE(vol_size, 0), s3_key FROM inodes WHERE id = ?", id,
+	).Scan(&curVolKey, &volSize, &curS3Key)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Inode was deleted (e.g. unlinked during an async upload).
+		return false, nil, tx.Commit()
+	}
+	if err != nil {
+		return false, nil, err
+	}
+
+	// Current block set, read inside the transaction.
+	rows, err := tx.Query("SELECT block_index, s3_key FROM blocks WHERE inode_id = ?", id)
+	if err != nil {
+		return false, nil, fmt.Errorf("commit blocks inode %d: read current: %w", id, err)
+	}
+	old := make(map[int64]string)
+	for rows.Next() {
+		var idx int64
+		var key string
+		if err := rows.Scan(&idx, &key); err != nil {
+			rows.Close()
+			return false, nil, err
+		}
+		old[idx] = key
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return false, nil, err
+	}
+
+	if curVolKey.Valid && curVolKey.String != "" {
+		if _, err := tx.Exec(
+			"UPDATE volumes SET live_size = MAX(live_size - ?, 0), live_count = MAX(live_count - 1, 0) WHERE s3_key = ?",
+			volSize, curVolKey.String,
+		); err != nil {
+			return false, nil, fmt.Errorf("commit blocks inode %d: decrement volume: %w", id, err)
+		}
+	}
+
+	var orphaned []string
+	for _, b := range blocks {
+		if prev, ok := old[b.Index]; ok && prev != b.S3Key {
+			orphaned = append(orphaned, prev)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO blocks (inode_id, block_index, s3_key, size) VALUES (?, ?, ?, ?)
+			 ON CONFLICT(inode_id, block_index) DO UPDATE SET s3_key = excluded.s3_key, size = excluded.size`,
+			id, b.Index, b.S3Key, b.Size,
+		); err != nil {
+			return false, nil, fmt.Errorf("commit blocks inode %d: upsert block %d: %w", id, b.Index, err)
+		}
+	}
+
+	for idx, key := range old {
+		if idx > lastLive {
+			orphaned = append(orphaned, key)
+		}
+	}
+	if _, err := tx.Exec("DELETE FROM blocks WHERE inode_id = ? AND block_index > ?", id, lastLive); err != nil {
+		return false, nil, fmt.Errorf("commit blocks inode %d: truncate past %d: %w", id, lastLive, err)
+	}
+
+	// The whole-file key is what this inode used to be stored as. Leaving it set
+	// would keep the read path serving the pre-overwrite object and would keep
+	// AllS3KeySet protecting it forever.
+	if curS3Key.Valid && curS3Key.String != "" {
+		orphaned = append(orphaned, curS3Key.String)
+	}
+
+	res, err := tx.Exec(
+		"UPDATE inodes SET s3_key = NULL, size = ?, status = 'committed', mtime_ns = ?,"+
+			" vol_s3_key = NULL, vol_offset = NULL, vol_size = NULL WHERE id = ?",
+		size, now, id,
+	)
+	if err != nil {
+		return false, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, nil, err
+	}
+	n, _ := res.RowsAffected()
+	// Map iteration above makes the order arbitrary; sorting keeps callers' logs
+	// and tests stable.
+	slices.Sort(orphaned)
+	return n > 0, orphaned, nil
+}
+
+// BlocksForInode returns the inode's blocks ordered by index. A gap in the
+// indexes is a hole: it reads as zeroes and is never fetched.
+func (d *DB) BlocksForInode(id int64) ([]BlockCommit, error) {
+	rows, err := d.db.Query(
+		"SELECT block_index, s3_key, size FROM blocks WHERE inode_id = ? ORDER BY block_index", id)
+	if err != nil {
+		return nil, fmt.Errorf("blocks for inode %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	var result []BlockCommit
+	for rows.Next() {
+		var b BlockCommit
+		if err := rows.Scan(&b.Index, &b.S3Key, &b.Size); err != nil {
+			return nil, err
+		}
+		result = append(result, b)
+	}
+	return result, rows.Err()
+}
+
+// DeleteBlocksForInode drops the inode's block rows and returns the keys they
+// held, so the caller can delete the objects afterwards. Reading the keys and
+// deleting the rows is one transaction because the only safe direction is
+// "read keys -> drop rows -> delete objects": rows also disappear on their own
+// through ON DELETE CASCADE, and once they have, nothing knows those keys.
+func (d *DB) DeleteBlocksForInode(id int64) ([]string, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT s3_key FROM blocks WHERE inode_id = ? ORDER BY block_index", id)
+	if err != nil {
+		return nil, fmt.Errorf("delete blocks for inode %d: %w", id, err)
+	}
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec("DELETE FROM blocks WHERE inode_id = ?", id); err != nil {
+		return nil, fmt.Errorf("delete blocks for inode %d: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 func (d *DB) UpdateS3Key(id int64, newKey string) error {

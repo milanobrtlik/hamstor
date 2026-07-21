@@ -23,14 +23,30 @@ type GCResult struct {
 	DBOrphans      int
 }
 
+// gcOptions narrows what a GC run may look at. Production always uses the whole
+// bucket and the full grace period; the phase 1 test sets both, because with the
+// real grace period a freshly uploaded object is skipped before its key is ever
+// compared against the database — so it would survive even a GC that has lost
+// track of it, and the test would prove nothing. Scoping the listing then keeps
+// that zero grace period from reaching the objects other packages' tests are
+// using in the same bucket.
+type gcOptions struct {
+	grace      time.Duration
+	listPrefix string
+}
+
 func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool, excludePrefixes ...string) (*GCResult, error) {
+	return gcScoped(ctx, database, store, dryRun, gcOptions{grace: gcGracePeriod}, excludePrefixes...)
+}
+
+func gcScoped(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool, opts gcOptions, excludePrefixes ...string) (*GCResult, error) {
 	knownKeys, err := database.AllS3KeySet()
 	if err != nil {
 		return nil, fmt.Errorf("gc: load keys from db: %w", err)
 	}
 	log.Printf("gc: %d keys in database", len(knownKeys))
 
-	s3Objects, err := store.ListObjects(ctx, "")
+	s3Objects, err := store.ListObjects(ctx, opts.listPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("gc: list s3 objects: %w", err)
 	}
@@ -41,7 +57,7 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 		excludePrefixes = []string{"litestream/"}
 	}
 
-	cutoff := time.Now().Add(-gcGracePeriod)
+	cutoff := time.Now().Add(-opts.grace)
 	result := &GCResult{}
 	var orphanKeys []string
 	for _, obj := range s3Objects {
@@ -118,7 +134,7 @@ func GC(ctx context.Context, database *db.DB, store *s3store.Store, dryRun bool,
 	}
 
 	// Phase 3: delete empty volumes (all needles deleted, older than grace period)
-	graceNs := int64(gcGracePeriod / time.Nanosecond)
+	graceNs := int64(opts.grace / time.Nanosecond)
 	emptyVols, err := database.GetEmptyVolumes(graceNs)
 	if err != nil {
 		log.Printf("gc: get empty volumes: %v", err)

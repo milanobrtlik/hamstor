@@ -1,8 +1,11 @@
 package ops
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
@@ -27,6 +30,79 @@ func setupGCTest(t *testing.T) (*db.DB, *s3store.Store) {
 
 	t.Cleanup(func() { database.Close() })
 	return database, store
+}
+
+// TestGCPhase1KeepsBlockObjects covers the deletion loop itself, which nothing
+// else does: the two tests below exercise phase 2 (orphaned inodes in the DB),
+// while phase 1 — compare the key set against a bucket listing, delete the
+// difference — had no coverage at all. It is also the single most destructive
+// place in the block layout: a block set missing from AllS3KeySet means the
+// first `hamstor gc` deletes every large file in one DeleteObjects call.
+//
+// The run is scoped on purpose. Zero grace is what makes the assertion mean
+// anything: with the production grace period phase 1 skips a freshly uploaded
+// object before it ever compares its key, so the object would survive even a GC
+// that had lost track of it. The prefix then keeps that zero grace from
+// reaching the objects the hfuse, volume and s3store tests are using in the same
+// bucket — `go test ./...` runs those packages in parallel with this one.
+func TestGCPhase1KeepsBlockObjects(t *testing.T) {
+	database, store := setupGCTest(t)
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("gctest-blocks-%d/", time.Now().UnixNano())
+	blockKey := prefix + "block"
+	orphanKey := prefix + "orphan"
+	t.Cleanup(func() {
+		store.Delete(ctx, blockKey)
+		store.Delete(ctx, orphanKey)
+	})
+
+	blockData := []byte("block zero contents")
+	if err := store.Upload(ctx, blockKey, blockData); err != nil {
+		t.Fatalf("upload block: %v", err)
+	}
+
+	inodeID, err := database.InsertInode(1, "big.bin", 0o100644, "pending")
+	if err != nil {
+		t.Fatalf("insert inode: %v", err)
+	}
+	committed, _, err := database.CommitBlocks(inodeID,
+		[]db.BlockCommit{{Index: 0, S3Key: blockKey, Size: int64(len(blockData))}},
+		int64(len(blockData)))
+	if err != nil {
+		t.Fatalf("commit blocks: %v", err)
+	}
+	if !committed {
+		t.Fatal("commit blocks reported the inode as gone")
+	}
+
+	// Control object: referenced by nothing, so GC must delete it. Without it a
+	// green result would only prove that nothing was deleted at all.
+	if err := store.Upload(ctx, orphanKey, []byte("nobody references this")); err != nil {
+		t.Fatalf("upload control object: %v", err)
+	}
+
+	result, err := gcScoped(ctx, database, store, false, gcOptions{grace: 0, listPrefix: prefix})
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+
+	// Check the control first: if the deletion loop did not run, everything
+	// below passes for the wrong reason.
+	if _, err := store.Download(ctx, orphanKey); err == nil {
+		t.Fatal("the control object survived: the deletion loop never ran, so this test proves nothing")
+	}
+	got, err := store.Download(ctx, blockKey)
+	if err != nil {
+		t.Fatalf("gc deleted a live block object (its key is in blocks): %v", err)
+	}
+	if !bytes.Equal(got, blockData) {
+		t.Errorf("block object contents = %q, want %q", got, blockData)
+	}
+	if result.OrphansFound != 1 || result.OrphansDeleted != 1 {
+		t.Errorf("gc found %d orphans and deleted %d, want 1 and 1 (the control object alone)",
+			result.OrphansFound, result.OrphansDeleted)
+	}
 }
 
 func TestGCOrphanedInodes(t *testing.T) {
