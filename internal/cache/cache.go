@@ -1,8 +1,8 @@
 package cache
 
 import (
-	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,9 +44,25 @@ func New(dir string, maxBytes int64) (*DiskCache, error) {
 	return c, nil
 }
 
-// initApproxSize scans the cache directory to initialize the approximate size counter.
+// initApproxSize scans the cache directory to initialize the approximate size
+// counter, and sweeps out the chunk directories left by versions that stored
+// pieces of an object instead of the object.
+//
+// The sweep rides along on a walk that has to happen anyway, and it matters
+// because a cache directory outlives the binary: --cache-dir is deliberately
+// kept across reinstalls, so those directories sit there referenced by nothing
+// and counted against --cache-size. Nothing would ever look one up again — every
+// key a live row names is a fresh UUID — so they are pure dead weight, and
+// evictLRU only reclaims them once the cache is full enough to evict at all.
+//
+// The signal is exact rather than structural: a cached key is always
+// {2hex}/{uuid} or volobj/{2hex}/{uuid}, so a FILE named chunk-* can only be a
+// chunk, and its parent can only be a chunk directory. Testing the shape instead
+// ("a directory two levels down") would match volobj/{2hex} and delete the
+// volume cache.
 func (c *DiskCache) initApproxSize() {
 	var total int64
+	stale := make(map[string]int64)
 	filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -58,10 +74,29 @@ func (c *DiskCache) initApproxSize() {
 		if err != nil {
 			return nil
 		}
+		if strings.HasPrefix(d.Name(), "chunk-") {
+			stale[filepath.Dir(path)] += info.Size()
+			return nil
+		}
 		total += info.Size()
 		return nil
 	})
 	c.approxSize.Store(total)
+
+	var freed int64
+	var removed int
+	for dir, size := range stale {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("hamstor: remove stale chunk directory %s: %v", dir, err)
+			continue
+		}
+		freed += size
+		removed++
+	}
+	if removed > 0 {
+		log.Printf("hamstor: cache: removed %d stale chunk directories from an older version, %d bytes reclaimed",
+			removed, freed)
+	}
 }
 
 // path returns the on-disk path for a cache entry.
@@ -82,8 +117,9 @@ func (c *DiskCache) MaxBytes() int64 { return c.maxBytes }
 
 // Has reports whether the given S3 key is cached as a whole file.
 //
-// A chunk directory at that path does not count: it holds pieces of the object,
-// not the object, and every caller of Has and Open wants the file itself.
+// A directory at that path does not count: it is not the object, and every
+// caller of Has and Open wants the object itself. See Open for what happens
+// without the check.
 func (c *DiskCache) Has(s3Key string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -96,11 +132,16 @@ func (c *DiskCache) Has(s3Key string) bool {
 // The returned file descriptor remains valid even if the cache entry is evicted,
 // because Linux keeps the inode alive until all fds are closed.
 //
-// A chunk directory (left by PutChunk for this key) is reported as absent. It is
-// not the file, and os.Open succeeds on a directory: the callers then allocate
-// its stat size, get EISDIR from ReadAt, and — in HamstorNode.Open's write
-// preload, which discards that error — take a few KB of zeros for the file's
-// contents.
+// A directory at the key's path is reported as absent. os.Open succeeds on a
+// directory: the callers then allocate its stat size, get EISDIR from ReadAt,
+// and — in HamstorNode.Open's write preload, which discards that error — take a
+// few KB of zeros for the file's contents.
+//
+// The check outlived the chunk sub-cache that motivated it, deliberately. New's
+// sweep clears the chunk directories an older version left in a --cache-dir kept
+// across reinstalls, but a directory that turns up at a key's path some other
+// way must not become file contents either, and the test costs an IsDir() on a
+// Stat that happens anyway.
 func (c *DiskCache) Open(s3Key string) (*os.File, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -121,7 +162,9 @@ func (c *DiskCache) Open(s3Key string) (*os.File, error) {
 // Put stores data in the cache. Writes to a temp file and renames atomically.
 func (c *DiskCache) Put(s3Key string, data []byte) error {
 	p := c.path(s3Key)
-	// Remove chunk directory if it exists (Put stores whole file, not chunks)
+	// A directory may sit at this path — a chunk directory from an older version
+	// that New's sweep has not run over, for instance. Put stores the object as
+	// one file, so clear whatever is there first.
 	os.RemoveAll(p)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
@@ -268,74 +311,6 @@ func (c *DiskCache) Clear() error {
 	return nil
 }
 
-// --- Chunk-based operations ---
-
-const ChunkSize = 2 << 20 // 2 MB
-
-// ChunkIndex returns the chunk index for a byte offset.
-func ChunkIndex(offset int64) int64 {
-	return offset / ChunkSize
-}
-
-// chunkPath returns the on-disk path for a specific chunk.
-func (c *DiskCache) chunkPath(s3Key string, index int64) string {
-	return filepath.Join(c.dir, s3Key, fmt.Sprintf("chunk-%06d", index))
-}
-
-// GetChunk returns the data for a cached chunk, or os.ErrNotExist.
-func (c *DiskCache) GetChunk(s3Key string, index int64) ([]byte, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return os.ReadFile(c.chunkPath(s3Key, index))
-}
-
-// PutChunk stores a single chunk in the cache.
-func (c *DiskCache) PutChunk(s3Key string, index int64, data []byte) error {
-	p := c.chunkPath(s3Key, index)
-	// Remove whole-file cache if it exists (PutChunk stores chunks in a directory)
-	keyPath := filepath.Join(c.dir, s3Key)
-	if info, err := os.Lstat(keyPath); err == nil && !info.IsDir() {
-		os.Remove(keyPath)
-	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".chunk-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	c.mu.Lock()
-	err = os.Rename(tmpName, p)
-	c.mu.Unlock()
-	if err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	c.approxSize.Add(int64(len(data)))
-	if c.approxSize.Load() > c.maxBytes {
-		c.evictLRU()
-	}
-	return nil
-}
-
-// HasChunk reports whether a specific chunk is cached.
-func (c *DiskCache) HasChunk(s3Key string, index int64) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, err := os.Stat(c.chunkPath(s3Key, index))
-	return err == nil
-}
-
 type cacheEntry struct {
 	path    string
 	size    int64
@@ -344,9 +319,9 @@ type cacheEntry struct {
 
 // evictLRU removes oldest entries until total size is under a low-water mark
 // below maxBytes. Entries are collected at the S3 key level (prefix/uuid) so
-// that both whole-file caches and chunk directories are evicted as complete
-// units. A single eviction runs at a time: concurrent Put/PutChunk callers that
-// also cross the threshold skip launching a redundant full-tree rescan.
+// that a directory found there is evicted as one unit. A single eviction runs at
+// a time: concurrent Put callers that also cross the threshold skip launching a
+// redundant full-tree rescan.
 func (c *DiskCache) evictLRU() {
 	if !c.evicting.CompareAndSwap(false, true) {
 		return // another eviction is already scanning/deleting
@@ -372,7 +347,8 @@ func (c *DiskCache) evictLRU() {
 			var size int64
 			var modTime int64
 			if key.IsDir() {
-				// Chunk directory: sum up chunk sizes
+				// A directory at key level: sum what is under it and treat the
+				// subtree as one entry.
 				filepath.WalkDir(keyPath, func(path string, d os.DirEntry, err error) error {
 					if err != nil || d.IsDir() {
 						return nil

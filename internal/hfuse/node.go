@@ -12,6 +12,8 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/milan/hamstor/internal/crypto"
 	"github.com/milan/hamstor/internal/db"
+	"github.com/milan/hamstor/internal/media"
+	"github.com/milan/hamstor/internal/ratelimit"
 	"github.com/milan/hamstor/internal/thumb"
 	"github.com/milan/hamstor/internal/volume"
 	sqlite "modernc.org/sqlite"
@@ -435,24 +437,31 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		}
 	}
 
-	// Streaming mode for multimedia is OFF, deliberately, until it can fetch per
-	// block.
+	// Streaming mode: serve a media file block by block, rate-limited, instead of
+	// attaching a store the length of the file and faulting the whole thing into
+	// it. See readStreaming.
 	//
-	// It exists to serve a movie by ranging into the one object that holds it,
-	// rate-limited, without downloading the whole thing first. A file written as
-	// blocks has no such object, and h.s3Key is empty for every file the write
-	// path has produced since it switched — so enabling it here sends
-	// DownloadRange for the EMPTY KEY and answers EIO for a perfectly healthy
-	// file. --stream-rate defaults to 5, so every media file on an unencrypted
-	// mount has been unreadable, and nothing caught it because no test ever set
-	// StreamRate.
+	// hasBlocks is a REQUIREMENT, not an optimisation, and it is the condition
+	// that dropping "no encryption" makes load-bearing. Streaming resolves every
+	// block through the blocks table, where no row means a hole — so a media file
+	// stored as a volume needle or a staging file, which has no rows at all,
+	// would be served as silence. Under the old encryption gate the case was
+	// mostly out of reach; without it, any .mp3 or .m4a small enough to be packed
+	// (up to MaxNeedleSize) lands right in it. Those fall through to
+	// ensureLoaded, which reads them whole — they are at most a needle anyway.
 	//
-	// Media now falls through to ensureLoaded, which fetches every block and
-	// serves the file whole: slower to first byte, but correct. Re-enabling it on
-	// blocks also retires the "no streaming under encryption" limitation, since
-	// each block is separately decryptable — both belong to the same change.
-	//
-	// TestStreamingMediaFileReads covers the read either way.
+	// Encryption is no longer an obstacle: every block is its own
+	// [version][nonce][ct+tag], so each object decrypts on its own. That was the
+	// entire reason for the old restriction.
+	if flags&writeFlags == 0 && hasBlocks && media.IsMediaExt(meta.Name) && n.hfs.StreamRate > 0 {
+		handle.streaming = true
+		handle.rateLimiter = ratelimit.New(
+			float64(n.hfs.StreamRate<<20), float64(n.hfs.StreamBuffer<<20))
+		// One block is the smallest unit that can be served — a block object is
+		// one AES-GCM message, so there is no ranging inside it — which means a
+		// --stream-buffer below 8 MiB cannot be honoured and rounds up to it.
+		handle.streamBlocksCap = max(1, n.hfs.StreamBuffer<<20/db.BlockSize)
+	}
 
 	ok = true
 	return handle, fuse.FOPEN_DIRECT_IO, 0

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -188,12 +189,34 @@ func TestOpenNotExist(t *testing.T) {
 	}
 }
 
-// TestChunkDirIsNotAWholeFile: PutChunk leaves a directory at the key's path,
-// and os.Open succeeds on a directory. Reporting that as a cached file makes
-// callers allocate the directory's stat size, get EISDIR from ReadAt, and — in
-// hfuse's write preload, which discards that error — serve a few KB of zeros as
-// the file's contents.
-func TestChunkDirIsNotAWholeFile(t *testing.T) {
+// seedChunkDir writes a chunk directory the way a pre-block version of hamstor
+// left one behind: a directory at the key's own path holding chunk-%06d files.
+// Nothing in the current binary can create one, and that is the point — a
+// --cache-dir is deliberately kept across reinstalls, so these arrive from the
+// past rather than from anything a test could do through the API.
+func seedChunkDir(t *testing.T, dir, key string, chunks ...[]byte) {
+	t.Helper()
+	p := filepath.Join(dir, key)
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, data := range chunks {
+		name := filepath.Join(p, fmt.Sprintf("chunk-%06d", i))
+		if err := os.WriteFile(name, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestInheritedChunkDirIsNotAWholeFile: os.Open succeeds on a directory.
+// Reporting one as a cached file makes callers allocate its stat size, get
+// EISDIR from ReadAt, and — in hfuse's write preload, which discards that
+// error — serve a few KB of zeros as the file's contents.
+//
+// New's sweep normally removes these, so the guard covers a directory that
+// turns up at a key's path any other way: a cache directory added after start,
+// or one seeded between New and the lookup.
+func TestInheritedChunkDirIsNotAWholeFile(t *testing.T) {
 	dir := t.TempDir()
 	c, err := New(dir, 1<<30)
 	if err != nil {
@@ -201,17 +224,66 @@ func TestChunkDirIsNotAWholeFile(t *testing.T) {
 	}
 
 	key := "ee/ee000000-0000-0000-0000-000000000003"
-	if err := c.PutChunk(key, 0, []byte("chunk zero")); err != nil {
+	seedChunkDir(t, dir, key, []byte("chunk zero"))
+
+	if c.Has(key) {
+		t.Fatal("directory at a key's path reported as a cached whole file")
+	}
+	if _, err := c.Open(key); !os.IsNotExist(err) {
+		t.Fatalf("Open on a directory: got %v, want os.ErrNotExist", err)
+	}
+}
+
+// TestNewSweepsInheritedChunkDirs: the chunk directories an older version left
+// are referenced by nothing — every key a live row names is a fresh UUID — but
+// they count against --cache-size and evictLRU only reclaims them once the
+// cache is full enough to evict at all. New clears them during the walk it
+// already does.
+//
+// The control entries matter more than the chunk directory: the sweep decides
+// by file name (chunk-*), not by shape, and a shape test ("a directory two
+// levels down") would delete volobj/{prefix}, i.e. the whole volume cache.
+func TestNewSweepsInheritedChunkDirs(t *testing.T) {
+	dir := t.TempDir()
+
+	seedChunkDir(t, dir, "aa/aa000000-0000-0000-0000-00000000000a",
+		bytes.Repeat([]byte("x"), 100), bytes.Repeat([]byte("y"), 200))
+
+	live := map[string][]byte{
+		"bb/bb000000-0000-0000-0000-00000000000b":        []byte("a block"),
+		"volobj/cc/cc000000-0000-0000-0000-00000000000c": []byte("a whole volume"),
+	}
+	var liveBytes int64
+	for key, data := range live {
+		p := filepath.Join(dir, key)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		liveBytes += int64(len(data))
+	}
+
+	c, err := New(dir, 1<<30)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	if c.Has(key) {
-		t.Fatal("chunk directory reported as a cached whole file")
+	stale := filepath.Join(dir, "aa/aa000000-0000-0000-0000-00000000000a")
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale chunk directory survived New: %v", err)
 	}
-	if _, err := c.Open(key); !os.IsNotExist(err) {
-		t.Fatalf("Open on a chunk directory: got %v, want os.ErrNotExist", err)
+	for key := range live {
+		if !c.Has(key) {
+			t.Fatalf("New removed a live cache entry: %s", key)
+		}
 	}
-	if !c.HasChunk(key, 0) {
-		t.Fatal("the chunk itself should still be cached")
+	if total, count := c.Size(); total != liveBytes || count != len(live) {
+		t.Fatalf("after sweep Size() = %d bytes / %d entries, want %d / %d",
+			total, count, liveBytes, len(live))
+	}
+	if got := c.approxSize.Load(); got != liveBytes {
+		t.Fatalf("approxSize counts swept bytes: got %d, want %d", got, liveBytes)
 	}
 }
