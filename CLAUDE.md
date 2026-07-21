@@ -33,6 +33,8 @@ Build embeds S3 credentials and passphrase via ldflags from `.env` (see `.env.ex
 
 Tests requiring S3 (upload, download, GC, range reads) need credentials from `.env.test` (`source .env.test` before `go test`) and a reachable S3 endpoint — by default a local Garage on `http://localhost:3900` with the `hamstor` bucket. `testutil.RequireS3` probes both and calls `t.Skip` when either is missing, so an unconfigured checkout skips those tests in milliseconds instead of failing after ~30s of SDK retries.
 
+**Every line of `.env.test` must start with `export`** (see `.env.test.example`). `testutil.RequireS3` reads the values with `os.Getenv`, so a plain `KEY=value` file sets shell variables that `go test` never sees: every S3 test skips and the run still prints `ok`. A green suite is therefore not by itself evidence the S3 tests ran — check for `SKIP`, or that the package took seconds rather than milliseconds. This is why `.env` is different: it is `include`d by the Makefile, not sourced, and must stay unprefixed.
+
 ## Architecture
 
 **Data flow:** Write → memory buffer or spill file → async S3 upload on Flush → SQLite metadata commit → old S3 key deleted if update.
