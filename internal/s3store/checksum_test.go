@@ -6,9 +6,13 @@ package s3store
 import (
 	"bytes"
 	"context"
+	"regexp"
+	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/milan/hamstor/internal/testutil"
 )
 
@@ -34,6 +38,38 @@ func forceMultipartStore(t *testing.T) (*Store, int64) {
 	})
 	return store, partSize
 }
+
+// requireMultipart fails unless key really was stored as a multipart object.
+//
+// This is the enforcement behind forceMultipartStore's comment. Pinning the part
+// size is necessary but not sufficient: the payload has to stay over it too, and
+// either could drift. S3 reports a multipart object's ETag as "<hex>-<parts>",
+// so the suffix is a direct statement from the server about how the object was
+// assembled — not an inference from our own configuration.
+//
+// Without this, a change that made these tests single-PUT would leave them
+// green while testing nothing, and the CRC32 trap they exist for would be
+// unguarded until someone hit it again.
+func requireMultipart(t *testing.T, store *Store, key string) {
+	t.Helper()
+	head, err := store.client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String(store.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("head %s: %v", key, err)
+	}
+	etag := strings.Trim(aws.ToString(head.ETag), `"`)
+	if !multipartETag.MatchString(etag) {
+		t.Fatalf("object %s has ETag %q, which is not a multipart ETag: this test is "+
+			"no longer exercising multipart, so it proves nothing about the CRC32 trap",
+			key, etag)
+	}
+}
+
+// multipartETag matches the "-<part count>" suffix S3 appends for objects
+// assembled from multiple parts.
+var multipartETag = regexp.MustCompile(`-\d+$`)
 
 // TestDownloadWholeMultipartObject is the regression test for the CRC32 trap.
 //
@@ -61,6 +97,7 @@ func TestDownloadWholeMultipartObject(t *testing.T) {
 		t.Fatalf("upload %d bytes: %v", len(data), err)
 	}
 	t.Cleanup(func() { store.Delete(context.Background(), key) })
+	requireMultipart(t, store, key)
 
 	got, err := store.Download(ctx, key)
 	if err != nil {
@@ -90,6 +127,7 @@ func TestDownloadRangeOfMultipartObject(t *testing.T) {
 		t.Fatalf("upload: %v", err)
 	}
 	t.Cleanup(func() { store.Delete(context.Background(), key) })
+	requireMultipart(t, store, key)
 
 	// Straddle the part boundary, where a composite-checksum bug would show up.
 	off := partSize - 512

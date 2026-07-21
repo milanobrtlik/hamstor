@@ -21,7 +21,37 @@ const (
 	maxRetries      = 3
 	retryBaseWait   = 500 * time.Millisecond
 	MaxDownloadSize = 2 << 30 // 2 GB — safety limit for in-memory downloads
+
+	// UploadPartSize is the transfer manager's part size. It is deliberately
+	// twice the 8 MiB block size of the block layout, so that a single block is
+	// always one PutObject and no path in hamstor can produce a multipart
+	// object. See claudedocs/block-layout-design.md, D1.
+	//
+	// That is a structural property, not a heuristic: the SDK does one
+	// nextReader() and takes the single-part path when it returns io.EOF, which
+	// it does exactly when the remaining bytes fit in one part
+	// (manager/upload.go:391, :472). So size <= PartSize implies one PUT.
+	//
+	// Raising it costs no memory as long as every request body implements
+	// io.ReaderAt — see ReaderAtSeeker.
+	UploadPartSize = 16 << 20
 )
+
+// ReaderAtSeeker is what the SDK's transfer manager needs from a request body to
+// stream it without buffering. It mirrors the manager's own readerAtSeeker
+// (manager/upload.go:908), which is unexported there.
+//
+// This is a requirement, not a coincidence. For a body of this shape nextReader
+// hands out an io.SectionReader and allocates nothing; for anything less it
+// falls into the branch that fills a buffer from the pool
+// (manager/upload.go:503), which means Concurrency+1 = 6 slices of
+// UploadPartSize per upload. With UploadSem allowing 32 concurrent uploads
+// against debug.SetMemoryLimit(150 << 20), that kills the mount immediately.
+// Hence the parameter type on UploadReader: the compiler holds the invariant.
+type ReaderAtSeeker interface {
+	io.ReadSeeker
+	io.ReaderAt
+}
 
 type Store struct {
 	client   *s3.Client
@@ -87,9 +117,11 @@ func New(ctx context.Context, bucket, endpoint, accessKey, secretKey, region str
 
 	client := s3.NewFromConfig(cfg, opts...)
 	return &Store{
-		client:   client,
-		uploader: manager.NewUploader(client),
-		bucket:   bucket,
+		client: client,
+		uploader: manager.NewUploader(client, func(u *manager.Uploader) {
+			u.PartSize = UploadPartSize
+		}),
+		bucket: bucket,
 	}, nil
 }
 
@@ -138,8 +170,12 @@ func (s *Store) Upload(ctx context.Context, key string, data []byte) error {
 }
 
 // UploadReader uploads data from a reader. The S3 upload manager handles
-// multipart uploads automatically for large files.
-func (s *Store) UploadReader(ctx context.Context, key string, r io.ReadSeeker, size int64) error {
+// multipart uploads automatically for large files — though with UploadPartSize
+// set as it is, nothing hamstor writes today should reach that path.
+//
+// The parameter is a ReaderAtSeeker rather than an io.ReadSeeker on purpose: it
+// is what keeps the body out of the SDK's buffering branch. See ReaderAtSeeker.
+func (s *Store) UploadReader(ctx context.Context, key string, r ReaderAtSeeker, size int64) error {
 	return retry(ctx, "upload "+key, func() error {
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("s3store: seek before upload %s: %w", key, err)
