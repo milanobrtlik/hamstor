@@ -392,12 +392,20 @@ s odkazem na D1 — jediná úmyslná duplikace té hodnoty.
 
 ### `blocks.size` není délka souboru
 
-`blocks.size` je **délka uloženého objektu**, tedy read bound pro ten konkrétní objekt.
-Živý rozsah bloku je `min(blockSize, inodes.size - b*blockSize)` a ty dvě věci se běžně
-liší: `truncate()` na cestě bez otevřeného write handle zmenší `inodes.size`, ale poslední
-blok se nepřepisuje (stejně jako se dnes nepřepisuje celý objekt — proto existuje clamp
-v `readLoaded`, `handle.go:503-515`). **Odvozovat délku souboru ze `SUM(blocks.size)` je
-nová verze staré chyby.** `inodes.size` (a za běhu `inodeWrite.size`) je jediná autorita.
+`blocks.size` je **kolik plaintextových bajtů bloku patří do souboru**. Za tou hranicí
+blok čte nuly a uložený objekt klidně může být delší: zmenšení, které řízne doprostřed
+bloku, objekt nepřepisuje, jen zkrátí tohle číslo. **Odvozovat délku souboru ze
+`SUM(blocks.size)` je nová verze staré chyby.** `inodes.size` (a za běhu `inodeWrite.size`)
+je jediná autorita.
+
+> **Opraveno v Kroku 5.** Původně tu stálo, že `blocks.size` je *délka uloženého objektu*
+> a že rozdíl proti živému rozsahu řeší clamp v `readLoaded`. To je pravda jen dokud soubor
+> zůstane krátký. Jakmile se zvětší zpátky, clamp na `inodes.size` ty bajty zase pustí
+> dovnitř a servíruje se starý ocas — a je to **přesně případ, který dokument sám naměřil**
+> (1 048 560 B na 1MiB souboru). Mazání bloků za koncem, které Krok 5 předepisuje, na to
+> nesahá: 1MiB soubor má jediný řádek, takže za koncem není co smazat. Řeší to
+> `clampLastBlockSize` v `db`, volaná z `CommitBlocks` i `SetAttr`, a dvojitý clamp ve
+> `fetchBlock`/`faultBlock`.
 
 **Nezaměňovat se dvěma věcmi, které se sem podobají:**
 
@@ -773,9 +781,24 @@ výhradně na data, která nikdo jiný nezná. `uploadAttempt` zůstává neměn
 > **Stav po Kroku 3:** kopie zavedená není a zatím být nemusí. Dokud je čtení hloupé
 > (`loaded = false` po flushi, příští přístup načítá znovu z bloků), spill file živá
 > materializace *není* a odevzdání vlastnictví drží pravidlo stejně jako dnes. Goroutina
-> tedy sahá na soubor, který stav pustil z ruky. **Krok 5 tenhle předpoklad ruší** — jakmile
-> spill file přežívá flush jako řídká materializace, musí se kopie zavést, jinak nastane
-> přesně ta směs dvou verzí bloku. Viz poznámka 2 u Kroku 3 v sekci 5.
+> tedy sahá na soubor, který stav pustil z ruky.
+>
+> **Rozhodnutí Kroku 5: kopie se nezavádí, protože se nepřebírá premisa.** Požadavek D4 je
+> podmíněný — platí *„jakmile spill file přežívá flush jako řídká materializace"*. Krok 5
+> tu podmínku nesplnil schválně: `Flush` dál odevzdá (řídký) spill file goroutině a stav se
+> resetuje (`loaded=false`, `presentBlocks=nil`, `blockBacked=false`), takže goroutina zase
+> sahá na data, ke kterým se nikdo jiný nedostane, a pravidlo drží **týmž ověřeným
+> mechanismem**, ne novým. Důvod je robustnost: kopie by přidala dva invarianty, jejichž
+> porušení je tiché — „kopie špinavých bloků je úplná" (nahraje se blok s nulami) a
+> „`presentBlocks` po commitu pořád popisuje pravdu o bajtech, jejichž klíče se právě
+> vyměnily". Doporučená optimalizace „přesun místo kopie" by navíc znamenala dvě cesty
+> místo jedné.
+>
+> Cena: po `fsync` uprostřed zápisu se materializace zahodí a příští částečný zápis blok
+> refaultuje — z disk cache, kterou `cacheBlock` právě naplnil. `Flush` přichází skoro vždy
+> na `close()`, kdy handle stejně zaniká, takže dopad je omezený na fsync-heavy workloady.
+> Kdyby se to někdy stalo měřitelným problémem, kopie z D4 je ta správná odpověď — ale až
+> potom, a s testem, který ten rozdíl ukáže.
 >
 > Praktický důsledek pro Krok 5: uploadovaný blok se nešifrovaného mountu posílá jako
 > `io.NewSectionReader(snapshot, start, extent)`, ne jako `[]byte`. Drží to dvě věci
@@ -1194,6 +1217,15 @@ jsou v inventuře vyjmenované.
 ---
 
 **Krok 5 — líná materializace: tady zmizí full download a strop 2 GB.**
+> ✅ **HOTOVO 2026-07-21.** `presentBlocks`/`blockBacked`, `attachBlocks`/`faultBlock`/
+> `materializeRange`/`materializeForWrite`, `db.BlockAt`, `SetAttr` vracející osiřelé klíče,
+> `clampLastBlockSize`, `MaxDownloadSize` = `UploadPartSize`. Testy:
+> `internal/hfuse/lazy_test.go` (14 funkcí) a dvě v `internal/db/blocks_test.go`.
+> Změřeno na živém mountu: append do 100MB souboru se studenou cache **21 ms a 1 stažený
+> blok** místo 100 MB; `truncate -s 5T` 2,3 ms bez jediného řádku; zápis 4 B na offsetu
+> 4 TB vyrobí 1 blok. **Čtyři věci vyšly jinak, než tenhle dokument předpokládal — jsou
+> zapsané níž.** Nenasazeno samostatně.
+
 `presentBlocks`, per-blok fault v `readLoaded`, řídký spill file. Write preload v `Open`
 (`node.go:332-361`) přestane cokoli stahovat. `MaxDownloadSize` se překlopí na sanity
 check bloku.
@@ -1223,6 +1255,84 @@ nuly nebo `EIO`, ne tiše starou verzi.
 čtení díry a `truncate` nahoru na velikost, kterou by nešlo materializovat. K `SetAttr`
 patří vlastní regresní test: zmenšit **bez otevřeného handle**, zvětšit zpátky a ověřit,
 že se čtou nuly — ne starý ocas.
+
+#### Konzumenti předpokladu „backing store obsahuje celý soubor" (pro Kroky 6–7)
+
+Každý krok téhle řady tiše zneplatnil předpoklad, který compiler nevidí: Krok 3 nechal
+`h.s3Key` vždycky prázdný (přišlo se na to až po EIO na každé `.mp4`), Krok 4 udělal
+`st.cacheFile` nedosažitelným. Krok 5 ruší **„spill file / `buf` obsahuje celý soubor"**.
+Inventura, se kterou se pracovalo:
+
+| konzument | jak dopadl |
+|---|---|
+| `readLoaded` | faultuje čtený rozsah (`materializeRange`) |
+| `Write` částečný přepis bloku | **faultuje před zápisem** (`materializeForWrite`); jediná tichá cesta v celém kroku |
+| `flushAsync` větev `converting` | přepsána, viz nález 1 níž |
+| `flushStaged` bere `st.buf` jako celý soubor | drží `canStage = !hasBlocks`; kryje assert |
+| `scheduleThumb` | `wholeFileSnapshot`, viz rozhodnutí níž |
+| `retainPendingUpload` | beze změny — `wholeFileInOneBlock` ⇒ blok je dirty ⇒ přítomný |
+| `cacheBlock` | beze změny — commitnutý blok je dirty ⇒ přítomný |
+| `spillToDisk` → `spillState` | přesun store; **nesmí resetovat `presentBlocks`** |
+| `truncateWriteState` | zmenšení zahodí značky za koncem; zvětšení nad `spillThreshold` přejde na řídký spill |
+| clamp na `meta.Size` v `Open` | totéž (`dropBlocksPast`) |
+| větev `O_TRUNC` v `Open` | čistí `presentBlocks`, `blockBacked`, `wholeLoaded` |
+| `logicalSize()` | platí díky invariantu „store je přesně `st.size` dlouhý", který drží `attachBlocks` |
+| `O_APPEND` větev | kryje pravidlo pro `Write` |
+| `ensureLoaded` fallback „prázdný soubor" | přepsán, viz nález 2 |
+| `db.SetAttr` | maže bloky za koncem a vrací klíče |
+
+Navíc dvě čistě výkonnostní: `Open` i `openPreloadStaged` se ptaly `BlocksForInode` jen na
+„má bloky?" — u 4TB souboru 524 288 řádků na každé otevření. Nově `HasBlocks`.
+
+**Invariant, který krok zavádí: `dirtyBlocks ⊆ presentBlocks`.** Drží ho pořadí ve `Write`
+(fault → zápis → značka) a **jistí runtime assert ve `Flush`**: blok, který má jít nahoru
+a nebyl materializovaný, dá `EIO` a otráví stav místo aby nahrál nuly. Ten assert je tam
+schválně proti pravidlu „drží to konstrukce" — přesně tenhle druh předpokladu už třikrát
+tiše padl.
+
+#### Rozhodnutí: náhledy u částečné materializace se negenerují
+
+Zdrojem náhledu smí být jen snapshot pokrývající celý soubor (`wholeFileSnapshot`, dřív
+neformulovaná podmínka ve `flushAsync`). Alternativa „dotáhnout chybějící bloky" by
+znamenala stáhnout celý 2GB PSD kvůli 256px náhledu — přesně ten full download, který
+tenhle krok ruší — a udělat to v goroutině, která nesmí na `st.mu`. Cena volby je
+**zastaralý** náhled místo náhledu s dírami; freedesktop mtime ho nechá prohlížeči
+přegenerovat čtením přes mount, kde je soubor kompletní. Zastaralý a sám se opravující
+poráží platně vypadající a trvale špatný.
+
+#### Co Krok 5 zjistil navíc (zapsáno po implementaci)
+
+1. **`converting` nesmí vycházet z `inodes.size`, protože `dd seek=` volá `ftruncate`
+   dřív než první zápis.** Dokument podmínku `Size > 0` zavedl s tím, že „nový soubor
+   konverzí není", jenže nový soubor má velikost nastavenou ještě před prvním `Write`em —
+   tak pracuje `dd`, `truncate(1)` i každý předalokující stahovač. Naměřeno na živém
+   mountu: `dd bs=1M seek=4096 count=1` na novém souboru commitlo **513 řádků a nahrálo
+   4 GiB nul** za 1 KB dat. Test `TestSparseWriteMaterializesOneBlock` to nechytil, protože
+   zapisuje na offset **bez** toho `ftruncate` — fixture neodpovídala tomu, co dělají
+   skutečné nástroje. Nově rozhoduje `inodeWrite.wholeLoaded`, tedy *jak se store naplnil*,
+   ne co říká velikost. Hlídá `TestSparseWriteAfterFtruncateMaterializesOneBlock`.
+2. **„Velikost bez dat" je řídký soubor, ne chybějící staging.** Predikát
+   „commitnutý, bez needle, bez bloků" bral `truncate -s 4G` jako staged soubor, jehož
+   staging file zmizel: `readStaged` protočil pět pokusů a vrátil `EIO` — pro obyčejné
+   `dd seek=`. Boot k tomu hlásil `WARNING: unreadable: sparse.bin (4294967296 bytes)`, což
+   zabíjí signál pro případ, kdy je to pravda. Rozlišuje to velikost: `flushStaged` se dá
+   dosáhnout jen do `MaxNeedleSize`, takže větší soubor **nikdy staged nebyl**. Konstanta
+   se proto přestěhovala do `db` (`volume.MaxNeedleSize` je nově alias — `volume` importuje
+   `db`, obráceně to nejde) a je součástí `noBlockRows`.
+3. **Flush nového souboru přepisoval velikost nastavenou `ftruncate`em.** Kernel posílá
+   `FLUSH` hned po `CREATE`; ta větev commitovala `CommitInode(id, 0)`, takže
+   `truncate -s 5T newfile` skončil jako 0bajtový soubor. Commituje se nově velikost, kterou
+   inode skutečně má. Bylo to tam od Kroku 4, jen to nikdo nezkusil.
+4. **Zmenšení musí zkrátit i poslední přeživší blok**, ne jen smazat bloky za koncem —
+   viz opravená sekce 2. Předepsaná oprava (`DELETE ... WHERE block_index > lastLive`)
+   případ, který dokument naměřil, neřeší vůbec.
+
+*Co zůstává otevřené pro Krok 6:* sekvenční čtení velkého souboru materializuje celý soubor
+do spill adresáře. Není to regrese (`ensureLoaded` to dělalo taky, jen navíc předem), ale
+omezené čtecí cesty patří Kroku 6 — `readChunked`/`readStreaming` jsou přesně ta místa,
+kde má čtení běžet s ohraničenou stopou. A u souborů **do** `MaxNeedleSize` zůstává
+„staged" a „samé díry" nerozlišitelné; prakticky to nevadí (staged soubor se přepíše celý),
+ale je to poslední kout, kde velikost o obsahu nic neříká.
 
 ---
 
