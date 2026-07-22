@@ -227,6 +227,63 @@ func TestFailedOverwriteAfterTruncateRetainsTheSet(t *testing.T) {
 	}
 }
 
+// TestCancelledUploadRetainsTheSet is the shutdown path in miniature.
+//
+// Waiting for in-flight uploads at shutdown is unbounded — at the 4-6 MB/s this
+// mount gets to B2, one large file is minutes — so shutdown cancels them
+// instead. That is only safe because cancelling lands in the same failure path a
+// dead S3 endpoint does: the bytes are retained under pending/, the inode goes
+// back to 'pending', and the next start finishes the upload. If cancellation
+// ever stopped reaching retention, shutdown would go back to being a silent way
+// to lose a copy — with the difference that it would happen on every reboot
+// rather than on a rare outage.
+func TestCancelledUploadRetainsTheSet(t *testing.T) {
+	hfs, dbPath := setupTest(t)
+	hfs.SpillDir = t.TempDir()
+	pendingDir := filepath.Join(filepath.Dir(dbPath), "pending")
+	if err := os.MkdirAll(pendingDir, 0o755); err != nil {
+		t.Fatalf("pending dir: %v", err)
+	}
+	hfs.PendingDir = pendingDir
+
+	uploadCtx, cancelUploads := context.WithCancel(context.Background())
+	hfs.UploadCtx = uploadCtx
+	cancelUploads() // shutdown, before this flush ever reaches the network
+
+	content := bytes.Repeat([]byte("s"), db.BlockSize+128)
+	id := mustInsert(t, hfs, "interrupted.bin")
+	th := NewTestHandle(hfs, id, true)
+	if errno := th.TestWriteAt(content, 0); errno != 0 {
+		t.Fatalf("write: %v", errno)
+	}
+	th.TestFlush()
+	th.WaitUpload()
+	th.TestRelease()
+
+	if !hasRetainedData(pendingDir, id) {
+		t.Fatal("a cancelled upload retained nothing: every shutdown would drop the write it interrupted")
+	}
+	set, err := readPendingSet(pendingSetPath(pendingDir, id))
+	if err != nil {
+		t.Fatalf("retained set is unreadable, so recovery will refuse it: %v", err)
+	}
+	if set.FileSize != int64(len(content)) {
+		t.Errorf("retained file size %d, want %d", set.FileSize, len(content))
+	}
+	meta, err := hfs.DB.GetInode(id)
+	if err != nil {
+		t.Fatalf("get inode: %v", err)
+	}
+	if meta.Status != "pending" {
+		t.Errorf("inode status %q, want pending — RecoverPending would drop the set", meta.Status)
+	}
+
+	// Nothing reached S3, so nothing should be referenced.
+	if has, hErr := hfs.DB.HasBlocks(id); hErr != nil || has {
+		t.Errorf("a cancelled upload committed blocks (has=%v err=%v)", has, hErr)
+	}
+}
+
 // TestRecoverKeepsSetForCommittedInodeWithoutStorage is the other end of the
 // same format, and it has to move with it: RecoverPending drops a set whose
 // inode is already 'committed', on the reasoning that a later write made it
