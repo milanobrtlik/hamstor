@@ -62,9 +62,14 @@ var (
 	maxBatchEntries = 16384
 )
 
-// closeTimeout is the maximum time Close() will wait for the final
-// scanAndSeal before cancelling in-flight S3 operations.
-const closeTimeout = 30 * time.Second
+// DefaultCloseTimeout is how long Close() waits for the final scanAndSeal before
+// cancelling in-flight S3 operations, when the caller sets no budget of its own.
+//
+// Override it via Builder.CloseTimeout rather than raising it: the daemon gives
+// its whole shutdown one budget (--shutdown-timeout), and a second, larger one
+// hidden here would silently add to it — which is how a shutdown that is
+// supposed to fit inside systemd's stop timeout comes to exceed it.
+const DefaultCloseTimeout = 30 * time.Second
 
 // Builder scans a staging directory for small files and packs them into
 // volume S3 objects. Files are written to staging by Flush() and committed
@@ -81,6 +86,11 @@ type Builder struct {
 	wg         sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
+
+	// CloseTimeout bounds the final drain in Close(). Zero means
+	// DefaultCloseTimeout. Set it before Close is called; nothing reads it
+	// otherwise.
+	CloseTimeout time.Duration
 }
 
 // NewBuilder creates a volume builder that scans stagingDir for files to pack.
@@ -298,7 +308,11 @@ func (b *Builder) FlushInode(inodeID int64) error {
 // Waits up to closeTimeout for in-flight S3 operations to finish.
 func (b *Builder) Close() error {
 	close(b.done)
-	timer := time.AfterFunc(closeTimeout, func() {
+	budget := b.CloseTimeout
+	if budget <= 0 {
+		budget = DefaultCloseTimeout
+	}
+	timer := time.AfterFunc(budget, func() {
 		b.cancel()
 	})
 	b.wg.Wait()

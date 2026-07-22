@@ -46,8 +46,27 @@ type HamstorFS struct {
 	// If empty, failed uploads are lost as before.
 	PendingDir string
 
-	// InflightUploads tracks async upload goroutines for graceful shutdown.
+	// InflightUploads tracks async upload goroutines for graceful shutdown, and
+	// InflightCount is the same population as a readable number — a WaitGroup
+	// cannot be asked how many it is waiting for, and shutdown wants to say how
+	// many uploads it is about to cancel.
 	InflightUploads sync.WaitGroup
+	InflightCount   atomic.Int64
+
+	// UploadCtx is cancelled at shutdown to stop in-flight uploads. nil means
+	// "never cancelled", which is what tests and the subcommands want.
+	//
+	// An upload deliberately does NOT inherit the FUSE request's context — it
+	// outlives the close(2) that started it — so it needs one of its own to be
+	// interruptible at all. Cancelling it is what makes shutdown bounded: waiting
+	// for the uploads instead is unbounded, and at 4-6 MB/s to B2 a single large
+	// file is minutes, which is how the daemon came to be SIGABRTed by systemd
+	// mid-upload with nothing retained.
+	//
+	// Cancelling is safe precisely because it lands in the same failure path as a
+	// dead endpoint: the bytes are retained under PendingDir and RecoverPending
+	// finishes the upload on the next start. See uploadContext.
+	UploadCtx context.Context
 
 	// writeStates holds the per-inode write state shared by every open handle
 	// (see inodeWrite). writeMu guards the map and the reference counts in it,
@@ -156,6 +175,17 @@ func (hfs *HamstorFS) cacheBlock(key string, src *os.File, off, size int64) {
 	if err := hfs.Cache.PutReader(key, io.NewSectionReader(src, off, size)); err != nil {
 		log.Printf("hamstor: cache put block %s: %v", key, err)
 	}
+}
+
+// uploadContext is the context an async upload runs under: UploadCtx when one
+// was wired up, and an uncancellable one otherwise. Keeping the nil case here
+// rather than at each use site means a bare HamstorFS literal — every test, and
+// the subcommands — still works without knowing about shutdown.
+func (hfs *HamstorFS) uploadContext() context.Context {
+	if hfs.UploadCtx != nil {
+		return hfs.UploadCtx
+	}
+	return context.Background()
 }
 
 // applyInFlightSize overrides attr.Size with what the shared write state knows,

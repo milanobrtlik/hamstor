@@ -1346,9 +1346,11 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 	// pre-upload key from the DB and writes on top of it.
 	hfs.retainUpload(st)
 	hfs.InflightUploads.Add(1)
+	hfs.InflightCount.Add(1)
 
 	go func() {
 		defer hfs.InflightUploads.Done()
+		defer hfs.InflightCount.Add(-1)
 		defer hfs.releaseUpload(inodeID, st)
 		// Closing att.done releases every waiter, so it must come after both the
 		// commit and the last write to att.err. Defers run LIFO, so this line
@@ -1368,7 +1370,7 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			}
 		}()
 
-		uploadCtx := context.Background()
+		uploadCtx := hfs.uploadContext()
 
 		// snapPath is the snapshot file: it holds the plaintext of exactly what
 		// we are uploading, and nobody else knows about it. That is what keeps
@@ -1432,9 +1434,22 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			// Nothing is committed: a file half old and half new is exactly the
 			// silent corruption this layout was chosen to avoid. Drop whatever did
 			// land, so the bucket is not left with objects nothing references.
-			for _, key := range uploaded {
-				if delErr := hfs.Store.Delete(uploadCtx, key); delErr != nil {
-					log.Printf("hamstor: cleanup after failed flush, delete %s: %v", key, delErr)
+			//
+			// Unless this is the shutdown cancelling us, in which case every Delete
+			// would fail on the same dead context and only slow the exit down. The
+			// objects are not in the blocks table, so GC phase 1 removes them once
+			// gcGracePeriod passes — which is what pendingMeta already relies on for
+			// the blocks a failed flush had managed to upload.
+			if uploadCtx.Err() != nil {
+				if len(uploaded) > 0 {
+					log.Printf("hamstor: shutdown cancelled the upload of inode %d, leaving %d object(s) for gc",
+						inodeID, len(uploaded))
+				}
+			} else {
+				for _, key := range uploaded {
+					if delErr := hfs.Store.Delete(uploadCtx, key); delErr != nil {
+						log.Printf("hamstor: cleanup after failed flush, delete %s: %v", key, delErr)
+					}
 				}
 			}
 

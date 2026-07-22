@@ -10,12 +10,16 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/milan/hamstor/internal/cache"
 	"github.com/milan/hamstor/internal/creds"
 	"github.com/milan/hamstor/internal/crypto"
@@ -52,6 +56,7 @@ func main() {
 	volumePacking := flag.Bool("volume-packing", true, "pack small files (<256KB) into volume S3 objects")
 	compactRatio := flag.Float64("compact-ratio", 0.5, "dead space ratio threshold for volume compaction")
 	snapshotInterval := flag.Duration("snapshot-interval", 6*time.Hour, "litestream snapshot interval; lower = faster cold restore, higher = less B2 cost")
+	shutdownTimeout := flag.Duration("shutdown-timeout", 10*time.Second, "budget for the waiting parts of shutdown; retention of interrupted uploads is never cut short")
 	flag.Parse()
 
 	// Collect the subcommand words, parsing flags wherever they appear. Go's
@@ -291,11 +296,19 @@ func main() {
 		}
 	}
 
+	// Uploads outlive the close(2) that starts them, so they cannot inherit a
+	// FUSE request's context. This one exists so shutdown can interrupt them:
+	// waiting instead is unbounded, and a cancelled upload retains its bytes and
+	// is finished by RecoverPending on the next start.
+	uploadCtx, cancelUploads := context.WithCancel(context.Background())
+	defer cancelUploads()
+
 	hfs := &hfuse.HamstorFS{
 		DB: database, Store: store, Mountpoint: *mountpoint,
 		Encryptor: enc, Cache: diskCache,
 		DefaultUid: defaultUid, DefaultGid: defaultGid,
 		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
+		UploadCtx: uploadCtx,
 		UploadSem: make(chan struct{}, 32),
 		// Four block encryptions at once: each holds a block's plaintext and its
 		// sealed copy, so 4 * 2 * 8 MiB = 64 MiB, comfortably inside the 150 MiB
@@ -314,6 +327,9 @@ func main() {
 			log.Printf("hamstor: staging dir: %v (volume packing disabled)", err)
 		} else {
 			hfs.VolumeBuilder = volume.NewBuilder(database, store, stagingDir, diskCache)
+			// One budget for the whole shutdown: the builder's own default would
+			// otherwise add its 30s on top of it.
+			hfs.VolumeBuilder.CloseTimeout = *shutdownTimeout
 			log.Println("hamstor: volume packing enabled (files <256KB packed into volumes)")
 		}
 	} else {
@@ -342,16 +358,49 @@ func main() {
 
 	log.Printf("hamstor %s: mounted on %s", version, *mountpoint)
 
+	// server.Wait() is NOT the main line of control. It used to be, with the
+	// unmount pushed into a goroutine whose error was dropped — and go-fuse's
+	// Unmount gives up after five fusermount attempts inside ~75 ms
+	// (fuse/server.go), which fails whenever anything holds the mount busy. A
+	// shell with its cwd inside is enough, and at machine shutdown that is the
+	// normal case, not an edge one. Wait() then never returned, systemd timed the
+	// stop out and SIGABRTed the daemon mid-upload with nothing retained.
+	served := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		log.Println("hamstor: unmounting...")
-		server.Unmount()
+		server.Wait()
+		close(served)
 	}()
 
-	server.Wait()
+	<-ctx.Done()
+	deadline := time.Now().Add(*shutdownTimeout)
 
-	log.Println("hamstor: waiting for in-flight uploads...")
-	hfs.InflightUploads.Wait()
+	if lazy := releaseMount(server, *mountpoint); lazy {
+		// A lazy detach has already taken the mount out of the namespace, so
+		// nothing can reach the filesystem any more and there is nothing left to
+		// wait for. The connection itself stays up until whoever held it closes
+		// their descriptors, which may be never — waiting on that is what the old
+		// shutdown effectively did.
+		log.Println("hamstor: mount detached; open descriptors drain on their own")
+	} else if !waitClosed(served, time.Until(deadline)) {
+		log.Printf("hamstor: FUSE connection still held after %v, continuing shutdown", *shutdownTimeout)
+	}
+
+	// A short grace, then cancel. An upload seconds from done beats re-sending
+	// it, but waiting for one to finish is unbounded — at the few MB/s a home
+	// uplink gives, one large file is minutes. Cancelling lands in the retention
+	// path, so the bytes survive as a pending set and the next start uploads them.
+	if hfs.InflightCount.Load() > 0 &&
+		!waitGroup(&hfs.InflightUploads, min(uploadGrace, time.Until(deadline))) {
+		log.Printf("hamstor: cancelling %d in-flight upload(s); their bytes are retained for the next start",
+			hfs.InflightCount.Load())
+		cancelUploads()
+		// Deliberately unbounded: what runs now is local-disk retention, and that
+		// is the only thing standing between an interrupted write and losing it.
+		// Cutting it off mid-set would be strictly worse than not starting —
+		// RecoverPending refuses a half-written set, so the time would be spent
+		// and the data lost anyway.
+		hfs.InflightUploads.Wait()
+	}
 
 	if hfs.VolumeBuilder != nil {
 		if err := hfs.VolumeBuilder.Close(); err != nil {
@@ -361,7 +410,7 @@ func main() {
 
 	database.Close()
 	if rep != nil {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), *shutdownTimeout)
 		defer stopCancel()
 		if err := rep.Stop(stopCtx); err != nil {
 			log.Printf("litestream stop: %v", err)
@@ -369,6 +418,85 @@ func main() {
 	}
 
 	log.Println("hamstor: stopped")
+}
+
+// uploadGrace is how long shutdown lets in-flight uploads finish on their own
+// before cancelling them. Short on purpose: it is here to catch the small file
+// that is nearly done, not to wait out a large one. A cancelled upload is re-sent
+// in full on the next start, which costs nothing but time on B2 (Class A
+// requests are free).
+const uploadGrace = 2 * time.Second
+
+// releaseMount detaches the filesystem, and unlike a bare server.Unmount() it
+// cannot leave the daemon holding a mount nobody can get rid of.
+//
+// go-fuse tries fusermount five times over ~75 ms and then returns EBUSY for
+// good — it never retries later, so once anything has held the mount busy at
+// that instant the daemon stays wedged even after the holder goes away
+// (reproduced: the process outlived its own holder and only exited when a lazy
+// unmount was issued by hand).
+//
+// So the fallback is a LAZY detach, which is the right answer for shutdown
+// anyway: it removes the mount from the namespace immediately, so nothing new
+// can enter while open descriptors drain. It is also exactly what the unit file
+// already does at the other end, with `umount -l` in ExecStartPre.
+//
+// Reports whether it had to fall back, because that changes what the caller
+// should do next: after a lazy detach the FUSE connection stays up until the
+// holder closes its descriptors, so waiting for it buys nothing.
+func releaseMount(server *fuse.Server, mountpoint string) (lazy bool) {
+	log.Println("hamstor: unmounting...")
+	err := server.Unmount()
+	if err == nil {
+		return false
+	}
+	log.Printf("hamstor: unmount: %s — detaching lazily",
+		strings.TrimSpace(strings.ReplaceAll(err.Error(), "\n", " ")))
+
+	// MNT_DETACH first: the daemon runs as root under systemd, and this needs no
+	// subprocess. fusermount -uz covers an unprivileged run, where the mount's
+	// owner may unmount it but umount2 is refused.
+	if uErr := syscall.Unmount(mountpoint, syscall.MNT_DETACH); uErr == nil {
+		return true
+	}
+	if out, fErr := exec.Command("fusermount", "-u", "-z", mountpoint).CombinedOutput(); fErr != nil {
+		log.Printf("hamstor: lazy unmount of %s failed: %v: %s", mountpoint, fErr, out)
+	}
+	return true
+}
+
+// waitClosed reports whether c closed within d. A non-positive d still gives it
+// one non-blocking look, so an already-finished wait is never reported as a
+// timeout just because the budget ran out elsewhere.
+func waitClosed(c <-chan struct{}, d time.Duration) bool {
+	if d <= 0 {
+		select {
+		case <-c:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-c:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// waitGroup is waitClosed for a WaitGroup: reports whether it reached zero
+// within d. The goroutine it leaks when it does not is bounded by the number of
+// shutdown phases and dies with the process.
+func waitGroup(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return waitClosed(done, d)
 }
 
 // errLockHeld reports the one failure that actually means a second hamstor is
