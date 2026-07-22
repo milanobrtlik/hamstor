@@ -22,7 +22,23 @@ import (
 )
 
 // spillThreshold is the size at which writes switch from memory to a temp file.
-const spillThreshold = 64 << 20 // 64 MB
+//
+// One block, because that is the unit in which data leaves the process anyway: a
+// flush uploads whole blocks, and an encrypted block is a single GCM message, so
+// holding more than one on the heap buys nothing. The number is set against
+// debug.SetMemoryLimit(150 << 20) in main.go, not picked for roundness — say so
+// here, or the next person who raises it reintroduces the following.
+//
+// It used to be 64 MiB, which is the whole process budget for one file, and the
+// comparisons were `>` rather than `>=`, so a file of exactly 64 MiB never
+// spilled at all. Getting a buffer that large means growing it by append, which
+// is geometric: at the last reallocation the old array and the new one are both
+// live, so one such file transiently needs ~96-128 MiB. Measured on a live
+// encrypted B2 mount: four parallel 64 MiB writes peaked at 313 MB RSS and took
+// 40 s to commit. Nothing errors when that happens — the GC just runs
+// continuously and every upload crawls, which from outside looks like data loss,
+// because close(2) succeeds while stat(2) reports 0 until the commit lands.
+const spillThreshold = db.BlockSize
 
 type HamstorHandle struct {
 	hfs     *HamstorFS
@@ -101,7 +117,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	if h.st.isNew {
 		h.st.buf = []byte{}
 		h.st.loaded = true
-		h.st.size = 0
+		h.st.setSize(0)
 		return 0
 	}
 
@@ -192,7 +208,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 		h.st.buf = data
 		h.st.loaded = true
 		h.st.wholeLoaded = true // a staging file: the next block commit drops it
-		h.st.size = size
+		h.st.setSize(size)
 		h.fileSize = size
 		return 0
 	}
@@ -202,7 +218,7 @@ func (h *HamstorHandle) ensureLoaded(ctx context.Context) syscall.Errno {
 	// that an inode cannot name a whole-file object.
 	h.st.buf = []byte{}
 	h.st.loaded = true
-	h.st.size = meta.Size
+	h.st.setSize(meta.Size)
 	h.fileSize = meta.Size
 	return 0
 }
@@ -238,7 +254,7 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 	h.st.buf = data
 	h.st.loaded = true
 	h.st.wholeLoaded = true // a needle: the next block commit drops it wholesale
-	h.st.size = meta.Size
+	h.st.setSize(meta.Size)
 	return 0
 }
 
@@ -257,7 +273,7 @@ func (h *HamstorHandle) loadFromVolume(ctx context.Context, meta *db.InodeMeta) 
 // index into it by absolute offset. A store shorter than the file would silently
 // truncate; longer, and a flush would commit bytes past the end.
 func (h *HamstorHandle) attachBlocks(size int64) syscall.Errno {
-	if size > spillThreshold {
+	if size >= spillThreshold {
 		f, err := os.CreateTemp(h.hfs.SpillDir, "hamstor-spill-*")
 		if err != nil {
 			log.Printf("hamstor: block spill create for inode %d: %v", h.inodeID, err)
@@ -281,7 +297,7 @@ func (h *HamstorHandle) attachBlocks(size int64) syscall.Errno {
 	h.st.wholeLoaded = false // sparse by construction: blocks arrive one by one
 	h.st.presentBlocks = nil // nothing is materialized yet
 	h.st.loaded = true
-	h.st.size = size
+	h.st.setSize(size)
 	h.fileSize = size
 	return 0
 }
@@ -878,13 +894,13 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		}
 		h.st.dirty = true
 		h.st.markDirtyRange(off, int64(len(data)))
-		h.st.size = h.st.spillSize
+		h.st.setSize(h.st.spillSize)
 		return uint32(len(data)), 0
 	}
 
 	// Check if we should spill to disk
 	end := off + int64(len(data))
-	if end > spillThreshold {
+	if end >= spillThreshold {
 		if err := h.hfs.spillState(h.st); err != nil {
 			log.Printf("hamstor: spill to disk failed: %v", err)
 			return 0, syscall.EIO
@@ -902,7 +918,7 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		}
 		h.st.dirty = true
 		h.st.markDirtyRange(off, int64(len(data)))
-		h.st.size = h.st.spillSize
+		h.st.setSize(h.st.spillSize)
 		return uint32(len(data)), 0
 	}
 
@@ -913,7 +929,7 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 	copy(h.st.buf[off:], data)
 	h.st.dirty = true
 	h.st.markDirtyRange(off, int64(len(data)))
-	h.st.size = int64(len(h.st.buf))
+	h.st.setSize(int64(len(h.st.buf)))
 	return uint32(len(data)), 0
 }
 
@@ -1231,14 +1247,18 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 		return toErrno(err)
 	}
 	fileName := meta.Name
-	// Retention is only worth anything for an inode Cleanup would otherwise
-	// delete, and Cleanup only looks at pending ones. For a committed inode the
-	// previous version survives a failed flush untouched — the needle, staging
-	// file or older blocks are all still there, and only the keys this attempt
-	// uploaded get dropped — while RecoverPending would discard the retained copy
-	// as stale anyway (see cleanup.go). Retaining there would mean re-encrypting
-	// and copying the whole file to disk to build something the next boot deletes.
-	wasPending := meta.Status == "pending"
+	// Retention is worth exactly as much as what a failure would otherwise
+	// destroy, so the question is whether anything survives one — never what the
+	// status says. Where a previous version does survive (a needle, a staging
+	// file, older blocks; only the keys this attempt uploaded get dropped) there
+	// is nothing to keep, and retaining anyway would re-encrypt and copy a whole
+	// file to disk to build something the next boot deletes.
+	//
+	// This used to test meta.Status == "pending", and the case that falls through
+	// the gap is every overwrite: open(O_TRUNC) leaves the inode 'committed' with
+	// no storage at all (see inodeHasStorage), so a failed rewrite dropped the
+	// file's only remaining copy and reported it as survivable.
+	hasPrev := inodeHasStorage(h.hfs.DB, meta)
 
 	// Which blocks must this upload write?
 	//
@@ -1335,6 +1355,12 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 		// running before the two above is what orders it correctly.
 		defer close(att.done)
 		defer func() { <-hfs.UploadSem }()
+		// Hand stat(2) back to the DB, whichever way this ends: on success the
+		// commit below has just recorded the size, and on failure the state is
+		// poisoned and the DB (or the retained set) is the truth. Registered AFTER
+		// close(att.done) so LIFO runs it BEFORE — a waiter that wakes up must not
+		// find a size the commit has already superseded.
+		defer st.clearVisibleSize()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("hamstor: async upload panic: %v", r)
@@ -1394,30 +1420,9 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 					uploadErr = err
 					break
 				}
-			} else {
-				// GCM needs the whole plaintext of what it seals, so an encrypted
-				// block does go through memory — but one block of it, not one
-				// file. Encrypting per block is what makes every object
-				// independently decryptable, and since crypto.Encrypt emits
-				// [version][nonce][ct+tag] on every call, it is also per-block
-				// nonces for free.
-				plain := make([]byte, extent)
-				if _, rerr := uploadFile.ReadAt(plain, start); rerr != nil && rerr != io.EOF {
-					log.Printf("hamstor: snapshot read failed for inode %d block %d: %v", inodeID, idx, rerr)
-					uploadErr = fmt.Errorf("snapshot read block %d: %w", idx, rerr)
-					break
-				}
-				body, encErr := hfs.Encryptor.Encrypt(plain)
-				plain = nil
-				if encErr != nil {
-					log.Printf("hamstor: encrypt failed for inode %d block %d: %v", inodeID, idx, encErr)
-					uploadErr = fmt.Errorf("encrypt block %d: %w", idx, encErr)
-					break
-				}
-				if err := hfs.Store.Upload(uploadCtx, blockKey, body); err != nil {
-					uploadErr = err
-					break
-				}
+			} else if err := hfs.uploadSealedBlock(uploadCtx, blockKey, uploadFile, start, extent, inodeID, idx); err != nil {
+				uploadErr = err
+				break
 			}
 			uploaded = append(uploaded, blockKey)
 			blocks = append(blocks, db.BlockCommit{Index: idx, S3Key: blockKey, Size: extent})
@@ -1440,10 +1445,10 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			//
 			// The whole set is retained, not just the blocks that had yet to go
 			// up. The ones that did upload are not in the blocks table, so GC will
-			// remove them — see pending.go. And only for an inode that was pending
-			// when this upload started: see wasPending above.
+			// remove them — see pending.go. And only when this flush is the file's
+			// only copy: see hasPrev above.
 			retained := false
-			if wasPending && bufSize > 0 {
+			if !hasPrev && bufSize > 0 {
 				retain := make([]pendingBlock, 0, len(indexes))
 				for _, idx := range indexes {
 					extent := min(int64(db.BlockSize), bufSize-idx*db.BlockSize)
@@ -1460,10 +1465,21 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 					uploadFile = nil
 				}
 			}
+			if retained {
+				// The set is the only copy now, so the inode has no durable
+				// storage — which is what 'pending' means. Saying so is what keeps
+				// RecoverPending from discarding the set as stale on the next
+				// start, and it hides the file rather than showing a 0-byte one
+				// the user might delete or overwrite before then. A no-op when the
+				// inode was pending all along, which is the common case.
+				if _, mErr := hfs.DB.MarkPending(inodeID); mErr != nil {
+					log.Printf("hamstor: marking inode %d pending after retention: %v", inodeID, mErr)
+				}
+			}
 			switch {
 			case retained:
 				log.Printf("hamstor: async upload failed for inode %d, data retained for retry on next start: %v", inodeID, uploadErr)
-			case !wasPending:
+			case hasPrev:
 				// Nothing was lost that S3 ever held: the file still reads as its
 				// previous version, which is all close(2) without fsync promised.
 				log.Printf("hamstor: async upload failed for inode %d (%s), previous version kept, this write lost: %v",
@@ -1568,6 +1584,39 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 	}()
 
 	return 0
+}
+
+// uploadSealedBlock encrypts one block out of the snapshot and PUTs it.
+//
+// GCM seals a whole message, so an encrypted block does go through memory — but
+// one block of it, not one file. Encrypting per block is what makes every object
+// independently decryptable, and since crypto.Encrypt emits
+// [version][nonce][ct+tag] on every call, it is per-block nonces for free.
+//
+// It is a function rather than the inline branch it replaced so that the
+// EncryptSem slot is released by a defer. The slot has to cover the PUT as well
+// as the sealing — the sealed copy stays on the heap until the request is
+// done — which means every early return between here and there would otherwise
+// have to give it back by hand, and the one that forgets wedges the mount
+// instead of failing.
+func (hfs *HamstorFS) uploadSealedBlock(ctx context.Context, key string, src *os.File, start, extent, inodeID, idx int64) error {
+	if hfs.EncryptSem != nil {
+		hfs.EncryptSem <- struct{}{}
+		defer func() { <-hfs.EncryptSem }()
+	}
+
+	plain := make([]byte, extent)
+	if _, err := src.ReadAt(plain, start); err != nil && err != io.EOF {
+		log.Printf("hamstor: snapshot read failed for inode %d block %d: %v", inodeID, idx, err)
+		return fmt.Errorf("snapshot read block %d: %w", idx, err)
+	}
+	body, err := hfs.Encryptor.Encrypt(plain)
+	plain = nil
+	if err != nil {
+		log.Printf("hamstor: encrypt failed for inode %d block %d: %v", inodeID, idx, err)
+		return fmt.Errorf("encrypt block %d: %w", idx, err)
+	}
+	return hfs.Store.Upload(ctx, key, body)
 }
 
 // wholeFileSnapshot reports whether a committed block set covers the file

@@ -59,6 +59,25 @@ type HamstorFS struct {
 	// UploadSem limits concurrent async S3 uploads.
 	UploadSem chan struct{}
 
+	// EncryptSem bounds how many block encryptions may be in flight at once.
+	// nil means unbounded, which is right for tests and for the unencrypted
+	// path — that one streams each block straight off the snapshot through
+	// io.NewSectionReader and puts nothing on the heap.
+	//
+	// Encryption cannot: GCM seals a whole message, so an encrypted block holds
+	// its plaintext AND its sealed copy, 2 * db.BlockSize, for as long as the PUT
+	// takes. An UploadSem slot is held across a flush's ENTIRE block loop, so
+	// with its capacity of 32 the ceiling was 512 MiB against
+	// debug.SetMemoryLimit(150 << 20) — reachable by any bulk copy onto an
+	// encrypted mount, and invisible when it happens: nothing errors, the GC just
+	// runs continuously and every upload crawls.
+	//
+	// It is a second, narrower semaphore rather than a smaller UploadSem because
+	// the two bound different things. UploadSem bounds requests in flight, which
+	// is what keeps a bulk copy's throughput up; this bounds bytes on the heap,
+	// and only the encrypted path spends any.
+	EncryptSem chan struct{}
+
 	// ThumbSem limits concurrent thumbnail operations.
 	ThumbSem chan struct{}
 
@@ -137,6 +156,33 @@ func (hfs *HamstorFS) cacheBlock(key string, src *os.File, off, size int64) {
 	if err := hfs.Cache.PutReader(key, io.NewSectionReader(src, off, size)); err != nil {
 		log.Printf("hamstor: cache put block %s: %v", key, err)
 	}
+}
+
+// applyInFlightSize overrides attr.Size with what the shared write state knows,
+// when it knows something the DB does not.
+//
+// A file's size only becomes real at CommitBlocks, and Flush is asynchronous, so
+// between close(2) and that commit stat(2) reports 0 for a file that was just
+// written whole. Nothing tells that apart from an empty file — which is exactly
+// how a slow upload gets reported as silent data loss. The write state has known
+// the size since the first Write; this is only a matter of asking it.
+//
+// It takes writeMu (a leaf lock) and an atomic, and deliberately not st.mu: that
+// one is held across block downloads from S3, so a stat behind it could block for
+// tens of seconds. The refcount round trip is the same one Setattr does, and is
+// what keeps the state from being torn down mid-read.
+//
+// This does NOT close the durability window — close(2) still promises nothing
+// without fsync — it stops the window from looking like loss.
+func (hfs *HamstorFS) applyInFlightSize(inodeID int64, attr *fuse.Attr) {
+	st := hfs.tryAcquireWrite(inodeID)
+	if st == nil {
+		return
+	}
+	if s := st.visibleSize.Load(); s >= 0 {
+		attr.Size = uint64(s)
+	}
+	hfs.releaseWrite(inodeID, st)
 }
 
 // dropObjects deletes the objects a commit orphaned and drops their cache

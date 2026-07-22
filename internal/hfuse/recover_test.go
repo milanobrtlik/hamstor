@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -112,6 +113,182 @@ func TestCleanupKeepsPendingWithRetainedData(t *testing.T) {
 	}
 	if _, err := hfs.DB.GetInode(lost); err == nil {
 		t.Error("pending inode with no retained data should have been deleted")
+	}
+}
+
+// truncatedThenFailed builds the shape this pair of tests is about: an inode
+// that is 'committed' and yet has no storage at all.
+//
+// It is not a contrived state. go-fuse never negotiates CAP_ATOMIC_O_TRUNC, so
+// the kernel implements open(O_TRUNC) as a VFS truncate — FUSE_SETATTR with
+// size 0, sent BEFORE FUSE_OPEN. db.SetAttr then deletes every block row and
+// Setattr deletes the objects, while the status stays 'committed'. Every
+// overwrite of an existing file passes through it.
+func truncatedThenFailed(t *testing.T, hfs *HamstorFS, name string, content []byte) int64 {
+	t.Helper()
+	id := mustInsert(t, hfs, name)
+	writeAt(t, hfs, id, content, 0, true)
+	if has, err := hfs.DB.HasBlocks(id); err != nil || !has {
+		t.Fatalf("setup: the file should be stored as blocks first (has=%v err=%v)", has, err)
+	}
+	setSize(t, &HamstorNode{hfs: hfs, inodeID: id}, 0)
+
+	meta, err := hfs.DB.GetInode(id)
+	if err != nil {
+		t.Fatalf("setup: get inode: %v", err)
+	}
+	has, err := hfs.DB.HasBlocks(id)
+	if err != nil {
+		t.Fatalf("setup: has blocks: %v", err)
+	}
+	if meta.Status != "committed" || meta.Size != 0 || has {
+		t.Fatalf("setup: want the post-O_TRUNC shape (committed, size 0, no blocks), got %s/%d/has=%v",
+			meta.Status, meta.Size, has)
+	}
+	return id
+}
+
+// TestFailedOverwriteAfterTruncateRetainsTheSet is the overwrite half of the
+// retain/recover contract, and it was missing.
+//
+// Retention used to be gated on the inode having been 'pending' when the flush
+// started, on the reasoning that a committed inode still has its previous
+// version to fall back on. After open(O_TRUNC) that is false twice over: the
+// truncate already deleted the old blocks AND their objects, so a failed upload
+// dropped the only remaining copy of the file and logged "previous version kept,
+// this write lost" — the reassuring sentence, for total loss. It is the same
+// class of bug as ad0ff5f, left open for this case.
+//
+// So the question retention asks must be "does anything survive this failure?",
+// not "was this inode pending?".
+func TestFailedOverwriteAfterTruncateRetainsTheSet(t *testing.T) {
+	cfg := testutil.RequireS3(t)
+	hfs, dbPath := setupTest(t)
+	hfs.SpillDir = t.TempDir()
+	pendingDir := filepath.Join(filepath.Dir(dbPath), "pending")
+	if err := os.MkdirAll(pendingDir, 0o755); err != nil {
+		t.Fatalf("pending dir: %v", err)
+	}
+	hfs.PendingDir = pendingDir
+
+	id := truncatedThenFailed(t, hfs, "overwritten.bin", bytes.Repeat([]byte("o"), db.BlockSize+64))
+
+	// From here the store is unreachable, so the rewrite's upload fails.
+	badStore, err := s3store.New(context.Background(),
+		"hamstor-no-such-bucket-"+strings.ToLower(t.Name()),
+		cfg.Endpoint, cfg.AccessKey, cfg.SecretKey, cfg.Region)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	hfs.Store = badStore
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	rewrite := bytes.Repeat([]byte("n"), db.BlockSize+64)
+	th := NewTestHandle(hfs, id, false)
+	if errno := th.TestWriteAt(rewrite, 0); errno != 0 {
+		t.Fatalf("write: %v", errno)
+	}
+	th.TestFlush()
+	th.WaitUpload()
+	th.TestRelease()
+
+	if !hasRetainedData(pendingDir, id) {
+		t.Fatalf("nothing was retained for inode %d: the rewrite is the only copy of this file, "+
+			"because the truncate that preceded it already deleted the old blocks and their objects", id)
+	}
+	set, err := readPendingSet(pendingSetPath(pendingDir, id))
+	if err != nil {
+		t.Fatalf("retained set is unreadable, so recovery will refuse it: %v", err)
+	}
+	if set.FileSize != int64(len(rewrite)) {
+		t.Errorf("retained file size %d, want %d", set.FileSize, len(rewrite))
+	}
+
+	// The inode goes back to 'pending', which is what the retained set means: it
+	// has no durable storage. It also keeps RecoverPending's staleness test
+	// honest, and hides the file rather than showing a 0-byte one the user might
+	// overwrite or delete before the next start recovers it.
+	meta, err := hfs.DB.GetInode(id)
+	if err != nil {
+		t.Fatalf("get inode: %v", err)
+	}
+	if meta.Status != "pending" {
+		t.Errorf("inode status %q after retention, want pending", meta.Status)
+	}
+
+	if strings.Contains(logs.String(), "previous version kept") {
+		t.Errorf("the failure was reported as survivable, but the truncate left no previous version:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "data retained") {
+		t.Errorf("retention happened but was not reported as such:\n%s", logs.String())
+	}
+}
+
+// TestRecoverKeepsSetForCommittedInodeWithoutStorage is the other end of the
+// same format, and it has to move with it: RecoverPending drops a set whose
+// inode is already 'committed', on the reasoning that a later write made it
+// durable. A committed inode with NO storage is the counter-example the
+// truncate path creates, and dropping its set is the very loss retention just
+// prevented.
+//
+// The stale case still has to work, so both are asserted here — one predicate,
+// both directions.
+func TestRecoverKeepsSetForCommittedInodeWithoutStorage(t *testing.T) {
+	hfs, _ := setupTest(t)
+	pendingDir := t.TempDir()
+	ctx := context.Background()
+
+	// A committed inode that has no storage: its set is the only copy.
+	orphaned, err := hfs.DB.InsertInode(1, "truncated.bin", 0o100644, "committed")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	body := []byte("the rewrite that never reached S3")
+	writeRetainedSet(t, pendingDir, orphaned, int64(len(body)), 0, map[int64][]byte{0: body})
+
+	// A committed inode that DOES have storage: its set is genuinely stale.
+	durable, err := hfs.DB.InsertInode(1, "durable.bin", 0o100644, "committed")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	live := []byte("committed and durable")
+	key := s3store.NewKey()
+	if uErr := hfs.Store.Upload(ctx, key, live); uErr != nil {
+		t.Fatalf("upload live block: %v", uErr)
+	}
+	t.Cleanup(func() { hfs.Store.Delete(ctx, key) })
+	if _, _, cErr := hfs.DB.CommitBlocks(durable,
+		[]db.BlockCommit{{Index: 0, S3Key: key, Size: int64(len(live))}}, int64(len(live))); cErr != nil {
+		t.Fatalf("commit live block: %v", cErr)
+	}
+	writeRetainedSet(t, pendingDir, durable, 4, 0, map[int64][]byte{0: []byte("old!")})
+
+	if err := RecoverPending(hfs.DB, hfs.Store, pendingDir); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	meta, err := hfs.DB.GetInode(orphaned)
+	if err != nil {
+		t.Fatalf("get recovered inode: %v", err)
+	}
+	if meta.Size != int64(len(body)) {
+		t.Errorf("recovered size %d, want %d — the set for a committed inode with no storage was dropped as stale",
+			meta.Size, len(body))
+	}
+	blocksOf(t, hfs, orphaned)
+	if hasRetainedData(pendingDir, orphaned) {
+		t.Error("the recovered set was left behind")
+	}
+
+	if hasRetainedData(pendingDir, durable) {
+		t.Error("a set for a committed inode that already has storage must still be dropped as stale")
+	}
+	if m, gErr := hfs.DB.GetInode(durable); gErr != nil || m.Size != int64(len(live)) {
+		t.Errorf("the durable inode was overwritten by its stale set: size %d, want %d (err %v)",
+			m.Size, len(live), gErr)
 	}
 }
 

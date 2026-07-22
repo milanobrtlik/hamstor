@@ -296,7 +296,13 @@ func main() {
 		Encryptor: enc, Cache: diskCache,
 		DefaultUid: defaultUid, DefaultGid: defaultGid,
 		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
-		UploadSem:    make(chan struct{}, 32),
+		UploadSem: make(chan struct{}, 32),
+		// Four block encryptions at once: each holds a block's plaintext and its
+		// sealed copy, so 4 * 2 * 8 MiB = 64 MiB, comfortably inside the 150 MiB
+		// limit set above alongside the write buffers (one block each now). The
+		// unencrypted path streams off the snapshot and never comes here, so this
+		// does not cap a plain mount's upload concurrency at 4.
+		EncryptSem:   make(chan struct{}, 4),
 		ThumbSem:     make(chan struct{}, 4),
 		SpillDir:     spillDir,
 		PendingDir:   pendingDir,

@@ -128,10 +128,17 @@ func RecoverPending(d *db.DB, store *s3store.Store, pendingDir string) error {
 			os.RemoveAll(path)
 			continue
 		}
-		if meta.Status == "committed" {
+		if meta.Status == "committed" && inodeHasStorage(d, meta) {
 			// A later write already made this inode durable; the retained copy is
-			// stale and must not overwrite it. This is also why retention only
-			// ever runs for a 'pending' inode in the first place.
+			// stale and must not overwrite it.
+			//
+			// Storage, not status alone. A 'committed' inode with no blocks and no
+			// needle is what open(O_TRUNC) leaves behind (see inodeHasStorage), so
+			// dropping its set here would discard the only copy of a rewrite that
+			// failed — undoing the retention that had just saved it. Retention marks
+			// such an inode back to 'pending', so this should not be reachable; it
+			// is the same predicate on both sides precisely so that a missed mark
+			// costs nothing.
 			os.RemoveAll(path)
 			continue
 		}

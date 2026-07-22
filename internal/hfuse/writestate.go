@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -71,7 +72,27 @@ type inodeWrite struct {
 	// sibling got there first) keeps that snapshot forever: reading through it
 	// would clamp everyone's contents down to whatever the file happened to be
 	// when it opened. Only meaningful while loaded is true.
+	//
+	// Assign it through setSize, never directly: visibleSize below has to move
+	// with it.
 	size int64
+
+	// visibleSize is size published for stat(2), or -1 when the DB is the
+	// authority. Read WITHOUT mu (see HamstorFS.applyInFlightSize), which is the
+	// whole reason it is an atomic and not just a field: mu is held across block
+	// downloads from S3, so a stat that took it could sit there for tens of
+	// seconds.
+	//
+	// It exists because a file's size only becomes real at CommitBlocks, and
+	// Flush is asynchronous — so between close(2) and the commit, stat reports 0
+	// for a file that was just written. Nothing distinguishes that from an empty
+	// file, which is how a slow upload gets reported as data loss.
+	//
+	// -1 rather than 0 for "no opinion": atomic.Int64 starts at zero, so a state
+	// that never recorded a size would otherwise claim every file it is open on
+	// is empty — inventing the very symptom this is here to remove. acquireWrite
+	// sets the sentinel when it builds the state.
+	visibleSize atomic.Int64
 
 	// dirtyBlocks holds the indexes written since the last Flush, so a flush
 	// uploads the blocks that changed instead of the whole file. Guarded by mu
@@ -190,6 +211,25 @@ func (st *inodeWrite) markDirtyRange(off, n int64) {
 		// covered everything that was stored in it.
 		st.presentBlocks[b] = struct{}{}
 	}
+}
+
+// setSize records the state's logical size and publishes it for stat(2). Must be
+// called with mu held.
+//
+// Every assignment to size goes through here so the published value cannot drift
+// from it. The two are set in eight places between Open, ensureLoaded, Write and
+// truncateWriteState, and a missed one does not fail loudly — it reports a stale
+// length for a file somebody has open.
+func (st *inodeWrite) setSize(s int64) {
+	st.size = s
+	st.visibleSize.Store(s)
+}
+
+// clearVisibleSize hands stat(2) back to the DB. Safe to call without mu — that
+// is deliberate, because the caller is the upload goroutine, which must never
+// take it.
+func (st *inodeWrite) clearVisibleSize() {
+	st.visibleSize.Store(-1)
 }
 
 // present reports whether block b's bytes are really in the backing store.
@@ -334,7 +374,7 @@ func (hfs *HamstorFS) truncateWriteState(st *inodeWrite, s int64) syscall.Errno 
 			return syscall.EIO
 		}
 		st.spillSize = s
-		st.size = s
+		st.setSize(s)
 		st.dirty = true
 		st.dropBlocksPast(s)
 		return 0
@@ -350,7 +390,7 @@ func (hfs *HamstorFS) truncateWriteState(st *inodeWrite, s int64) syscall.Errno 
 	// for five terabytes of heap and kills the mount. A sparse file charges
 	// nothing for the hole, which is also exactly what the block layout wants:
 	// the gap has no rows, so it stays a hole all the way to S3.
-	if s > spillThreshold && s > int64(len(st.buf)) {
+	if s >= spillThreshold && s > int64(len(st.buf)) {
 		if err := hfs.spillState(st); err != nil {
 			log.Printf("hamstor: spill on grow failed: %v", err)
 			return syscall.EIO
@@ -360,7 +400,7 @@ func (hfs *HamstorFS) truncateWriteState(st *inodeWrite, s int64) syscall.Errno 
 			return syscall.EIO
 		}
 		st.spillSize = s
-		st.size = s
+		st.setSize(s)
 		st.dirty = true
 		return 0
 	}
@@ -371,7 +411,7 @@ func (hfs *HamstorFS) truncateWriteState(st *inodeWrite, s int64) syscall.Errno 
 		st.buf = append(st.buf, make([]byte, s-int64(len(st.buf)))...)
 	}
 	st.dirty = true
-	st.size = s
+	st.setSize(s)
 	st.dropBlocksPast(s)
 	return 0
 }
@@ -420,6 +460,7 @@ func (st *inodeWrite) free() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.buf = nil
+	st.clearVisibleSize()
 	// Spill ownership transfers to the upload goroutine in Flush; a spill file
 	// still here means Flush never ran (opened and written, never closed) or it
 	// bailed early, so this is the last chance to clean it up.
@@ -451,6 +492,9 @@ func (hfs *HamstorFS) acquireWrite(inodeID int64) *inodeWrite {
 	st := hfs.writeStates[inodeID]
 	if st == nil {
 		st = &inodeWrite{}
+		// Nothing is known about the size yet, and the zero value of an
+		// atomic.Int64 would claim the file is empty. See visibleSize.
+		st.clearVisibleSize()
 		hfs.writeStates[inodeID] = st
 	}
 	st.handleRefs++
