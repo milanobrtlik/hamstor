@@ -480,6 +480,25 @@ func (d *DB) commitInodeTx(id int64, size, now int64) (bool, error) {
 	return n > 0, nil
 }
 
+// MarkPending puts an inode back to 'pending'. Returns whether it still existed.
+//
+// The one caller is retention (hfuse: flushAsync): an inode whose only surviving
+// copy is a retained set under pending/ has no durable storage, which is what
+// 'pending' means. It is reached when a rewrite fails after open(O_TRUNC) has
+// already deleted the previous version — the inode is 'committed' and empty at
+// that point, and leaving it that way has two costs. RecoverPending drops a
+// committed inode's set as stale, and a 0-byte file the user can see is one they
+// may overwrite or delete before the next start recovers it. Pending inodes are
+// invisible to LookupChild, so neither can happen.
+func (d *DB) MarkPending(id int64) (bool, error) {
+	res, err := d.db.Exec("UPDATE inodes SET status = 'pending' WHERE id = ?", id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // DeleteInode removes the inode and returns the S3 keys of the blocks it owned,
 // for the caller to delete AFTER this returns.
 //

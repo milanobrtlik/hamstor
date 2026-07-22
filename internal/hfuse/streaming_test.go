@@ -277,18 +277,23 @@ func TestStreamingMemoryStaysBounded(t *testing.T) {
 		t.Fatalf("streaming materialized the shared state (loaded=%v, %d bytes buffered)", loaded, bufLen)
 	}
 
-	// The control: the same file through the ordinary path holds ALL of it. That
-	// is what makes the numbers above mean something rather than being small by
-	// accident.
+	// The control: the same file through the ordinary path attaches a backing
+	// store the length of the WHOLE file after a single 128 KB read. That is what
+	// makes the numbers above mean something rather than being small by accident.
+	//
+	// Measured through logicalSize rather than len(st.buf), because where that
+	// store lives is not the point and is no longer the heap: past spillThreshold
+	// (one block) attachBlocks gives it a sparse temp file. Streaming's claim is
+	// that it attaches NOTHING — asserted above — and that holds against either.
 	hfs.StreamRate = 0
 	ctrl, releaseCtrl := openStream(t, hfs, id, false)
 	defer releaseCtrl()
 	readAt(t, ctrl, 0, fuseReadSize)
 	ctrl.st.mu.Lock()
-	ctrlBuf := len(ctrl.st.buf)
+	ctrlStore := ctrl.st.logicalSize()
 	ctrl.st.mu.Unlock()
-	if int64(ctrlBuf) != size {
-		t.Fatalf("control handle buffered %d bytes of a %d-byte file; the comparison is not what it claims", ctrlBuf, size)
+	if ctrlStore != size {
+		t.Fatalf("control handle attached a store of %d bytes for a %d-byte file; the comparison is not what it claims", ctrlStore, size)
 	}
 }
 

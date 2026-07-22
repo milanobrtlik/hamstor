@@ -76,6 +76,36 @@ func pendingSetPath(pendingDir string, inodeID int64) string {
 	return filepath.Join(pendingDir, strconv.FormatInt(inodeID, 10))
 }
 
+// inodeHasStorage reports whether the inode's data is reachable from storage
+// that outlives a failed flush: a volume needle, or a set of block rows.
+//
+// It is the question both ends of the retain/recover pair have to ask, which is
+// why it is one function. Retention asks it as "is this flush the only copy?"
+// and RecoverPending asks it as "did a later write make this set stale?" — and a
+// second, differently-worded copy of it is exactly how the two ends of this
+// format stop agreeing.
+//
+// Status is NOT the answer, though it was: a 'committed' inode looks durable and
+// need not be. open(O_TRUNC) leaves one committed with no blocks and no needle,
+// because go-fuse does not negotiate CAP_ATOMIC_O_TRUNC and the kernel therefore
+// truncates through SETATTR before it opens — db.SetAttr drops every block row
+// and the caller deletes the objects, all while the status stays 'committed'.
+// Every overwrite of an existing file passes through that shape.
+//
+// Errors answer false: keeping a set that turns out to be redundant costs disk,
+// dropping one that was not costs the file.
+func inodeHasStorage(d *db.DB, meta *db.InodeMeta) bool {
+	if meta.VolS3Key != "" {
+		return true
+	}
+	has, err := d.HasBlocks(meta.ID)
+	if err != nil {
+		log.Printf("hamstor: storage lookup for inode %d: %v (assuming none)", meta.ID, err)
+		return false
+	}
+	return has
+}
+
 // hasRetainedData reports whether pendingDir holds a retained set for inodeID
 // that a later start could still upload.
 //

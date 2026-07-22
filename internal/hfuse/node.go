@@ -90,6 +90,7 @@ func (n *HamstorNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.At
 		return toErrno(err)
 	}
 	fillAttr(meta, &out.Attr)
+	n.hfs.applyInFlightSize(n.inodeID, &out.Attr)
 	return 0
 }
 
@@ -180,6 +181,10 @@ func (n *HamstorNode) Lookup(ctx context.Context, name string, out *fuse.EntryOu
 	inode := n.NewInode(ctx, child, stable)
 
 	fillAttr(meta, &out.Attr)
+	// ls -l goes LOOKUP first and the kernel caches what comes back for
+	// --attr-timeout (60s by default), so overriding only in Getattr would still
+	// show 0 bytes for a file whose upload is in flight.
+	n.hfs.applyInFlightSize(meta.ID, &out.Attr)
 	return inode, 0
 }
 
@@ -370,7 +375,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		st.wholeLoaded = false
 		st.loaded = true
 		st.dirty = true
-		st.size = 0
+		st.setSize(0)
 	} else if flags&writeFlags != 0 && hasData && !st.loaded {
 		if hasBlocks || sparse {
 			// Attach a sparse backing store and fetch NOTHING. Opening a large
@@ -428,7 +433,7 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 			} else if int64(len(st.buf)) > meta.Size {
 				st.buf = st.buf[:meta.Size]
 			}
-			st.size = meta.Size
+			st.setSize(meta.Size)
 			// Anything recorded about blocks the file no longer has goes with
 			// them: a present index that survives a shrink claims the store holds
 			// that block, so growing the file again would serve the zeroes the
