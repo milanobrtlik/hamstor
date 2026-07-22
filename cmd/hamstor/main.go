@@ -130,8 +130,10 @@ func main() {
 	// objects out from under the other. fsck/cache/version returned earlier and
 	// do not take the lock.
 	lockFile, lockErr := acquireDBLock(*dbPath)
-	if lockErr != nil {
-		log.Fatalf("hamstor: another instance is using %s (lock: %v)", *dbPath, lockErr)
+	if errors.Is(lockErr, errLockHeld) {
+		log.Fatalf("hamstor: another instance is using %s", *dbPath)
+	} else if lockErr != nil {
+		log.Fatalf("hamstor: cannot lock %s: %v", *dbPath, lockErr)
 	}
 	defer lockFile.Close()
 
@@ -363,18 +365,33 @@ func main() {
 	log.Println("hamstor: stopped")
 }
 
+// errLockHeld reports the one failure that actually means a second hamstor is
+// running. Every other way of failing to take the lock — the file cannot be
+// opened, the directory does not exist, the filesystem refuses flock — says
+// nothing about other processes, and telling the user to go find one sends them
+// after something that is not there. The common case is a permission error:
+// systemd runs the daemon as root, so /var/lib/hamstor and its lock file belong
+// to root, and a user running `hamstor gc` cannot open it.
+var errLockHeld = errors.New("lock held by another process")
+
 // acquireDBLock takes a non-blocking exclusive advisory lock on "<dbPath>.lock".
 // The returned file must stay open for the process lifetime to hold the lock;
-// the OS releases it automatically on exit. Returns an error if another process
-// already holds the lock.
+// the OS releases it automatically on exit. Returns errLockHeld if another
+// process already holds it, and a descriptive error for anything else.
 func acquireDBLock(dbPath string) (*os.File, error) {
-	f, err := os.OpenFile(dbPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	lockPath := dbPath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open %s: %w", lockPath, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, err
+		// LOCK_NB reports contention as EWOULDBLOCK (== EAGAIN); anything else
+		// is the filesystem or the descriptor refusing, not a rival process.
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errLockHeld
+		}
+		return nil, fmt.Errorf("flock %s: %w", lockPath, err)
 	}
 	return f, nil
 }
