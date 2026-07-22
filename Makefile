@@ -11,7 +11,13 @@ LDFLAGS = -X main.version=$(VERSION) \
 
 build:
 	@mkdir -p data
-	go build -ldflags "$(LDFLAGS)" -o hamstor ./cmd/hamstor
+# Silenced deliberately: LDFLAGS carries the S3 access key, the secret key and
+# the encryption passphrase, so echoing the command prints all three. They then
+# live in terminal scrollback, in any CI log, and in whatever captured the build
+# output — none of which is where a bucket credential or the only key to the
+# stored data belongs.
+	@echo "go build -o hamstor ./cmd/hamstor"
+	@go build -ldflags "$(LDFLAGS)" -o hamstor ./cmd/hamstor
 
 install: build
 	@{ \
