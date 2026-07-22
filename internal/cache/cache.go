@@ -347,57 +347,44 @@ func (c *DiskCache) evictLRU() {
 	}
 	defer c.evicting.Store(false)
 
-	// Phase 1: scan at S3 key level (2 levels deep: prefix/uuid)
+	// Phase 1: every cached object is one entry, whatever depth its key sits at.
+	//
+	// The scan used to assume two levels and read the second as the key, which is
+	// true for {2hex}/{uuid} and wrong for volobj/{2hex}/{uuid}: it took volobj as
+	// the prefix and each 2-hex shard under it as a single entry, summed the
+	// subtree, and evicted the lot — about 1/256 of every cached volume in one
+	// step. The recency was wrong in both directions too, being the newest mtime
+	// in the shard: one hot volume kept 255 cold ones resident, and when the shard
+	// finally lost, it took the hot one with it.
+	//
+	// Walking to files instead is both correct and simpler, because after the
+	// chunk sub-cache was removed no live entry is a directory: Put clears
+	// whatever sits at the path, Open and Has refuse directories, and New sweeps
+	// the ones older versions left. Depth stops being something this has to know.
 	var entries []cacheEntry
 	var totalSize int64
 
-	prefixes, _ := os.ReadDir(c.dir)
-	for _, prefix := range prefixes {
-		if !prefix.IsDir() {
-			continue
+	filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
 		}
-		prefixPath := filepath.Join(c.dir, prefix.Name())
-		keys, _ := os.ReadDir(prefixPath)
-		for _, key := range keys {
-			if strings.HasPrefix(key.Name(), ".") {
-				continue
-			}
-			keyPath := filepath.Join(prefixPath, key.Name())
-			var size int64
-			var modTime int64
-			if key.IsDir() {
-				// A directory at key level: sum what is under it and treat the
-				// subtree as one entry.
-				filepath.WalkDir(keyPath, func(path string, d os.DirEntry, err error) error {
-					if err != nil || d.IsDir() {
-						return nil
-					}
-					info, err := d.Info()
-					if err != nil {
-						return nil
-					}
-					size += info.Size()
-					if t := info.ModTime().UnixNano(); t > modTime {
-						modTime = t
-					}
-					return nil
-				})
-			} else {
-				info, err := key.Info()
-				if err != nil {
-					continue
-				}
-				size = info.Size()
-				modTime = info.ModTime().UnixNano()
-			}
-			entries = append(entries, cacheEntry{
-				path:    keyPath,
-				size:    size,
-				modTime: modTime,
-			})
-			totalSize += size
+		// Skip a concurrent Put's temp file: it is not reachable by any key, and
+		// deleting it would fail that Put rather than free anything.
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil
 		}
-	}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		entries = append(entries, cacheEntry{
+			path:    path,
+			size:    info.Size(),
+			modTime: info.ModTime().UnixNano(),
+		})
+		totalSize += info.Size()
+		return nil
+	})
 
 	// Recalibrate approxSize from actual disk scan
 	c.approxSize.Store(totalSize)
@@ -420,7 +407,10 @@ func (c *DiskCache) evictLRU() {
 			break
 		}
 		c.mu.Lock()
-		err := os.RemoveAll(e.path)
+		// Remove, not RemoveAll: every entry is a file now, and refusing to
+		// recurse means a directory that turned up here cannot take a subtree
+		// with it the way volobj shards used to.
+		err := os.Remove(e.path)
 		c.mu.Unlock()
 		if err == nil {
 			totalSize -= e.size
