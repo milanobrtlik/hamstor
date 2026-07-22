@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"errors"
 	"io"
 	"log"
 	"os"
@@ -24,8 +25,8 @@ type DiskCache struct {
 	// scans on every Put. Recalibrated when evictLRU actually runs.
 	approxSize atomic.Int64
 
-	// evicting guards against many concurrent Put/PutChunk callers each
-	// launching a full directory rescan when the size crosses maxBytes.
+	// evicting guards against many concurrent Put callers each launching a
+	// full directory rescan when the size crosses maxBytes.
 	evicting atomic.Bool
 }
 
@@ -297,6 +298,18 @@ func (c *DiskCache) Size() (totalBytes int64, count int) {
 }
 
 // Clear removes all cached data.
+//
+// Every removal failure is reported. Discarding them made `hamstor cache clear`
+// print "cache cleared" over a cache it had not touched, and that is the normal
+// case rather than an exotic one: the daemon runs from systemd as root and
+// creates --cache-dir as root, while the CLI is run by a user, so RemoveAll
+// fails with EACCES on every entry. A cache that silently refuses to clear is
+// worse than one that cannot, because the next cold-read measurement is taken
+// against data that was supposed to be gone.
+//
+// approxSize is only zeroed when everything really went, for the same reason:
+// claiming an empty cache while entries survive makes eviction believe it has
+// the whole budget free.
 func (c *DiskCache) Clear() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -304,8 +317,14 @@ func (c *DiskCache) Clear() error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, e := range entries {
-		os.RemoveAll(filepath.Join(c.dir, e.Name()))
+		if rmErr := os.RemoveAll(filepath.Join(c.dir, e.Name())); rmErr != nil {
+			errs = append(errs, rmErr)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	c.approxSize.Store(0)
 	return nil
