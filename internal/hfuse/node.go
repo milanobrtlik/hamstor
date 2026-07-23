@@ -646,9 +646,17 @@ func (n *HamstorNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.E
 	if uint64(stats.TotalSize)%4096 != 0 {
 		totalBlocks++
 	}
-	out.Blocks = totalBlocks + 1<<20 // report some headroom
-	out.Bfree = 1 << 20              // report ~4 GB free (S3 is elastic)
-	out.Bavail = out.Bfree
+	// S3 is elastic, so free space is not a real quantity. Report a large,
+	// fixed amount so a file manager's pre-flight statvfs check never refuses a
+	// copy: GNOME Files rejected a 17 GB paste against the old 4 GB figure
+	// ("12.2 GB more space is required"). 1 PiB is the "effectively unlimited"
+	// value used by other object-store mounts — big enough that no realistic
+	// copy is blocked, small enough that df -h shows a sane number. Total grows
+	// with usage (used + free) so the used/free/total triple stays coherent.
+	const freeBlocks = 1 << 38 // 1 PiB in 4096-byte blocks
+	out.Blocks = totalBlocks + freeBlocks
+	out.Bfree = freeBlocks
+	out.Bavail = freeBlocks
 
 	return 0
 }
