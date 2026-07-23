@@ -248,6 +248,7 @@ func (n *HamstorNode) Create(ctx context.Context, name string, flags uint32, mod
 	st := n.hfs.acquireWrite(newID)
 	st.mu.Lock()
 	st.isNew = true
+	st.freshWrite = true // created empty: write-time eviction may commit a growing prefix
 	st.mu.Unlock()
 	handle := &HamstorHandle{
 		hfs:        n.hfs,
@@ -378,6 +379,14 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		st.loaded = true
 		st.dirty = true
 		st.setSize(0)
+		// Emptied from empty: write-time eviction may engage on the rewrite. The
+		// old objects were already dropped by the FUSE_SETATTR size-0 that precedes
+		// O_TRUNC's open (see the Async Flush note in CLAUDE.md), so committing a
+		// growing prefix over this inode truncates nothing that still exists.
+		st.freshWrite = true
+		st.evictBroken = false
+		st.seqHead = 0
+		st.committedExtent = 0
 	} else if flags&writeFlags != 0 && hasData && !st.loaded {
 		if hasBlocks || sparse {
 			// Attach a sparse backing store and fetch NOTHING. Opening a large

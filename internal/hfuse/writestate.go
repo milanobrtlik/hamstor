@@ -195,6 +195,37 @@ type inodeWrite struct {
 	// the global write-buffer budget can pace writers, and released to 0 before the
 	// state is freed. Guarded by mu.
 	accountedBlocks int
+
+	// Phase B write-eviction state (guarded by mu). Eviction commits completed
+	// blocks of a large sequential write to S3 and hole-punches them out of the
+	// spill, so a file bigger than the local disk can still be copied. It engages
+	// ONLY for a file written from empty (freshWrite) as a contiguous sequential
+	// stream (!evictBroken): each incremental commit sets the inode's size to the
+	// contiguous extent through the block it commits, which is the file's true
+	// committed size only while nothing beyond the frontier is committed — exactly
+	// what "fresh + sequential, no flush yet" guarantees. Getting that wrong
+	// truncates a file, so the gate is deliberately narrow. See maybeEvict.
+	freshWrite      bool  // opened empty (new file or O_TRUNC): nothing is committed beyond what eviction writes
+	evictBroken     bool  // a non-sequential write, a flush, or an unsupported FS disabled eviction; the committed prefix stays valid
+	seqHead         int64 // offset just past the highest contiguously-written byte
+	committedExtent int64 // bytes committed as a contiguous prefix; the blocks below live in S3, punched out of the spill
+}
+
+// trackSequential advances the sequential-write frontier eviction relies on, and
+// disables eviction — leaving the already-committed prefix valid — on the first
+// write that leaves a gap or revisits the committed prefix. Must be called with mu
+// held, with the O_APPEND-resolved offset.
+func (st *inodeWrite) trackSequential(off, n int64) {
+	if st.evictBroken {
+		return
+	}
+	if off > st.seqHead || off < st.committedExtent {
+		st.evictBroken = true
+		return
+	}
+	if off+n > st.seqHead {
+		st.seqHead = off + n
+	}
 }
 
 // chargeBlocks moves the state's accounted dirty-block count by delta and mirrors
