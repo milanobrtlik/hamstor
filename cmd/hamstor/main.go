@@ -51,6 +51,7 @@ func main() {
 	ownerGid := flag.Int("gid", os.Getgid(), "default file owner GID")
 	streamRate := flag.Int("stream-rate", 5, "streaming rate limit in MB/s for multimedia (0 to disable)")
 	streamBuffer := flag.Int("stream-buffer", 16, "streaming memory buffer in MB")
+	writeBuffer := flag.Int64("write-buffer", 1<<30, "max local un-uploaded write buffer in bytes; Write blocks past it so a bulk copy paces to the S3 upload rate and the spill dir stays bounded (0 to disable). A single file larger than this still needs local disk equal to its size.")
 	entryTimeout := flag.Duration("entry-timeout", 60*time.Second, "FUSE entry/attr cache timeout")
 	pprofAddr := flag.String("pprof", "", "pprof listen address (e.g. :6060, empty to disable)")
 	volumePacking := flag.Bool("volume-packing", true, "pack small files (<256KB) into volume S3 objects")
@@ -308,7 +309,8 @@ func main() {
 		Encryptor: enc, Cache: diskCache,
 		DefaultUid: defaultUid, DefaultGid: defaultGid,
 		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
-		UploadCtx: uploadCtx,
+		WriteBuffer: *writeBuffer,
+		UploadCtx:   uploadCtx,
 		UploadSem: make(chan struct{}, 32),
 		// Four block encryptions at once: each holds a block's plaintext and its
 		// sealed copy, so 4 * 2 * 8 MiB = 64 MiB, comfortably inside the 150 MiB

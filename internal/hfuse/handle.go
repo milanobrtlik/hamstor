@@ -851,6 +851,11 @@ func (hfs *HamstorFS) spillState(st *inodeWrite) error {
 }
 
 func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	// Backpressure: block here, holding no lock, until the un-uploaded footprint
+	// has room, so a bulk copy paces to the S3 drain rate and the spill dir stays
+	// bounded. A no-op unless --write-buffer is set. See HamstorFS.admitWrite.
+	h.hfs.admitWrite(int64(len(data)))
+
 	h.st.mu.Lock()
 	defer h.st.mu.Unlock()
 
@@ -1050,6 +1055,14 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	dirty := h.st.dirtyBlocks
 	h.st.dirtyBlocks = nil
 
+	// Transfer the write-buffer charge to the upload. The dirty bytes stay on disk
+	// (or in buf) until the upload releases them, so accountedBlocks is zeroed here
+	// — this flush no longer owns them — and the same count is returned to the
+	// budget by flushStaged/flushAsync once the bytes are actually gone. Captured
+	// under mu, exactly like the dirty set above.
+	dirtyCharge := h.st.accountedBlocks
+	h.st.accountedBlocks = 0
+
 	// The presence map describes the backing store, so it is handed over with it
 	// rather than kept. This is the deliberate answer to D4's snapshot copy: the
 	// state does NOT keep a live sparse materialization across a flush, it gives
@@ -1079,7 +1092,7 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 
 	// Small files: stage to disk, commit immediately, volume builder packs later.
 	if bufSize > 0 && bufSize <= int64(volume.MaxNeedleSize) && canStage {
-		errno := h.flushStaged(uploadFile, bufSize)
+		errno := h.flushStaged(uploadFile, bufSize, dirtyCharge)
 		if errno != 0 {
 			// The bytes are no longer anywhere: buf was handed to stageData and
 			// nil'd, and this path retains nothing (unlike the async one). A
@@ -1093,14 +1106,19 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 		return errno
 	}
 
-	return h.flushAsync(att, uploadFile, bufSize, dirty, hasBlocks, wholeLoaded, materialized)
+	return h.flushAsync(att, uploadFile, bufSize, dirty, hasBlocks, wholeLoaded, materialized, dirtyCharge)
 }
 
 // flushStaged writes a small file to the volume staging directory and commits it
 // immediately; the volume builder packs it into a volume object later. Called
 // with st.mu held, and keeps it for the whole path — there is no upload
 // goroutine here, so the attempt is already complete when this returns.
-func (h *HamstorHandle) flushStaged(uploadFile *os.File, bufSize int64) syscall.Errno {
+func (h *HamstorHandle) flushStaged(uploadFile *os.File, bufSize int64, dirtyCharge int) syscall.Errno {
+	// Staging is synchronous, so unlike the async path there is no upload goroutine
+	// to hand the charge to: return it to the write-buffer budget on every exit.
+	if dirtyCharge > 0 {
+		defer h.hfs.addDirtyBytes(-int64(dirtyCharge) * db.BlockSize)
+	}
 	{
 		// There is no previous standalone object to clean up: an inode names no
 		// object of its own, and an inode that already has blocks never reaches
@@ -1224,7 +1242,19 @@ func (h *HamstorHandle) flushStaged(uploadFile *os.File, bufSize int64) syscall.
 // materialized reports whether a block was really in the snapshot when Flush
 // took it, which is what the check below turns from a silent corruption into an
 // error.
-func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufSize int64, dirty map[int64]struct{}, hasBlocks, wholeLoaded bool, materialized func(int64) bool) syscall.Errno {
+func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufSize int64, dirty map[int64]struct{}, hasBlocks, wholeLoaded bool, materialized func(int64) bool, dirtyCharge int) syscall.Errno {
+	// releaseCharge returns this flush's write-buffer charge to the budget exactly
+	// once: here on an early return, or from the upload goroutine's defer once the
+	// spill is gone. addDirtyBytes broadcasts, so a blocked writer re-checks. Only
+	// one path ever runs it — an early return returns without launching the
+	// goroutine — so the dirtyCharge guard needs no lock of its own.
+	releaseCharge := func() {
+		if dirtyCharge > 0 {
+			h.hfs.addDirtyBytes(-int64(dirtyCharge) * db.BlockSize)
+			dirtyCharge = 0
+		}
+	}
+
 	// Now wait for upload slot — this goroutine holds no file data in RAM.
 	h.st.mu.Unlock()
 	h.hfs.UploadSem <- struct{}{}
@@ -1241,6 +1271,7 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			uploadFile.Close()
 			os.Remove(uploadFile.Name())
 		}
+		releaseCharge()
 		att.err = err
 		h.st.poisoned = err
 		close(att.done)
@@ -1329,6 +1360,7 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			uploadFile.Close()
 			os.Remove(uploadFile.Name())
 		}
+		releaseCharge()
 		att.err = aErr
 		h.st.poisoned = aErr
 		close(att.done)
@@ -1349,8 +1381,23 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 	hfs.InflightCount.Add(1)
 
 	go func() {
+		// LIFO ordering of these three matters. Registered first so it runs LAST:
+		// InflightUploads.Wait() (used by shutdown, and by tests) must not return
+		// until the write-buffer charge has already been returned below it.
 		defer hfs.InflightUploads.Done()
-		defer hfs.InflightCount.Add(-1)
+		// Runs before Done(), after the decrement: returns this flush's charge to
+		// the budget and broadcasts, so a blocked writer re-checks. The bytes have
+		// left the spill tier by now — removed, or moved into pending/ on the
+		// retention path — either way they no longer count.
+		defer releaseCharge()
+		// Runs first of the three: decrement then wake, so a writer blocked on the
+		// single-file exemption (InflightCount == 0) is re-evaluated even when this
+		// upload had no charge of its own. A waiter may wake here and again at
+		// releaseCharge — both harmless, cond waiters re-check.
+		defer func() {
+			hfs.InflightCount.Add(-1)
+			hfs.wakeWriters()
+		}()
 		defer hfs.releaseUpload(inodeID, st)
 		// Closing att.done releases every waiter, so it must come after both the
 		// commit and the last write to att.err. Defers run LIFO, so this line
