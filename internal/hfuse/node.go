@@ -366,7 +366,9 @@ func (n *HamstorNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, ui
 		// Nothing written since the last flush survives an emptied file, and the
 		// commit at size 0 drops every block anyway. The presence map goes with
 		// it: an emptied file has no block to be present, and a stale entry would
-		// tell a later read that a block it never fetched is already local.
+		// tell a later read that a block it never fetched is already local. The
+		// dropped dirty blocks return their write-buffer charge first.
+		st.chargeBlocks(-st.accountedBlocks)
 		st.dirtyBlocks = nil
 		st.presentBlocks = nil
 		st.blockBacked = false

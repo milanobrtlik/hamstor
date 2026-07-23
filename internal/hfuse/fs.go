@@ -129,6 +129,82 @@ type HamstorFS struct {
 	// but before SQLite commit. Tests use this to simulate a crash
 	// in the critical window.
 	TestCrashBeforeCommit func()
+
+	// Write-buffer backpressure (Phase A). WriteBuffer caps the total un-uploaded
+	// ("dirty") bytes buffered locally before Write blocks, so a bulk copy paces to
+	// the S3 drain rate instead of letting the spill dir grow without bound. It is a
+	// DISK budget, distinct from debug.SetMemoryLimit — the spill lives on disk.
+	// <= 0 disables the gate entirely, which is what tests and the mutating
+	// subcommands get by leaving it unset (behaviour identical to before Phase A).
+	//
+	// dirtyBytes is the accounted footprint: Σ over live write states of
+	// inodeWrite.accountedBlocks × db.BlockSize, plus the bytes of in-flight uploads
+	// whose spill has not yet been released. Charged per DIRTIED BLOCK, never by
+	// spillSize — that counts sparse holes, so truncate -s 5T must cost ~0. dirtyMu
+	// is a LEAF lock in the same class as writeMu: only the counter and the
+	// broadcast touch it, never a st.mu / DB / S3 call held across it.
+	WriteBuffer   int64
+	dirtyMu       sync.Mutex
+	dirtyCond     *sync.Cond
+	dirtyCondOnce sync.Once
+	dirtyBytes    int64
+}
+
+// ensureDirtyCond lazily builds the write-buffer condition variable, so a bare
+// HamstorFS literal (tests, subcommands) stays usable without an explicit init.
+func (hfs *HamstorFS) ensureDirtyCond() {
+	hfs.dirtyCondOnce.Do(func() { hfs.dirtyCond = sync.NewCond(&hfs.dirtyMu) })
+}
+
+// addDirtyBytes adjusts the accounted un-uploaded footprint and, when it falls,
+// wakes writers blocked in admitWrite. Leaf lock: takes only dirtyMu, and
+// broadcasts while holding it so a writer between its predicate check and Wait()
+// cannot miss the wakeup. Safe to call while holding inodeWrite.mu (it never
+// reaches back for st.mu), which is what lets per-block accounting ride inside
+// markDirtyRange/dropBlocksPast.
+func (hfs *HamstorFS) addDirtyBytes(delta int64) {
+	if delta == 0 {
+		return
+	}
+	hfs.ensureDirtyCond()
+	hfs.dirtyMu.Lock()
+	hfs.dirtyBytes += delta
+	if delta < 0 {
+		hfs.dirtyCond.Broadcast()
+	}
+	hfs.dirtyMu.Unlock()
+}
+
+// wakeWriters re-evaluates every blocked writer's admission condition. Called
+// when the last in-flight upload drains, so the single-file exemption in
+// admitWrite (InflightCount == 0) can release a writer that a falling dirtyBytes
+// alone would not have. Broadcasts under dirtyMu — the same lock admitWrite reads
+// InflightCount under — which closes the lost-wakeup window.
+func (hfs *HamstorFS) wakeWriters() {
+	hfs.ensureDirtyCond()
+	hfs.dirtyMu.Lock()
+	hfs.dirtyCond.Broadcast()
+	hfs.dirtyMu.Unlock()
+}
+
+// admitWrite blocks until adding n bytes keeps the un-uploaded footprint within
+// WriteBuffer, OR until nothing is draining. The second clause is the deadlock
+// exemption: a single large file has no upload in flight until its own close, so
+// InflightCount stays 0 while it is the sole writer and this returns at once —
+// the file overflows to the disk tier up to its size (the documented Phase A
+// single-file limit). With other files draining, InflightCount > 0 and this paces
+// the writer to the S3 rate. Must be called holding NO lock (the wait would
+// otherwise wedge the mount); Write calls it before taking st.mu.
+func (hfs *HamstorFS) admitWrite(n int64) {
+	if hfs.WriteBuffer <= 0 {
+		return
+	}
+	hfs.ensureDirtyCond()
+	hfs.dirtyMu.Lock()
+	for hfs.dirtyBytes+n > hfs.WriteBuffer && hfs.InflightCount.Load() > 0 {
+		hfs.dirtyCond.Wait()
+	}
+	hfs.dirtyMu.Unlock()
 }
 
 // FreeOSMemoryInterval controls how often completed uploads trigger

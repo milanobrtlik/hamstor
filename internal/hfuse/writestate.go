@@ -184,6 +184,32 @@ type inodeWrite struct {
 	// handleRefs and uploadRefs are guarded by HamstorFS.writeMu, NOT by mu.
 	handleRefs int // live file handles
 	uploadRefs int // in-flight upload goroutines
+
+	// hfs is a back-pointer used only to reach the write-buffer accounting
+	// (addDirtyBytes) from this state's own methods. Set in acquireWrite; nil in a
+	// bare test literal, which chargeBlocks tolerates.
+	hfs *HamstorFS
+
+	// accountedBlocks is how many of this state's dirty blocks are currently
+	// counted in hfs.dirtyBytes. Kept in step with dirtyBlocks by chargeBlocks so
+	// the global write-buffer budget can pace writers, and released to 0 before the
+	// state is freed. Guarded by mu.
+	accountedBlocks int
+}
+
+// chargeBlocks moves the state's accounted dirty-block count by delta and mirrors
+// it into the global write-buffer budget: positive when a write dirties new
+// blocks, negative when a truncate or emptying drops them. Must be called with mu
+// held (it guards accountedBlocks); the budget update itself takes only the leaf
+// dirtyMu.
+func (st *inodeWrite) chargeBlocks(delta int) {
+	if delta == 0 {
+		return
+	}
+	st.accountedBlocks += delta
+	if st.hfs != nil {
+		st.hfs.addDirtyBytes(int64(delta) * db.BlockSize)
+	}
 }
 
 // markDirtyRange records that [off, off+n) was written, so the next Flush
@@ -202,7 +228,11 @@ func (st *inodeWrite) markDirtyRange(off, n int64) {
 	if st.presentBlocks == nil {
 		st.presentBlocks = make(map[int64]struct{})
 	}
+	added := 0
 	for b := off / db.BlockSize; b <= (off+n-1)/db.BlockSize; b++ {
+		if _, ok := st.dirtyBlocks[b]; !ok {
+			added++ // only NEW dirty blocks change the write-buffer footprint
+		}
 		st.dirtyBlocks[b] = struct{}{}
 		// Marking present here is what keeps dirtyBlocks a subset of
 		// presentBlocks. It is only truthful because Write faults every block it
@@ -211,6 +241,7 @@ func (st *inodeWrite) markDirtyRange(off, n int64) {
 		// covered everything that was stored in it.
 		st.presentBlocks[b] = struct{}{}
 	}
+	st.chargeBlocks(added)
 }
 
 // setSize records the state's logical size and publishes it for stat(2). Must be
@@ -268,9 +299,11 @@ func (st *inodeWrite) dropBlocksPast(s int64) {
 	if s > 0 {
 		lastLive = (s - 1) / db.BlockSize
 	}
+	removed := 0
 	for b := range st.dirtyBlocks {
 		if b > lastLive {
 			delete(st.dirtyBlocks, b)
+			removed++ // dropping a dirty block returns its write-buffer charge
 		}
 	}
 	for b := range st.presentBlocks {
@@ -278,6 +311,7 @@ func (st *inodeWrite) dropBlocksPast(s int64) {
 			delete(st.presentBlocks, b)
 		}
 	}
+	st.chargeBlocks(-removed)
 }
 
 // stagedReadAttempts bounds readStaged's retries. The transitions it rides out
@@ -459,6 +493,10 @@ func (st *inodeWrite) awaitUpload() syscall.Errno {
 func (st *inodeWrite) free() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	// Backstop the write-buffer accounting: a state freed with dirty blocks still
+	// charged — opened, written, then released without a Flush that transferred the
+	// charge to an upload — would otherwise leak budget until the mount restarts.
+	st.chargeBlocks(-st.accountedBlocks)
 	st.buf = nil
 	st.clearVisibleSize()
 	// Spill ownership transfers to the upload goroutine in Flush; a spill file
@@ -491,7 +529,7 @@ func (hfs *HamstorFS) acquireWrite(inodeID int64) *inodeWrite {
 	}
 	st := hfs.writeStates[inodeID]
 	if st == nil {
-		st = &inodeWrite{}
+		st = &inodeWrite{hfs: hfs}
 		// Nothing is known about the size yet, and the zero value of an
 		// atomic.Int64 would claim the file is empty. See visibleSize.
 		st.clearVisibleSize()
