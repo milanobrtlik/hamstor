@@ -417,6 +417,109 @@ func (h *HamstorHandle) materializeForWrite(ctx context.Context, off, n int64) s
 	return 0
 }
 
+// maybeEvict, called at the end of a spill-backed Write, commits completed blocks
+// of a large sequential write to S3 and hole-punches them out of the spill so the
+// local footprint stays within --write-buffer. It is what lets a file larger than
+// the local disk be copied. Narrowly gated (see inodeWrite.freshWrite): a file
+// written from empty as a contiguous sequential stream, on a filesystem that can
+// punch holes. Must be called with st.mu held.
+func (h *HamstorHandle) maybeEvict(ctx context.Context) syscall.Errno {
+	st := h.st
+	if st.evictBroken || !st.freshWrite || st.spillFile == nil ||
+		h.hfs.WriteBuffer <= 0 || int64(st.accountedBlocks)*db.BlockSize <= h.hfs.WriteBuffer {
+		return 0
+	}
+	if !h.hfs.holePunchSupported() {
+		st.evictBroken = true // cannot reclaim disk; keep Phase A whole-file spill
+		return 0
+	}
+	// The spill becomes the block-backed store: an evicted block is punched out of
+	// it and must then be faulted from S3, not read back as the hole left behind.
+	// presentBlocks already lists every written block (markDirtyRange), so flipping
+	// the flag is coherent — every not-yet-evicted block is still present in spill.
+	st.blockBacked = true
+	for int64(st.accountedBlocks)*db.BlockSize > h.hfs.WriteBuffer {
+		k := st.committedExtent / db.BlockSize
+		if (k+1)*db.BlockSize > st.seqHead {
+			break // the block at the frontier is still being written
+		}
+		if _, dirty := st.dirtyBlocks[k]; !dirty {
+			break // defensive: a sequential prefix is always dirty here
+		}
+		if errno := h.evictBlock(ctx, k); errno != 0 {
+			return errno
+		}
+	}
+	return 0
+}
+
+// evictBlock uploads block k out of the spill, commits it as a contiguous-prefix
+// extension (size = the extent through k), seeds the cache, and hole-punches the
+// block out of the spill. Called from maybeEvict with st.mu held. Committing at
+// (k+1)*BlockSize is sound ONLY because freshWrite guarantees nothing beyond the
+// frontier is committed (see inodeWrite.freshWrite); an existing file would be
+// truncated. On any failure it poisons the state and returns EIO — the
+// already-committed prefix stays durable, so the file is left validly truncated
+// rather than corrupt.
+func (h *HamstorHandle) evictBlock(ctx context.Context, k int64) syscall.Errno {
+	st := h.st
+	hfs := h.hfs
+	start := k * db.BlockSize
+	extent := min(int64(db.BlockSize), st.spillSize-start)
+	if extent <= 0 {
+		st.evictBroken = true
+		return 0
+	}
+
+	// Bound upload concurrency/heap like the flush path, and let other files'
+	// admitWrite see that draining is happening (the single-file exemption).
+	hfs.UploadSem <- struct{}{}
+	hfs.InflightCount.Add(1)
+	key := s3store.NewKey()
+	err := hfs.uploadBlockBody(ctx, key, st.spillFile, start, extent, h.inodeID, k)
+	hfs.InflightCount.Add(-1)
+	<-hfs.UploadSem
+	hfs.wakeWriters()
+	if err != nil {
+		log.Printf("hamstor: evict upload failed for inode %d block %d: %v", h.inodeID, k, err)
+		st.poisoned = err
+		return syscall.EIO
+	}
+
+	// Cache the plaintext BEFORE punching, so a reopen reads it locally.
+	hfs.cacheBlock(key, st.spillFile, start, extent)
+
+	size := start + extent
+	committed, orphaned, cErr := hfs.DB.CommitBlocks(h.inodeID,
+		[]db.BlockCommit{{Index: k, S3Key: key, Size: extent}}, size)
+	if cErr != nil {
+		log.Printf("hamstor: evict commit failed for inode %d block %d: %v", h.inodeID, k, cErr)
+		hfs.Store.Delete(ctx, key)
+		st.poisoned = cErr
+		return syscall.EIO
+	}
+	if !committed {
+		// The inode was unlinked mid-write: nothing references the object.
+		hfs.Store.Delete(ctx, key)
+		st.poisoned = fmt.Errorf("inode %d deleted during eviction", h.inodeID)
+		return syscall.EIO
+	}
+	hfs.dropObjects(ctx, orphaned)
+
+	if pErr := punchHole(st.spillFile, start, extent); pErr != nil {
+		// The block is committed and cached; we just cannot reclaim its spill.
+		// Stop evicting and let the rest of the file spill whole (Phase A).
+		log.Printf("hamstor: hole-punch failed for inode %d block %d: %v; disabling eviction", h.inodeID, k, pErr)
+		st.evictBroken = true
+	}
+	delete(st.dirtyBlocks, k)
+	delete(st.presentBlocks, k)
+	st.chargeBlocks(-1)
+	st.committedExtent = size
+	st.isNew = false // the inode now has committed blocks
+	return 0
+}
+
 // fetchBlock returns one block's plaintext, from the disk cache when it is
 // there and from S3 otherwise.
 //
@@ -883,6 +986,11 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		return 0, errno
 	}
 
+	// Advance the sequential-write frontier for eviction (Phase B). Cheap and
+	// harmless for every write; only the spill branches below act on it, via
+	// maybeEvict. Must see the O_APPEND-resolved offset.
+	h.st.trackSequential(off, int64(len(data)))
+
 	// If writing to spill file
 	if h.st.spillFile != nil {
 		end := off + int64(len(data))
@@ -900,6 +1008,9 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		h.st.dirty = true
 		h.st.markDirtyRange(off, int64(len(data)))
 		h.st.setSize(h.st.spillSize)
+		if errno := h.maybeEvict(ctx); errno != 0 {
+			return 0, errno
+		}
 		return uint32(len(data)), 0
 	}
 
@@ -924,6 +1035,9 @@ func (h *HamstorHandle) Write(ctx context.Context, data []byte, off int64) (uint
 		h.st.dirty = true
 		h.st.markDirtyRange(off, int64(len(data)))
 		h.st.setSize(h.st.spillSize)
+		if errno := h.maybeEvict(ctx); errno != 0 {
+			return 0, errno
+		}
 		return uint32(len(data)), 0
 	}
 
@@ -1062,6 +1176,14 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 	// under mu, exactly like the dirty set above.
 	dirtyCharge := h.st.accountedBlocks
 	h.st.accountedBlocks = 0
+
+	// Stop write-time eviction once any flush commits the tail. Eviction's
+	// incremental commits are sound only while committedExtent is the whole
+	// committed size (fresh + sequential, no flush yet); after a tail commit at the
+	// full size that no longer holds, so a post-fsync continued write must fall back
+	// to Phase A rather than risk truncating at an evictBlock. For the common single
+	// cp this fires at close, after all writing, and changes nothing.
+	h.st.evictBroken = true
 
 	// The presence map describes the backing store, so it is handed over with it
 	// rather than kept. This is the deliberate answer to D4's snapshot copy: the
@@ -1457,19 +1579,10 @@ func (h *HamstorHandle) flushAsync(att *uploadAttempt, uploadFile *os.File, bufS
 			}
 			blockKey := s3store.NewKey()
 
-			if hfs.Encryptor == nil {
-				// Stream the block straight off the snapshot — no file data on the
-				// Go heap. A SectionReader is a ReaderAt+Seeker, which is also what
-				// keeps the SDK on its no-allocation path (it slices the body
-				// itself rather than filling a PartSize buffer). Buffering here
-				// instead would put up to one block per in-flight upload on the
-				// heap, and UploadSem admits 32 of them against a 150 MB limit.
-				body := io.NewSectionReader(uploadFile, start, extent)
-				if err := hfs.Store.UploadReader(uploadCtx, blockKey, body, extent); err != nil {
-					uploadErr = err
-					break
-				}
-			} else if err := hfs.uploadSealedBlock(uploadCtx, blockKey, uploadFile, start, extent, inodeID, idx); err != nil {
+			// Same primitive the write-time eviction path uses: unencrypted streams
+			// straight off the snapshot (no heap, SDK no-alloc), encrypted seals one
+			// block bounded by EncryptSem. See HamstorFS.uploadBlockBody.
+			if err := hfs.uploadBlockBody(uploadCtx, blockKey, uploadFile, start, extent, inodeID, idx); err != nil {
 				uploadErr = err
 				break
 			}

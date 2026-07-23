@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/sys/unix"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -148,6 +149,13 @@ type HamstorFS struct {
 	dirtyCond     *sync.Cond
 	dirtyCondOnce sync.Once
 	dirtyBytes    int64
+
+	// punchProbeOnce/punchOK cache whether the spill filesystem supports hole
+	// punching, which write-time eviction (Phase B) needs to reclaim disk. Probed
+	// on first use; if unsupported the mount keeps Phase A behaviour (a single file
+	// needs local disk equal to its size).
+	punchProbeOnce sync.Once
+	punchOK        bool
 }
 
 // ensureDirtyCond lazily builds the write-buffer condition variable, so a bare
@@ -205,6 +213,48 @@ func (hfs *HamstorFS) admitWrite(n int64) {
 		hfs.dirtyCond.Wait()
 	}
 	hfs.dirtyMu.Unlock()
+}
+
+// uploadBlockBody PUTs one block read out of src[start:start+extent] under key,
+// encrypting it first when a passphrase is set. Shared by the flush loop and the
+// write-time eviction path so both keep the same heap profile: the unencrypted
+// path streams straight off the file (zero heap, SDK no-alloc), the encrypted one
+// seals a single block bounded by EncryptSem.
+func (hfs *HamstorFS) uploadBlockBody(ctx context.Context, key string, src *os.File, start, extent, inodeID, idx int64) error {
+	if hfs.Encryptor == nil {
+		return hfs.Store.UploadReader(ctx, key, io.NewSectionReader(src, start, extent), extent)
+	}
+	return hfs.uploadSealedBlock(ctx, key, src, start, extent, inodeID, idx)
+}
+
+// punchHole releases the disk backing [off, off+length) of a spill file once the
+// block there has been uploaded and committed, so a file larger than the local
+// disk can still be copied. The logical size is kept (FALLOC_FL_KEEP_SIZE), so the
+// region reads back as a hole and the offsets of later blocks do not move.
+func punchHole(f *os.File, off, length int64) error {
+	return unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, off, length)
+}
+
+// holePunchSupported probes once whether the spill filesystem supports hole
+// punching, caching the result. Eviction needs it to reclaim disk mid-copy; a
+// filesystem without it (some tmpfs, network mounts) keeps Phase A behaviour.
+func (hfs *HamstorFS) holePunchSupported() bool {
+	hfs.punchProbeOnce.Do(func() {
+		f, err := os.CreateTemp(hfs.SpillDir, "hamstor-punch-probe-*")
+		if err != nil {
+			return
+		}
+		defer os.Remove(f.Name())
+		defer f.Close()
+		if err := f.Truncate(int64(db.BlockSize)); err != nil {
+			return
+		}
+		if err := punchHole(f, 0, int64(db.BlockSize)); err != nil {
+			return
+		}
+		hfs.punchOK = true
+	})
+	return hfs.punchOK
 }
 
 // FreeOSMemoryInterval controls how often completed uploads trigger
