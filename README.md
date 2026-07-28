@@ -97,7 +97,7 @@ When running as a normal user, pass `--cache-dir` to a writable path. The defaul
 | `--uid` | caller's UID | Default file owner UID (needed under systemd, which runs as root) |
 | `--gid` | caller's GID | Default file owner GID |
 | `--thumbnail-dir` | the `--uid` user's `~/.cache/thumbnails` | Freedesktop thumbnail cache to write into. Needed when that user's `XDG_CACHE_HOME` is not the default, since the daemon cannot see their environment |
-| `--thumbnails` | `sync` | Thumbnail work at mount: `off`, or `sync` to materialize stored thumbnails into the freedesktop cache |
+| `--thumbnails` | `sync` | Thumbnail work at mount: `off`; `sync` to materialize stored thumbnails into the freedesktop cache; or `backfill` to also render thumbnails for images that have none, which reads every such original once |
 | `--stream-rate` | `5` | Streaming rate limit in MB/s for media (`0` disables streaming) |
 | `--stream-buffer` | `16` | Streaming memory per open media file, in MB; rounded down to whole 8 MiB blocks, minimum one |
 | `--entry-timeout` | `60s` | FUSE entry/attr cache timeout |

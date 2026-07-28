@@ -31,8 +31,10 @@ func IsImageExt(name string) bool {
 	return imageExts[ext]
 }
 
-// maxImageBytes is the limit for image decoding to prevent decompression bombs.
-const maxImageBytes = 100 << 20 // 100 MB
+// MaxImageBytes is the limit for image decoding to prevent decompression bombs.
+// Exported so a caller that would have to FETCH the bytes first can refuse
+// before paying for them rather than after.
+const MaxImageBytes = 100 << 20 // 100 MB
 
 // sizes are the freedesktop cache subdirectories and their bounding dimensions.
 var sizes = []struct {
@@ -56,7 +58,7 @@ type Rendered struct {
 
 // Render decodes an image and scales it to the freedesktop sizes.
 func Render(imgData []byte) (Rendered, error) {
-	if len(imgData) > maxImageBytes {
+	if len(imgData) > MaxImageBytes {
 		return Rendered{}, fmt.Errorf("image too large (%d bytes)", len(imgData))
 	}
 	img, _, err := image.Decode(bytes.NewReader(imgData))

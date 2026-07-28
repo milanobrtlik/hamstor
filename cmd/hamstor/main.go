@@ -57,7 +57,7 @@ func main() {
 	ownerUid := flag.Int("uid", os.Getuid(), "default file owner UID")
 	ownerGid := flag.Int("gid", os.Getgid(), "default file owner GID")
 	thumbDir := flag.String("thumbnail-dir", "", "freedesktop thumbnail cache to write into (default: the --uid user's ~/.cache/thumbnails; empty and unresolvable disables thumbnails)")
-	thumbMode := flag.String("thumbnails", "sync", "thumbnail work at mount: off, or sync (materialize stored thumbnails into the freedesktop cache)")
+	thumbMode := flag.String("thumbnails", "sync", "thumbnail work at mount: off; sync (materialize stored thumbnails into the freedesktop cache); or backfill (sync, then render and store thumbnails for images that have none, which reads every such original once)")
 	streamRate := flag.Int("stream-rate", 5, "streaming rate limit in MB/s for multimedia (0 to disable)")
 	streamBuffer := flag.Int("stream-buffer", 16, "streaming memory buffer in MB")
 	writeBuffer := flag.Int64("write-buffer", 1<<30, "max local un-uploaded write buffer in bytes; Write blocks past it so a bulk copy paces to the S3 upload rate and the spill dir stays bounded (0 to disable). A single file larger than this still needs local disk equal to its size.")
@@ -328,6 +328,12 @@ func main() {
 	uploadCtx, cancelUploads := context.WithCancel(context.Background())
 	defer cancelUploads()
 
+	switch *thumbMode {
+	case "off", "sync", "backfill":
+	default:
+		log.Fatalf("--thumbnails must be off, sync or backfill (got %q)", *thumbMode)
+	}
+
 	thumbCache := resolveThumbCache(*thumbDir, *ownerUid, *ownerGid)
 	if thumbCache.Dir == "" {
 		log.Printf("hamstor: thumbnails disabled (no cache directory; pass --thumbnail-dir)")
@@ -409,6 +415,22 @@ func main() {
 			}
 			if stats.Written > 0 || stats.Failed > 0 {
 				log.Printf("hamstor: thumbnail sync: %s", stats)
+			}
+
+			// Backfill AFTER sync, and only when asked. Sync is nearly free and
+			// makes everything already stored visible at once; backfill has to
+			// read every original that has no thumbnail yet, so it is opt-in and
+			// goes second — there is no point paying for an image whose
+			// thumbnail sync was about to materialize anyway.
+			if *thumbMode != "backfill" || ctx.Err() != nil {
+				return
+			}
+			bf, err := hfs.BackfillThumbnails(ctx)
+			if err != nil && ctx.Err() == nil {
+				log.Printf("hamstor: thumbnail backfill: %v", err)
+			}
+			if bf.Rendered > 0 || bf.Failed > 0 {
+				log.Printf("hamstor: thumbnail backfill: %s", bf)
 			}
 		}()
 	}

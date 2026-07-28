@@ -27,6 +27,7 @@ type ThumbTarget struct {
 	InodeID int64
 	Path    string
 	MtimeNs int64
+	Size    int64
 	Rec     ThumbRecord
 }
 
@@ -145,7 +146,7 @@ func (d *DB) AllThumbnailTargets() ([]ThumbTarget, error) {
 			SELECT i.id, CASE WHEN p.path = '' THEN i.name ELSE p.path || '/' || i.name END
 			  FROM inodes i JOIN paths p ON i.parent_id = p.id
 		)
-		SELECT t.inode_id, p.path, i.mtime_ns,
+		SELECT t.inode_id, p.path, i.mtime_ns, i.size,
 		       t.s3_key, t.offset, t.length, t.normal_len, t.src_mtime_ns
 		  FROM thumbnails t
 		  JOIN inodes i ON i.id = t.inode_id
@@ -158,7 +159,7 @@ func (d *DB) AllThumbnailTargets() ([]ThumbTarget, error) {
 	var out []ThumbTarget
 	for rows.Next() {
 		var tt ThumbTarget
-		if err := rows.Scan(&tt.InodeID, &tt.Path, &tt.MtimeNs,
+		if err := rows.Scan(&tt.InodeID, &tt.Path, &tt.MtimeNs, &tt.Size,
 			&tt.Rec.S3Key, &tt.Rec.Offset, &tt.Rec.Length, &tt.Rec.NormalLen, &tt.Rec.SrcMtimeNs); err != nil {
 			return nil, err
 		}
@@ -179,7 +180,7 @@ func (d *DB) ThumbnaillessImages() ([]ThumbTarget, error) {
 			SELECT i.id, CASE WHEN p.path = '' THEN i.name ELSE p.path || '/' || i.name END
 			  FROM inodes i JOIN paths p ON i.parent_id = p.id
 		)
-		SELECT i.id, p.path, i.mtime_ns
+		SELECT i.id, p.path, i.mtime_ns, i.size
 		  FROM inodes i
 		  JOIN paths p ON p.id = i.id
 		 WHERE i.status = 'committed'
@@ -195,7 +196,7 @@ func (d *DB) ThumbnaillessImages() ([]ThumbTarget, error) {
 	var out []ThumbTarget
 	for rows.Next() {
 		var tt ThumbTarget
-		if err := rows.Scan(&tt.InodeID, &tt.Path, &tt.MtimeNs); err != nil {
+		if err := rows.Scan(&tt.InodeID, &tt.Path, &tt.MtimeNs, &tt.Size); err != nil {
 			return nil, err
 		}
 		out = append(out, tt)
