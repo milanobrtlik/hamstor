@@ -1,0 +1,70 @@
+version: "2"
+
+# Run with `make lint`.
+#
+# The point of the exclusions below is to keep every remaining finding worth
+# reading. A linter that reports fifty `defer f.Close()` is a linter nobody
+# runs, and the one real bug in the list goes out with the noise — which is
+# precisely what happened here: a bare os.Rename restoring a staging claim
+# (the silent lost write the staging-claim rules exist to prevent) sat
+# undetected among 50 errcheck hits.
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose # S3 responses: a leaked body holds a connection
+    - sqlclosecheck # metadata layer is hand-rolled database/sql
+    - rowserrcheck # rows.Err() after the loop — a silently short result set
+    - errorlint # %w / errors.Is correctness in the wrapping this repo does
+    - copyloopvar
+    - unconvert
+    - misspell
+
+  settings:
+    errcheck:
+      # Deferred close/rollback on a read path. The error says nothing the
+      # caller can act on, and the write paths that DO matter check theirs.
+      exclude-functions:
+        - (*os.File).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Tx).Rollback
+        - (io.ReadCloser).Close
+        - (io.Closer).Close
+        # bytes.Buffer never fails a write, so binary.Write to one cannot.
+        - encoding/binary.Write
+
+    staticcheck:
+      # This list is golangci-lint's own default plus -QF1008. Setting `checks`
+      # REPLACES the default rather than extending it, so the ST* entries have
+      # to be repeated or naming checks golangci-lint deliberately leaves off
+      # come back on — ST1003 alone wants every Uid/Gid in the tree renamed to
+      # UID/GID, including the thumb.Cache fields named that way on purpose.
+      #
+      # QF1008 wants out.Attr.Size written as out.Size. Naming the embedded
+      # struct is clearer about where a field actually lives, which matters in
+      # the go-fuse types where several embedded structs carry a Size.
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -QF1008
+
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Test cleanup is best-effort by construction: t.Cleanup closures cannot
+      # report and a failed Close in a teardown fails nothing that matters.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

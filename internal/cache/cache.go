@@ -64,7 +64,10 @@ func New(dir string, maxBytes int64) (*DiskCache, error) {
 func (c *DiskCache) initApproxSize() {
 	var total int64
 	stale := make(map[string]int64)
-	filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+	// _ = : the callback swallows every per-entry error and returns nil
+	// unconditionally, so WalkDir cannot return anything but nil — including
+	// when the root itself fails to stat, which it reports through the callback.
+	_ = filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -155,8 +158,11 @@ func (c *DiskCache) Open(s3Key string) (*os.File, error) {
 		return nil, os.ErrNotExist
 	}
 	// Touch mtime so LRU eviction reflects actual access time, not write time.
+	// Best-effort by design: a failure here only makes this entry look colder
+	// than it is to the evictor, and it happens on every cache hit, so reporting
+	// it would trade a slightly worse eviction order for a flooded log.
 	now := time.Now()
-	os.Chtimes(p, now, now)
+	_ = os.Chtimes(p, now, now)
 	return os.Open(p)
 }
 
@@ -254,7 +260,7 @@ func (c *DiskCache) Evict(s3Key string) {
 	var size int64
 	if info, err := os.Stat(p); err == nil {
 		if info.IsDir() {
-			filepath.WalkDir(p, func(_ string, d os.DirEntry, err error) error {
+			_ = filepath.WalkDir(p, func(_ string, d os.DirEntry, err error) error { //nolint:errcheck // callback always returns nil
 				if err != nil || d.IsDir() {
 					return nil
 				}
@@ -279,7 +285,7 @@ func (c *DiskCache) Evict(s3Key string) {
 func (c *DiskCache) Size() (totalBytes int64, count int) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error { //nolint:errcheck // callback always returns nil
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -364,7 +370,7 @@ func (c *DiskCache) evictLRU() {
 	var entries []cacheEntry
 	var totalSize int64
 
-	filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error { //nolint:errcheck // callback always returns nil
 		if err != nil || d.IsDir() {
 			return nil
 		}

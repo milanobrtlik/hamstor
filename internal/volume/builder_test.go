@@ -18,7 +18,7 @@ func TestRestoreClaimReturnsClaimWhenOrigGone(t *testing.T) {
 		t.Fatalf("write claim: %v", err)
 	}
 
-	restoreClaim(claim, orig)
+	RestoreClaim(claim, orig)
 
 	got, err := os.ReadFile(orig)
 	if err != nil {
@@ -50,7 +50,7 @@ func TestRestoreClaimDropsStaleClaimWhenNewerStagingExists(t *testing.T) {
 		t.Fatalf("write newer staging file: %v", err)
 	}
 
-	restoreClaim(claim, orig)
+	RestoreClaim(claim, orig)
 
 	got, err := os.ReadFile(orig)
 	if err != nil {
@@ -64,13 +64,13 @@ func TestRestoreClaimDropsStaleClaimWhenNewerStagingExists(t *testing.T) {
 	}
 }
 
-// TestRestoreClaimMissingClaimIsNoop verifies restoreClaim tolerates an already
+// TestRestoreClaimMissingClaimIsNoop verifies RestoreClaim tolerates an already
 // removed claim (e.g. a concurrent cleanup) without creating anything.
 func TestRestoreClaimMissingClaimIsNoop(t *testing.T) {
 	dir := t.TempDir()
 	orig := filepath.Join(dir, "42")
 
-	restoreClaim(orig+".packing", orig)
+	RestoreClaim(orig+".packing", orig)
 
 	if _, err := os.Stat(orig); !os.IsNotExist(err) {
 		t.Errorf("orig unexpectedly created (err=%v)", err)

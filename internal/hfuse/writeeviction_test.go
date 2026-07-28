@@ -276,8 +276,8 @@ func TestWriteEvictionUploadFailureLeavesValidPrefix(t *testing.T) {
 func TestTrackSequentialDisablesEvictionOnGapOrRevisit(t *testing.T) {
 	t.Run("gap above the frontier", func(t *testing.T) {
 		st := &inodeWrite{}
-		st.trackSequential(0, db.BlockSize)      // 0 .. 8 MiB
-		st.trackSequential(db.BlockSize, 4096)   // contiguous, still fine
+		st.trackSequential(0, db.BlockSize)    // 0 .. 8 MiB
+		st.trackSequential(db.BlockSize, 4096) // contiguous, still fine
 		if st.evictBroken {
 			t.Fatal("a contiguous append should not break eviction")
 		}

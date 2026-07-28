@@ -349,7 +349,7 @@ func main() {
 		StreamRate: *streamRate, StreamBuffer: *streamBuffer,
 		WriteBuffer: *writeBuffer,
 		UploadCtx:   uploadCtx,
-		UploadSem: make(chan struct{}, 32),
+		UploadSem:   make(chan struct{}, 32),
 		// Four block encryptions at once: each holds a block's plaintext and its
 		// sealed copy, so 4 * 2 * 8 MiB = 64 MiB, comfortably inside the 150 MiB
 		// limit set above alongside the write buffers (one block each now). The

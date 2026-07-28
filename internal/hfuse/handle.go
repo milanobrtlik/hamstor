@@ -494,13 +494,17 @@ func (h *HamstorHandle) evictBlock(ctx context.Context, k int64) syscall.Errno {
 		[]db.BlockCommit{{Index: k, S3Key: key, Size: extent}}, size)
 	if cErr != nil {
 		log.Printf("hamstor: evict commit failed for inode %d block %d: %v", h.inodeID, k, cErr)
-		hfs.Store.Delete(ctx, key)
+		// dropObjects, not a bare Store.Delete: cacheBlock above just put this
+		// block's plaintext in the disk cache under this key, and no row will
+		// ever name it now. Deleting only the S3 side leaves that entry sitting
+		// against --cache-size until LRU happens to reach it.
+		hfs.dropObjects(ctx, []string{key})
 		st.poisoned = cErr
 		return syscall.EIO
 	}
 	if !committed {
 		// The inode was unlinked mid-write: nothing references the object.
-		hfs.Store.Delete(ctx, key)
+		hfs.dropObjects(ctx, []string{key})
 		st.poisoned = fmt.Errorf("inode %d deleted during eviction", h.inodeID)
 		return syscall.EIO
 	}
@@ -1221,7 +1225,11 @@ func (h *HamstorHandle) Flush(ctx context.Context) syscall.Errno {
 			// sibling handle that loaded the inode back now would get a base
 			// that never contained them and commit over the gap, so poison the
 			// state instead and let close(2)/fsync report it.
-			att.err = fmt.Errorf("stage flush failed: errno %d", errno)
+			// %w, not "errno %d": errno is a syscall.Errno, so wrapping both
+			// renders it ("no space left on device" rather than "28" in the log
+			// the user actually sees) and keeps errors.Is working for callers
+			// that want to tell ENOSPC from the rest.
+			att.err = fmt.Errorf("stage flush failed: %w", errno)
 			h.st.poisoned = att.err
 		}
 		close(att.done)
@@ -1786,6 +1794,12 @@ func (hfs *HamstorFS) uploadSealedBlock(ctx context.Context, key string, src *os
 		return fmt.Errorf("snapshot read block %d: %w", idx, err)
 	}
 	body, err := hfs.Encryptor.Encrypt(plain)
+	//nolint:ineffassign,staticcheck // Deliberate: drops the plaintext block so
+	// only the sealed copy is live across the PUT below, which is what keeps the
+	// encrypted path inside EncryptSem's budget (see "Spill to disk at one
+	// block"). Go's liveness-precise GC most likely already collects it here, so
+	// this is belt-and-braces rather than load-bearing — but it is the kind of
+	// belt this file is written to wear, and the linter cannot see the intent.
 	plain = nil
 	if err != nil {
 		log.Printf("hamstor: encrypt failed for inode %d block %d: %v", inodeID, idx, err)

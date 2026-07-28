@@ -295,6 +295,10 @@ func copyRetainedData(dst string, blocks []pendingBlock, snap *os.File, enc *cry
 				return nil, false, fmt.Errorf("read block %d: %w", b.Index, rerr)
 			}
 			body, eerr := enc.Encrypt(plain)
+			//nolint:ineffassign,staticcheck // Deliberate: drops the plaintext
+			// block so only the sealed copy is live while it is written out.
+			// Retention re-seals a whole block set one block at a time precisely
+			// to bound the heap; see "Failed-upload recovery".
 			plain = nil
 			if eerr != nil {
 				return nil, false, fmt.Errorf("encrypt block %d: %w", b.Index, eerr)

@@ -666,6 +666,10 @@ func (d *DB) AllS3KeySet() (map[string]struct{}, error) {
 		for rows.Next() {
 			var key string
 			if err := rows.Scan(&key); err != nil {
+				//nolint:sqlclosecheck // Closed here and after rows.Err() below,
+				// deliberately not deferred: this loop runs one query per table,
+				// so a defer would hold every earlier result set open until the
+				// function returns instead of releasing each before the next.
 				rows.Close()
 				return nil, err
 			}
@@ -1056,6 +1060,9 @@ func (d *DB) commitBlocksTx(id int64, blocks []BlockCommit, size, lastLive, now 
 		var idx int64
 		var key string
 		if err := rows.Scan(&idx, &key); err != nil {
+			//nolint:sqlclosecheck // Closed here and after rows.Err() below,
+			// deliberately not deferred: the same transaction writes below, and
+			// a defer would hold this read cursor open across those writes.
 			rows.Close()
 			return false, nil, err
 		}
@@ -1188,6 +1195,9 @@ func (d *DB) DeleteBlocksForInode(id int64) ([]string, error) {
 	for rows.Next() {
 		var key string
 		if err := rows.Scan(&key); err != nil {
+			//nolint:sqlclosecheck // Closed here and after rows.Err() below,
+			// deliberately not deferred: the same transaction writes below, and
+			// a defer would hold this read cursor open across those writes.
 			rows.Close()
 			return nil, err
 		}
@@ -1290,6 +1300,10 @@ func (d *DB) SetAttr(id int64, size *int64, mode *uint32, mtimeNs *int64) ([]str
 		for rows.Next() {
 			var key string
 			if sErr := rows.Scan(&key); sErr != nil {
+				//nolint:sqlclosecheck // Closed here and after rows.Err() below,
+				// deliberately not deferred: the same transaction writes below,
+				// and a defer would hold this read cursor open across those
+				// writes.
 				rows.Close()
 				return nil, sErr
 			}

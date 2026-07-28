@@ -9,6 +9,15 @@ LDFLAGS = -X main.version=$(VERSION) \
           -X github.com/milan/hamstor/internal/creds.AWSRegion=$(AWS_REGION) \
           -X github.com/milan/hamstor/internal/creds.Passphrase=$(HAMSTOR_PASSPHRASE)
 
+lint:
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found. Install it with:"; \
+		echo "  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; \
+		exit 1; \
+	}
+	golangci-lint run ./...
+	go vet ./...
+
 build:
 # Silenced deliberately: LDFLAGS carries the S3 access key, the secret key and
 # the encryption passphrase, so echoing the command prints all three. They then
@@ -63,4 +72,4 @@ purge-s3: build
 	@read -p "Type 'yes' to confirm: " confirm && [ "$$confirm" = "yes" ] || { echo "Aborted."; exit 1; }
 	./hamstor --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) purge-s3
 
-.PHONY: build install uninstall purge-s3
+.PHONY: lint build install uninstall purge-s3

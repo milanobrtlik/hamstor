@@ -50,6 +50,34 @@ func Compact(ctx context.Context, database *db.DB, store *s3store.Store, deadRat
 	return result, nil
 }
 
+// reseal returns a volume to 'sealed' after a compaction attempt gave up on it.
+//
+// The error is logged rather than dropped because nothing else would ever
+// surface it: GetVolumesForCompaction selects `status = 'sealed'`, so a rollback
+// that silently fails leaves the volume pinned in 'compacting' — never chosen
+// for compaction again, and its dead space never reclaimed. That is invisible
+// from the outside, and this log line is the only trace it leaves.
+func reseal(database *db.DB, key string) {
+	if err := database.SetVolumeStatus(key, "sealed"); err != nil {
+		log.Printf("compact: volume %s stuck in 'compacting' — rollback to sealed failed: %v", key, err)
+	}
+}
+
+// dropNewVolume discards the half-built replacement volume after a failed
+// compaction. Both halves are best-effort: whatever survives is an orphan (an
+// object no row names, or a row with no live needles) and gc collects it on a
+// later run. Logging is what keeps that orphan explicable when it shows up.
+func dropNewVolume(ctx context.Context, database *db.DB, store *s3store.Store, key string, alsoS3 bool) {
+	if alsoS3 {
+		if err := store.Delete(ctx, key); err != nil {
+			log.Printf("compact: drop new volume object %s: %v (left for gc)", key, err)
+		}
+	}
+	if err := database.DeleteVolume(key); err != nil {
+		log.Printf("compact: drop new volume row %s: %v (left for gc)", key, err)
+	}
+}
+
 func compactVolume(ctx context.Context, database *db.DB, store *s3store.Store, vol db.VolumeRecord) (int, int64, error) {
 	// Mark as compacting
 	if err := database.SetVolumeStatus(vol.S3Key, "compacting"); err != nil {
@@ -59,7 +87,7 @@ func compactVolume(ctx context.Context, database *db.DB, store *s3store.Store, v
 	// Get live needles
 	needles, err := database.NeedlesInVolume(vol.S3Key)
 	if err != nil {
-		database.SetVolumeStatus(vol.S3Key, "sealed") // rollback status
+		reseal(database, vol.S3Key)
 		return 0, 0, fmt.Errorf("get needles: %w", err)
 	}
 
@@ -67,7 +95,7 @@ func compactVolume(ctx context.Context, database *db.DB, store *s3store.Store, v
 		// All dead — just delete
 		if err := store.Delete(ctx, vol.S3Key); err != nil {
 			log.Printf("compact: delete empty volume %s S3: %v", vol.S3Key, err)
-			database.SetVolumeStatus(vol.S3Key, "sealed")
+			reseal(database, vol.S3Key)
 			return 0, 0, nil
 		}
 		if err := database.DeleteVolume(vol.S3Key); err != nil {
@@ -84,7 +112,7 @@ func compactVolume(ctx context.Context, database *db.DB, store *s3store.Store, v
 		// Download needle from old volume
 		data, err := store.DownloadRange(ctx, vol.S3Key, needle.VolOffset, needle.VolSize)
 		if err != nil {
-			database.SetVolumeStatus(vol.S3Key, "sealed")
+			reseal(database, vol.S3Key)
 			return 0, 0, fmt.Errorf("download needle inode %d: %w", needle.ID, err)
 		}
 
@@ -101,23 +129,23 @@ func compactVolume(ctx context.Context, database *db.DB, store *s3store.Store, v
 	// Upload new volume
 	newKey := s3store.NewKey()
 	if err := database.InsertVolume(newKey, int64(buf.Len()), int64(buf.Len()), len(commits), len(commits), "open"); err != nil {
-		database.SetVolumeStatus(vol.S3Key, "sealed")
+		reseal(database, vol.S3Key)
 		return 0, 0, fmt.Errorf("insert new volume: %w", err)
 	}
 
 	if err := store.Upload(ctx, newKey, buf.Bytes()); err != nil {
-		database.DeleteVolume(newKey)
-		database.SetVolumeStatus(vol.S3Key, "sealed")
+		dropNewVolume(ctx, database, store, newKey, false)
+		reseal(database, vol.S3Key)
 		return 0, 0, fmt.Errorf("upload new volume: %w", err)
 	}
 
 	// Atomically commit needles to new volume
 	committedIDs, err := database.CommitNeedlesToVolume(newKey, int64(buf.Len()), commits, false, vol.S3Key)
 	if err != nil {
-		// New volume uploaded but DB failed — will be GC'd as orphan
-		store.Delete(ctx, newKey)
-		database.DeleteVolume(newKey)
-		database.SetVolumeStatus(vol.S3Key, "sealed")
+		// New volume uploaded but the DB refused it. Drop both halves; anything
+		// that survives the drop is an orphan and gc collects it.
+		dropNewVolume(ctx, database, store, newKey, true)
+		reseal(database, vol.S3Key)
 		return 0, 0, fmt.Errorf("commit to new volume: %w", err)
 	}
 
@@ -127,19 +155,17 @@ func compactVolume(ctx context.Context, database *db.DB, store *s3store.Store, v
 	}
 
 	if len(committedIDs) == 0 {
-		// All needles were modified during compaction — clean up new volume
-		if err := store.Delete(ctx, newKey); err != nil {
-			log.Printf("compact: delete empty new volume %s: %v", newKey, err)
-		}
-		database.DeleteVolume(newKey)
-		database.SetVolumeStatus(vol.S3Key, "sealed")
+		// Every needle was rewritten while we were compacting, so the volume we
+		// just built holds nothing anyone references.
+		dropNewVolume(ctx, database, store, newKey, true)
+		reseal(database, vol.S3Key)
 		return 0, 0, nil
 	}
 
 	// Delete old volume
 	if err := store.Delete(ctx, vol.S3Key); err != nil {
 		log.Printf("compact: delete old volume %s: %v (will retry next run)", vol.S3Key, err)
-		database.SetVolumeStatus(vol.S3Key, "sealed")
+		reseal(database, vol.S3Key)
 	} else if err := database.DeleteVolume(vol.S3Key); err != nil {
 		log.Printf("compact: delete old volume row %s: %v", vol.S3Key, err)
 	}

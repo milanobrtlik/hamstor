@@ -12,6 +12,7 @@ import (
 
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/s3store"
+	"github.com/milan/hamstor/internal/volume"
 )
 
 // Cleanup removes pending inodes left by a crash. Run it AFTER RecoverPending.
@@ -230,7 +231,13 @@ func recoverSet(d *db.DB, store *s3store.Store, dir string, inodeID int64, name 
 		return false, nil
 	}
 	for _, o := range orphaned {
-		store.Delete(ctx, o)
+		if delErr := store.Delete(ctx, o); delErr != nil {
+			// Superseded by the recovered set, so nothing reads it either way;
+			// gc collects what stays behind. Logged for the same reason drop()
+			// logs: an object that outlives its row is easier to explain later
+			// if the run that orphaned it said so.
+			log.Printf("hamstor: recover: delete superseded object %s: %v", o, delErr)
+		}
 	}
 	return true, nil
 }
@@ -370,8 +377,15 @@ func CleanupStagingDir(d *db.DB, stagingDir string) error {
 				cleaned++
 				continue
 			}
-			// Inode exists but has no storage — rename back so builder picks it up
-			os.Rename(filepath.Join(stagingDir, e.Name()), filepath.Join(stagingDir, baseName))
+			// Inode exists but has no storage — put it back so the builder picks
+			// it up. Through RestoreClaim, not a bare rename: a crash can leave
+			// BOTH "<id>" and "<id>.packing" on disk (the builder claimed the
+			// file, an overwrite Flush staged a newer one at the original path,
+			// and the machine went down before either finished). Renaming the
+			// stale claim over the newer file loses that write silently, exactly
+			// as it would at runtime — nothing about being startup makes the
+			// pair impossible, only concurrent.
+			volume.RestoreClaim(filepath.Join(stagingDir, e.Name()), filepath.Join(stagingDir, baseName))
 			cleaned++
 			continue
 		}

@@ -118,7 +118,7 @@ func (b *Builder) StagePath(inodeID int64) string {
 	return filepath.Join(b.stagingDir, strconv.FormatInt(inodeID, 10))
 }
 
-// restoreClaim returns a claimed staging file (claimPath, e.g. "<id>.packing"
+// RestoreClaim returns a claimed staging file (claimPath, e.g. "<id>.packing"
 // or "<id>.flushing") to its original path, UNLESS a newer staging file already
 // exists there. A concurrent overwrite Flush writes a fresh staging file at
 // origPath (tmp+rename) and bumps the inode's mtime; renaming the stale claim
@@ -138,7 +138,7 @@ func (b *Builder) StagePath(inodeID int64) string {
 // RENAME_NOREPLACE gives exactly the needed semantics atomically. If the kernel
 // or filesystem lacks it, fall back to stat+rename and accept the window rather
 // than strand the claim.
-func restoreClaim(claimPath, origPath string) {
+func RestoreClaim(claimPath, origPath string) {
 	err := unix.Renameat2(unix.AT_FDCWD, claimPath, unix.AT_FDCWD, origPath, unix.RENAME_NOREPLACE)
 	switch err {
 	case nil:
@@ -164,6 +164,25 @@ func restoreClaim(claimPath, origPath string) {
 		}
 	default:
 		log.Printf("hamstor: volume builder restore %s: %v", claimPath, err)
+	}
+}
+
+// dropVolume discards a volume the builder started but could not finish: the
+// row always, the S3 object too when the upload had already landed.
+//
+// Both halves are best-effort and gc collects whatever survives, but neither is
+// silent. A volume row that outlives its needles is the shape that makes
+// live_count accounting look wrong later, and an object with no row is the
+// shape gc reports as an orphan — in both cases the run that created the
+// situation is the only thing that can explain it.
+func (b *Builder) dropVolume(volKey string, alsoS3 bool) {
+	if err := b.db.DeleteVolume(volKey); err != nil {
+		log.Printf("hamstor: volume builder drop volume row %s: %v (left for gc)", volKey, err)
+	}
+	if alsoS3 {
+		if err := b.store.Delete(b.ctx, volKey); err != nil {
+			log.Printf("hamstor: volume builder drop volume object %s: %v (left for gc)", volKey, err)
+		}
 	}
 }
 
@@ -249,13 +268,13 @@ func (b *Builder) FlushInode(inodeID int64) error {
 	// CommitNeedlesToVolume detects concurrent Flush modifications.
 	meta, metaErr := b.db.GetInode(inodeID)
 	if metaErr != nil {
-		restoreClaim(claimPath, path)
+		RestoreClaim(claimPath, path)
 		return nil // inode deleted, ok
 	}
 
 	data, err := os.ReadFile(claimPath)
 	if err != nil {
-		restoreClaim(claimPath, path) // put back for builder to retry
+		RestoreClaim(claimPath, path) // put back for builder to retry
 		return fmt.Errorf("flush inode %d: read staging: %w", inodeID, err)
 	}
 
@@ -263,21 +282,20 @@ func (b *Builder) FlushInode(inodeID int64) error {
 	needle := db.NeedleCommit{InodeID: inodeID, Offset: 0, Size: int64(len(data)), MtimeNs: meta.MtimeNs}
 
 	if err := b.db.InsertVolume(volKey, 0, 0, 0, 0, "open"); err != nil {
-		restoreClaim(claimPath, path)
+		RestoreClaim(claimPath, path)
 		return fmt.Errorf("flush inode %d: insert volume: %w", inodeID, err)
 	}
 
 	if err := b.store.Upload(b.ctx, volKey, data); err != nil {
-		b.db.DeleteVolume(volKey)
-		restoreClaim(claimPath, path)
+		b.dropVolume(volKey, false)
+		RestoreClaim(claimPath, path)
 		return fmt.Errorf("flush inode %d: upload: %w", inodeID, err)
 	}
 
 	committedIDs, err := b.db.CommitNeedlesToVolume(volKey, int64(len(data)), []db.NeedleCommit{needle}, true, "")
 	if err != nil {
-		b.db.DeleteVolume(volKey)
-		b.store.Delete(b.ctx, volKey)
-		restoreClaim(claimPath, path) // restore for retry
+		b.dropVolume(volKey, true)
+		RestoreClaim(claimPath, path) // restore for retry
 		return fmt.Errorf("flush inode %d: commit: %w", inodeID, err)
 	}
 	if len(committedIDs) > 0 {
@@ -460,8 +478,11 @@ func (b *Builder) scanAndSeal(forceSmall bool) (sealed int, more bool) {
 		data, err := os.ReadFile(claimPath)
 		if err != nil {
 			log.Printf("hamstor: volume builder read staged %s: %v", claimPath, err)
-			// Put it back for the next cycle
-			os.Rename(claimPath, path)
+			// Put it back for the next cycle — via RestoreClaim, never a bare
+			// rename: a concurrent overwrite Flush may already have staged newer
+			// data at path, and renaming this claim back over it is the silent
+			// lost write RestoreClaim exists to prevent.
+			RestoreClaim(claimPath, path)
 			continue
 		}
 
@@ -486,7 +507,7 @@ func (b *Builder) scanAndSeal(forceSmall bool) (sealed int, more bool) {
 		// Put claimed files back so the next scan can pick them up, unless a
 		// concurrent overwrite already wrote a newer staging file at the path.
 		for _, sf := range staged {
-			restoreClaim(sf.path, strings.TrimSuffix(sf.path, ".packing"))
+			RestoreClaim(sf.path, strings.TrimSuffix(sf.path, ".packing"))
 		}
 		return 0, false
 	}
@@ -503,7 +524,7 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 
 	restorePaths := func(paths []string) {
 		for _, p := range paths {
-			restoreClaim(p, strings.TrimSuffix(p, ".packing"))
+			RestoreClaim(p, strings.TrimSuffix(p, ".packing"))
 		}
 	}
 
@@ -534,7 +555,7 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 
 		if err := b.store.Upload(b.ctx, volKey, data); err != nil {
 			log.Printf("hamstor: volume builder upload %s: %v", volKey, err)
-			b.db.DeleteVolume(volKey)
+			b.dropVolume(volKey, false)
 			restorePaths(paths)
 			return
 		}
@@ -542,8 +563,7 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 		committedIDs, err := b.db.CommitNeedlesToVolume(volKey, int64(len(data)), commits, true, "")
 		if err != nil {
 			log.Printf("hamstor: volume builder commit %s: %v", volKey, err)
-			b.db.DeleteVolume(volKey)
-			b.store.Delete(b.ctx, volKey)
+			b.dropVolume(volKey, true)
 			restorePaths(paths)
 			return
 		}
@@ -574,7 +594,7 @@ func (b *Builder) sealBatch(staged []stagedFile) {
 				// Needle not committed (superseded by a new Flush). Restore the
 				// claim for a later pass unless a newer staging file already
 				// exists at the original path.
-				restoreClaim(p, strings.TrimSuffix(p, ".packing"))
+				RestoreClaim(p, strings.TrimSuffix(p, ".packing"))
 			}
 		}
 
