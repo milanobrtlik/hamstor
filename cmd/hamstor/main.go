@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -121,25 +122,20 @@ func main() {
 		r = creds.AWSRegion
 	}
 
-	if dir := filepath.Dir(*dbPath); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Fatalf("create db directory: %v", err)
-		}
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Take an exclusive advisory lock on the DB so a mount and a mutating
-	// subcommand (gc/compact/purge-s3/restore) cannot run against the
-	// same database/bucket concurrently — which would let one delete S3 volume
-	// objects out from under the other. fsck/cache/version returned earlier and
-	// do not take the lock.
-	lockFile, lockErr := acquireDBLock(*dbPath)
+	// Check the database exists (for the subcommands that must not create one),
+	// create its directory, then take an exclusive advisory lock on it so a mount
+	// and a mutating subcommand (gc/compact/purge-s3/restore) cannot run against
+	// the same database/bucket concurrently — which would let one delete S3
+	// volume objects out from under the other. fsck/cache/version returned
+	// earlier; fsck does its own existence check and does not take the lock.
+	lockFile, lockErr := openDBPath(*dbPath, dbMustExist(subcmd))
 	if errors.Is(lockErr, errLockHeld) {
 		log.Fatalf("hamstor: another instance is using %s", *dbPath)
 	} else if lockErr != nil {
-		log.Fatalf("hamstor: cannot lock %s: %v", *dbPath, lockErr)
+		log.Fatalf("hamstor: %v", lockErr)
 	}
 	defer lockFile.Close()
 
@@ -532,6 +528,73 @@ func acquireDBLock(dbPath string) (*os.File, error) {
 	return f, nil
 }
 
+// dbMustExist reports whether subcmd refuses to create a database rather than
+// running against a fresh empty one.
+//
+// purge-s3 is deliberately absent: "I lost the database, wipe the bucket and
+// start over" is a real workflow, and it already requires the bucket name typed
+// back. restore and mount mode are absent because creating the file is their
+// job. Everything else in this list only ever reads a filesystem that already
+// exists, so being handed a new one means the caller is not where they think
+// they are.
+func dbMustExist(subcmd string) bool {
+	switch subcmd {
+	case "gc", "compact", "fsck":
+		return true
+	}
+	return false
+}
+
+// requireExistingDB reports a missing database instead of letting db.Open create
+// an empty one.
+//
+// db.Open is create-or-open and seedRoot then inserts the root inode, so a
+// database that did not exist a moment ago is indistinguishable from a healthy
+// filesystem holding no files. For gc that is catastrophic rather than merely
+// wrong: AllS3KeySet returns nothing, so every object in the bucket is an
+// orphan and one DeleteBatch removes all of them. The default --db is the
+// relative path data/hamstor.db, so this is one `cd` away at any time.
+func requireExistingDB(dbPath string) error {
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			hint := ""
+			if !filepath.IsAbs(dbPath) {
+				hint = " (a relative path, resolved against the current directory)"
+			}
+			return fmt.Errorf("database %s%s: %w — refusing to create one, "+
+				"because an empty database looks exactly like a filesystem with no files. "+
+				"Pass --db, or run `hamstor restore` to fetch it from S3", dbPath, hint, fs.ErrNotExist)
+		}
+		return fmt.Errorf("stat %s: %w", dbPath, err)
+	}
+	return nil
+}
+
+// openDBPath is the order in which the database path is made ready, kept in one
+// function so it can be tested: the existence check comes FIRST, before the
+// directory is created and before the lock file is opened. Both of those are
+// side effects on a path the caller may have got wrong, and the caller after
+// this one — litestream — is worse still: it replicates whatever database it is
+// given, so a run against an accidentally created empty one can publish a
+// generation over the real backup and destroy the way back.
+//
+// Evidence this is not theoretical: a data/ directory holding hamstor.db.lock
+// and .hamstor.db-litestream/ but no hamstor.db is exactly what a wrong-working
+// -directory run leaves behind.
+func openDBPath(dbPath string, mustExist bool) (*os.File, error) {
+	if mustExist {
+		if err := requireExistingDB(dbPath); err != nil {
+			return nil, err
+		}
+	}
+	if dir := filepath.Dir(dbPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create db directory: %w", err)
+		}
+	}
+	return acquireDBLock(dbPath)
+}
+
 func setupEncryption(database *db.DB, passphrase string) *crypto.Encryptor {
 	pass := passphrase
 	if pass == "" {
@@ -567,10 +630,11 @@ func setupEncryption(database *db.DB, passphrase string) *crypto.Encryptor {
 }
 
 func runFsck(dbPath string) {
-	if dir := filepath.Dir(dbPath); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Fatalf("create db directory: %v", err)
-		}
+	// fsck is read-only, so creating a database here destroyed nothing — it just
+	// reported "status: OK" about a filesystem that does not exist, and left a
+	// data/ directory behind to make the next wrong-directory run look plausible.
+	if err := requireExistingDB(dbPath); err != nil {
+		log.Fatalf("fsck: %v", err)
 	}
 	database, err := db.Open(dbPath)
 	if err != nil {
