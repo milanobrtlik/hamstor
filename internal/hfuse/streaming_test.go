@@ -334,6 +334,63 @@ func TestStreamingSkipsDiskCache(t *testing.T) {
 	}
 }
 
+// TestStreamingReadsFromDiskCache is the other half of the rule above, and the
+// half nothing covered: streaming does not WRITE the cache, but it does READ it.
+//
+// That asymmetry is the whole of what blockFromCache exists for — it was split
+// out of fetchBlock so the streaming path could share the lookup without sharing
+// the Put — and it is the only way a streaming read ever costs nothing. If the
+// branch fell out, every test above would still pass: the bytes would simply be
+// re-downloaded, which is exactly the kind of silent regression this file exists
+// to catch.
+//
+// Two things are asserted, and the objects are deleted so the first cannot be
+// satisfied by S3. Anything not held locally is now unfetchable, so a correct
+// read is proof it came from the cache rather than evidence that it might have.
+// The second is the rate limiter: local bytes cost no credit, so a rate that
+// would make a real fetch take seconds must not slow this down at all.
+func TestStreamingReadsFromDiskCache(t *testing.T) {
+	// 1 MB/s against an 8 MiB burst: the first block would ride the burst, but a
+	// second fetched block would have to wait ~8s for credit.
+	hfs := setupStreaming(t, 1, 8)
+	c, err := cache.New(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	hfs.Cache = c
+
+	// Attached BEFORE the write, so cacheBlock seeds it at commit — the mirror
+	// image of TestStreamingSkipsDiskCache, which attaches it afterwards
+	// precisely to keep the write path out of its measurement.
+	id, content := writeMediaBlocks(t, hfs, "cached.mp4", 2)
+
+	blocks := blocksOf(t, hfs, id)
+	if _, count := c.Size(); count != len(blocks) {
+		t.Fatalf("cache holds %d entries, want one per block (%d): the write path did not seed it, so this test proves nothing", count, len(blocks))
+	}
+
+	for _, b := range blocks {
+		if err := hfs.Store.Delete(context.Background(), b.S3Key); err != nil {
+			t.Fatalf("delete %s: %v", b.S3Key, err)
+		}
+	}
+
+	start := time.Now()
+	h, release := openStream(t, hfs, id, true)
+	defer release()
+	if got := readWhole(t, h, int64(len(content))); !bytes.Equal(got, content) {
+		t.Fatal("streamed read returned the wrong bytes")
+	}
+	elapsed := time.Since(start)
+
+	if len(h.streamBlocks) == 0 {
+		t.Fatal("the stream ring is empty: the read did not come through streaming")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("a fully cached read took %v; local bytes must not be charged to the rate limiter", elapsed)
+	}
+}
+
 // TestStreamingUnderEncryption covers the fifth requirement and retires the old
 // "no range reads or streaming under encryption" rule.
 //
