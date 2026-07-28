@@ -244,6 +244,35 @@ func (d *DB) runVersionedMigrations() error {
 				return err
 			},
 		},
+		{
+			// One row per image whose thumbnail is stored durably, so a new
+			// machine can populate its freedesktop cache without downloading a
+			// single original. The object body is the two rendered PNGs back to
+			// back, normal first, split at normal_len — one GET yields both.
+			//
+			// offset/length are 0/len today: one thumbnail per object. They are
+			// here from the start so that packing many thumbnails into one
+			// object later is a writer-side change with no migration, which is
+			// what keeps the "one tiny object per image" shape from becoming
+			// permanent.
+			//
+			// src_mtime_ns is the source's mtime when the thumbnail was
+			// rendered. It is both the freedesktop staleness check and the CAS
+			// that stops a queued render from overwriting a newer one.
+			key: "thumbs_table_v1",
+			fn: func() error {
+				_, err := d.db.Exec(`CREATE TABLE IF NOT EXISTS thumbnails (
+					inode_id     INTEGER NOT NULL REFERENCES inodes(id) ON DELETE CASCADE,
+					s3_key       TEXT    NOT NULL,
+					offset       INTEGER NOT NULL,
+					length       INTEGER NOT NULL,
+					normal_len   INTEGER NOT NULL,
+					src_mtime_ns INTEGER NOT NULL,
+					PRIMARY KEY (inode_id)
+				) WITHOUT ROWID`)
+				return err
+			},
+		},
 	}
 
 	for _, m := range migrations {
@@ -497,14 +526,16 @@ func (d *DB) MarkPending(id int64) (bool, error) {
 	return n > 0, nil
 }
 
-// DeleteInode removes the inode and returns the S3 keys of the blocks it owned,
-// for the caller to delete AFTER this returns.
+// DeleteInode removes the inode and returns the S3 keys it owned — its blocks
+// and its stored thumbnail — for the caller to delete AFTER this returns.
 //
-// Returning them is the whole point: the block rows go away with the inode
+// Returning them is the whole point: both kinds of row go away with the inode
 // through ON DELETE CASCADE, so this transaction is the last moment anyone knows
 // those keys. A caller that ignores the return value leaks every object of every
 // large file it deletes — but it is a build error to ignore it, which is why the
-// keys come back rather than being left for the caller to fetch beforehand.
+// keys come back rather than being left for the caller to fetch beforehand. The
+// thumbnail rides in the same slice for exactly that reason: every existing
+// caller drops it correctly without being changed.
 func (d *DB) DeleteInode(id int64) ([]string, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -514,6 +545,13 @@ func (d *DB) DeleteInode(id int64) ([]string, error) {
 	keys, err := blockKeysTx(tx, id)
 	if err != nil {
 		return nil, err
+	}
+	thumbKey, err := thumbKeyTx(tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if thumbKey != "" {
+		keys = append(keys, thumbKey)
 	}
 	if _, err := tx.Exec("DELETE FROM xattrs WHERE inode_id = ?", id); err != nil {
 		return nil, err
@@ -610,14 +648,16 @@ func (d *DB) InodePath(id int64) (string, error) {
 // removes live data in one batch, silently. Any new place that stores an S3 key
 // belongs in this union on the same commit that introduces it.
 //
-// Two shapes, since inodes stopped naming objects of their own: volume objects
-// (many needles each) and the blocks of large files (one object per block).
+// Three shapes, since inodes stopped naming objects of their own: volume
+// objects (many needles each), the blocks of large files (one object per
+// block), and stored thumbnails (one object per image).
 func (d *DB) AllS3KeySet() (map[string]struct{}, error) {
 	set := make(map[string]struct{})
 
 	for _, q := range []string{
 		"SELECT s3_key FROM volumes",
 		"SELECT s3_key FROM blocks",
+		"SELECT s3_key FROM thumbnails",
 	} {
 		rows, err := d.db.Query(q)
 		if err != nil {
@@ -724,9 +764,9 @@ func (d *DB) NeedlesInVolume(volS3Key string) ([]InodeMeta, error) {
 // has a NULL vol_s3_key and we must not decrement a second time. The volS3Key
 // parameter is retained for source compatibility but is intentionally ignored.
 //
-// Like DeleteInode it returns the inode's block keys for the caller to delete
-// afterwards; the volume object is never among them, since it is shared with
-// other needles and only GC may remove it.
+// Like DeleteInode it returns the inode's block and thumbnail keys for the
+// caller to delete afterwards; the volume object is never among them, since it
+// is shared with other needles and only GC may remove it.
 func (d *DB) DeleteInodeWithVolume(id int64, volS3Key string) ([]string, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
@@ -756,6 +796,13 @@ func (d *DB) DeleteInodeWithVolume(id int64, volS3Key string) ([]string, error) 
 	keys, err := blockKeysTx(tx, id)
 	if err != nil {
 		return nil, err
+	}
+	thumbKey, err := thumbKeyTx(tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if thumbKey != "" {
+		keys = append(keys, thumbKey)
 	}
 	if _, err := tx.Exec("DELETE FROM xattrs WHERE inode_id = ?", id); err != nil {
 		return nil, err

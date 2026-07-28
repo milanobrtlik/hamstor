@@ -106,6 +106,73 @@ func TestGCPhase1KeepsBlockObjects(t *testing.T) {
 	}
 }
 
+// TestGCPhase1KeepsThumbnailObjects is the same guard for stored thumbnails.
+// They are the newest of the three key shapes and the easiest one to forget,
+// and forgetting is silent in the worst direction: thumbnails exist precisely so
+// a new machine does not have to re-download originals, so a GC that ate them
+// would restore the exact cost the feature was built to remove — while every
+// file still read back perfectly and nothing looked wrong.
+//
+// Scoped and zero-grace for the same reasons as the block test above.
+func TestGCPhase1KeepsThumbnailObjects(t *testing.T) {
+	database, store := setupGCTest(t)
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("gctest-thumbs-%d/", time.Now().UnixNano())
+	thumbKey := prefix + "thumb"
+	orphanKey := prefix + "orphan"
+	t.Cleanup(func() {
+		store.Delete(ctx, thumbKey)
+		store.Delete(ctx, orphanKey)
+	})
+
+	thumbData := []byte("normal png bytes followed by large png bytes")
+	if err := store.Upload(ctx, thumbKey, thumbData); err != nil {
+		t.Fatalf("upload thumbnail: %v", err)
+	}
+
+	inodeID, err := database.InsertInode(1, "photo.png", 0o100644, "committed")
+	if err != nil {
+		t.Fatalf("insert inode: %v", err)
+	}
+	meta, err := database.GetInode(inodeID)
+	if err != nil {
+		t.Fatalf("get inode: %v", err)
+	}
+	ok, _, err := database.PutThumbnail(inodeID, db.ThumbRecord{
+		S3Key: thumbKey, Length: int64(len(thumbData)), NormalLen: 10, SrcMtimeNs: meta.MtimeNs,
+	})
+	if err != nil || !ok {
+		t.Fatalf("put thumbnail: ok=%v err=%v", ok, err)
+	}
+
+	// Control object: referenced by nothing, so GC must delete it. Without it a
+	// green result would only prove that nothing was deleted at all.
+	if err := store.Upload(ctx, orphanKey, []byte("nobody references this")); err != nil {
+		t.Fatalf("upload control object: %v", err)
+	}
+
+	result, err := gcScoped(ctx, database, store, false, gcOptions{grace: 0, listPrefix: prefix})
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+
+	if _, err := store.Download(ctx, orphanKey); err == nil {
+		t.Fatal("the control object survived: the deletion loop never ran, so this test proves nothing")
+	}
+	got, err := store.Download(ctx, thumbKey)
+	if err != nil {
+		t.Fatalf("gc deleted a live thumbnail object (its key is in thumbnails): %v", err)
+	}
+	if !bytes.Equal(got, thumbData) {
+		t.Errorf("thumbnail object contents = %q, want %q", got, thumbData)
+	}
+	if result.OrphansFound != 1 || result.OrphansDeleted != 1 {
+		t.Errorf("gc found %d orphans and deleted %d, want 1 and 1 (the control object alone)",
+			result.OrphansFound, result.OrphansDeleted)
+	}
+}
+
 // TestGCRefusesWhenTheDatabaseKnowsNothing reproduces the wrong-working
 // -directory bug. `hamstor gc` with the default relative --db created a fresh
 // empty database, which db.Open plus seedRoot make indistinguishable from a

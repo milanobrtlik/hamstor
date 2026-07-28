@@ -693,8 +693,19 @@ func TestThumbnailSkippedAfterPartialOverwrite(t *testing.T) {
 	if !waitForThumb(t, thumbDir, true) {
 		t.Fatal("no thumbnail after writing the whole file; the fixture proves nothing")
 	}
+	// The same gate governs the DURABLE copy, and there it matters more: a local
+	// thumbnail built from holes is repaired by the freedesktop mtime check, but
+	// one uploaded to S3 is handed to every future machine as the truth.
+	if !waitForStoredThumb(t, hfs, id, true) {
+		t.Fatal("a whole-file write stored no durable thumbnail")
+	}
 	if err := os.RemoveAll(thumbDir); err != nil {
 		t.Fatalf("clear thumbnails: %v", err)
+	}
+	if key, err := hfs.DB.DeleteThumbnail(id); err != nil {
+		t.Fatalf("clear stored thumbnail: %v", err)
+	} else if key != "" {
+		hfs.dropObjects(context.Background(), []string{key})
 	}
 
 	// Patch a few bytes inside block 0, well past the image data. The commit
@@ -704,6 +715,9 @@ func TestThumbnailSkippedAfterPartialOverwrite(t *testing.T) {
 	if waitForThumb(t, thumbDir, false) {
 		t.Fatal("a partial overwrite regenerated the thumbnail from a snapshot with holes")
 	}
+	if waitForStoredThumb(t, hfs, id, false) {
+		t.Fatal("a partial overwrite stored a durable thumbnail rendered from holes")
+	}
 
 	// Control again: the machinery still works, so the absence above was the
 	// guard and not a thumbnailer that had quietly stopped running.
@@ -711,6 +725,33 @@ func TestThumbnailSkippedAfterPartialOverwrite(t *testing.T) {
 	blocksOf(t, hfs, id)
 	if !waitForThumb(t, thumbDir, true) {
 		t.Fatal("a full rewrite did not regenerate the thumbnail")
+	}
+	if !waitForStoredThumb(t, hfs, id, true) {
+		t.Fatal("a full rewrite did not store a durable thumbnail")
+	}
+}
+
+// waitForStoredThumb is waitForThumb for the durable copy, with the same
+// direction-dependent deadline: appearance ends the wait, absence has to be
+// waited out so it means the thumbnailer had its chance.
+func waitForStoredThumb(t *testing.T, hfs *HamstorFS, inodeID int64, wantPresent bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	if !wantPresent {
+		deadline = time.Now().Add(500 * time.Millisecond)
+	}
+	for {
+		_, found, err := hfs.DB.GetThumbnail(inodeID)
+		if err != nil {
+			t.Fatalf("get stored thumbnail: %v", err)
+		}
+		if found {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

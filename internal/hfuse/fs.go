@@ -462,6 +462,7 @@ func (hfs *HamstorFS) thumbWorker() {
 				return
 			}
 			hfs.ThumbCache.Write(hfs.Mountpoint, job.relPath, job.mtimeNs/1e9, r)
+			hfs.storeThumb(hfs.uploadContext(), job.inodeID, job.mtimeNs, r)
 		}()
 	}
 }
