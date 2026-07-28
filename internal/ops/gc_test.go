@@ -105,9 +105,19 @@ func TestGCPhase1KeepsBlockObjects(t *testing.T) {
 	}
 }
 
+// TestGCOrphanedInodes covers phase 2. Like every test here it scopes phase 1 to
+// a prefix it owns: `go test ./...` runs the hfuse, volume and s3store packages
+// against this same bucket in parallel, and an unscoped listing hands their
+// objects to a database that has never heard of them — so the run deletes
+// everything in the bucket older than the grace period. That is not a
+// hypothetical: it is the wrong-working-directory bug this package now guards
+// against, and it was live in these two tests. Phase 2 and phase 3 never look at
+// the listing, so scoping it away costs this test nothing.
 func TestGCOrphanedInodes(t *testing.T) {
 	database, store := setupGCTest(t)
 	ctx := context.Background()
+
+	prefix := fmt.Sprintf("gctest-orphans-%d/", time.Now().UnixNano())
 
 	// Create a directory (id will be >1)
 	dirID, err := database.InsertInode(1, "testdir", 0o40755, "committed")
@@ -126,8 +136,12 @@ func TestGCOrphanedInodes(t *testing.T) {
 	}
 
 	// Upload S3 objects for the files
-	key1 := "gc-test-orphan-1"
-	key2 := "gc-test-orphan-2"
+	key1 := prefix + "orphan-1"
+	key2 := prefix + "orphan-2"
+	t.Cleanup(func() {
+		store.Delete(ctx, key1)
+		store.Delete(ctx, key2)
+	})
 	if err := store.Upload(ctx, key1, []byte("data1")); err != nil {
 		t.Fatalf("upload key1: %v", err)
 	}
@@ -162,7 +176,7 @@ func TestGCOrphanedInodes(t *testing.T) {
 	}
 
 	// Run GC
-	result, err := GC(ctx, database, store, false)
+	result, err := gcScoped(ctx, database, store, false, gcOptions{grace: gcGracePeriod, listPrefix: prefix})
 	if err != nil {
 		t.Fatalf("gc: %v", err)
 	}
@@ -194,13 +208,15 @@ func TestGCOrphanedInodesDryRun(t *testing.T) {
 	database, store := setupGCTest(t)
 	ctx := context.Background()
 
+	prefix := fmt.Sprintf("gctest-dryrun-%d/", time.Now().UnixNano())
+
 	// Create orphaned file (parent_id=999 doesn't exist)
 	fileID, err := database.InsertInode(999, "orphan.txt", 0o100644, "committed")
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
-	key := "gc-test-dryrun-orphan"
+	key := prefix + "orphan"
 	if err := store.Upload(ctx, key, []byte("data")); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
@@ -209,7 +225,7 @@ func TestGCOrphanedInodesDryRun(t *testing.T) {
 	}
 
 	// Run GC in dry-run mode
-	result, err := GC(ctx, database, store, true)
+	result, err := gcScoped(ctx, database, store, true, gcOptions{grace: gcGracePeriod, listPrefix: prefix})
 	if err != nil {
 		t.Fatalf("gc: %v", err)
 	}
