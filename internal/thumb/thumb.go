@@ -152,6 +152,33 @@ func (c Cache) Write(mountpoint, relPath string, mtimeSec int64, r Rendered) {
 	}
 }
 
+// Has reports whether both sizes are already present and current for one file.
+//
+// "Current" is the freedesktop rule: the stored Thumb::MTime must equal the
+// source's mtime. This is what makes a materialization pass idempotent and
+// therefore cheap enough to run on every mount — a finished library costs two
+// stats and two small reads per image and no S3 traffic at all.
+//
+// Both sizes must be good. Requiring only one would leave a half-written pair
+// in place forever, since nothing else ever revisits it.
+func (c Cache) Has(mountpoint, relPath string, mtimeSec int64) bool {
+	if c.Dir == "" {
+		return false
+	}
+	hash := fmt.Sprintf("%x", md5.Sum([]byte(fileURI(mountpoint, relPath))))
+	want := fmt.Sprintf("%d", mtimeSec)
+	for _, s := range sizes {
+		data, err := os.ReadFile(filepath.Join(c.Dir, s.dir, hash+".png"))
+		if err != nil {
+			return false
+		}
+		if got, ok := readTextChunk(data, "Thumb::MTime"); !ok || got != want {
+			return false
+		}
+	}
+	return true
+}
+
 // Remove drops both sizes for one file.
 func (c Cache) Remove(mountpoint, relPath string) {
 	if c.Dir == "" {

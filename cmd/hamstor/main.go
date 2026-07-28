@@ -57,6 +57,7 @@ func main() {
 	ownerUid := flag.Int("uid", os.Getuid(), "default file owner UID")
 	ownerGid := flag.Int("gid", os.Getgid(), "default file owner GID")
 	thumbDir := flag.String("thumbnail-dir", "", "freedesktop thumbnail cache to write into (default: the --uid user's ~/.cache/thumbnails; empty and unresolvable disables thumbnails)")
+	thumbMode := flag.String("thumbnails", "sync", "thumbnail work at mount: off, or sync (materialize stored thumbnails into the freedesktop cache)")
 	streamRate := flag.Int("stream-rate", 5, "streaming rate limit in MB/s for multimedia (0 to disable)")
 	streamBuffer := flag.Int("stream-buffer", 16, "streaming memory buffer in MB")
 	writeBuffer := flag.Int64("write-buffer", 1<<30, "max local un-uploaded write buffer in bytes; Write blocks past it so a bulk copy paces to the S3 upload rate and the spill dir stays bounded (0 to disable). A single file larger than this still needs local disk equal to its size.")
@@ -137,8 +138,9 @@ func main() {
 	// and a mutating subcommand (gc/compact/purge-s3/restore) cannot run against
 	// the same database/bucket concurrently — which would let one delete S3
 	// volume objects out from under the other. fsck/cache/version returned
-	// earlier; fsck does its own existence check and does not take the lock.
-	lockFile, lockErr := openDBPath(*dbPath, dbMustExist(subcmd))
+	// earlier; fsck does its own existence check and does not take the lock, and
+	// the read-only subcommands skip it deliberately (see readOnlySubcmd).
+	lockFile, lockErr := openDBPath(*dbPath, dbMustExist(subcmd), !readOnlySubcmd(subcmd))
 	if errors.Is(lockErr, errLockHeld) {
 		log.Fatalf("hamstor: another instance is using %s", *dbPath)
 	} else if lockErr != nil {
@@ -148,7 +150,7 @@ func main() {
 
 	// Litestream: restore DB from S3 if local file missing, then start replication
 	var rep *replicate.Replicator
-	if *enableReplication {
+	if *enableReplication && !readOnlySubcmd(subcmd) {
 		rep = replicate.New(replicate.Config{
 			DBPath:          *dbPath,
 			Bucket:          *bucket,
@@ -221,6 +223,11 @@ func main() {
 	case "purge-s3":
 		database.Close()
 		runPurgeS3(ctx, store, *dbPath, *bucket, *endpoint, *dryRun, *assumeYes)
+		return
+	case "thumbs":
+		runThumbsCmd(ctx, database, store, setupEncryption(database, *passphrase),
+			resolveThumbCache(*thumbDir, *ownerUid, *ownerGid), *mountpoint, subArgs)
+		database.Close()
 		return
 	}
 
@@ -384,6 +391,27 @@ func main() {
 	}
 
 	log.Printf("hamstor %s: mounted on %s", version, *mountpoint)
+
+	// Materialize stored thumbnails in the background. Storing them durably is
+	// worth nothing on its own: a freedesktop cache is a local directory and no
+	// file manager can be made to read from a bucket, so something has to put
+	// them where the desktop looks. This is that something, and it is the whole
+	// answer to the new-machine case — it downloads thumbnails, never originals.
+	//
+	// Off the mount path entirely, and cancelled by shutdown: nothing waits on
+	// it, and a pass that never finishes costs only the thumbnails it did not
+	// get to, which the desktop then renders for itself as before.
+	if thumbCache.Dir != "" && *thumbMode != "off" {
+		go func() {
+			stats, err := ops.SyncThumbnails(ctx, database, store, enc, thumbCache, *mountpoint)
+			if err != nil && ctx.Err() == nil {
+				log.Printf("hamstor: thumbnail sync: %v", err)
+			}
+			if stats.Written > 0 || stats.Failed > 0 {
+				log.Printf("hamstor: thumbnail sync: %s", stats)
+			}
+		}()
+	}
 
 	// server.Wait() is NOT the main line of control. It used to be, with the
 	// unmount pushed into a goroutine whose error was dropped — and go-fuse's
@@ -600,10 +628,25 @@ the state of the filesystem, re-run with --allow-mass-delete.
 // they are.
 func dbMustExist(subcmd string) bool {
 	switch subcmd {
-	case "gc", "compact", "fsck":
+	case "gc", "compact", "fsck", "thumbs":
 		return true
 	}
 	return false
+}
+
+// readOnlySubcmd reports a subcommand that changes neither the database nor the
+// bucket, and may therefore run alongside a live mount.
+//
+// It buys two exemptions, and both are required rather than merely convenient.
+// The flock is exclusive, so taking it would mean stopping the daemon to run
+// something that only reads — and the point of `thumbs sync` is being usable on
+// a machine that is already serving the filesystem. Litestream is the sharper
+// one: rep.Start would make this process a SECOND replicator of a database the
+// daemon is already replicating, publishing a competing generation over the
+// real backup. `fsck` avoids both by returning before either exists; a
+// subcommand that needs S3 has to say so explicitly.
+func readOnlySubcmd(subcmd string) bool {
+	return subcmd == "thumbs"
 }
 
 // requireExistingDB reports a missing database instead of letting db.Open create
@@ -642,7 +685,7 @@ func requireExistingDB(dbPath string) error {
 // Evidence this is not theoretical: a data/ directory holding hamstor.db.lock
 // and .hamstor.db-litestream/ but no hamstor.db is exactly what a wrong-working
 // -directory run leaves behind.
-func openDBPath(dbPath string, mustExist bool) (*os.File, error) {
+func openDBPath(dbPath string, mustExist, takeLock bool) (*os.File, error) {
 	if mustExist {
 		if err := requireExistingDB(dbPath); err != nil {
 			return nil, err
@@ -652,6 +695,10 @@ func openDBPath(dbPath string, mustExist bool) (*os.File, error) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create db directory: %w", err)
 		}
+	}
+	if !takeLock {
+		// A nil *os.File closes harmlessly, so the caller's defer needs no guard.
+		return nil, nil
 	}
 	return acquireDBLock(dbPath)
 }

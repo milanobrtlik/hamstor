@@ -85,6 +85,43 @@ func TestCacheWriteLandsWhereTheDesktopLooks(t *testing.T) {
 	}
 }
 
+// TestCacheHasTracksTheSourceMtime pins the predicate that makes a
+// materialization pass idempotent, and therefore cheap enough to run at every
+// mount. Getting it wrong is expensive in both directions: too eager and every
+// mount rewrites the whole library, too lax and a stale thumbnail is kept
+// forever.
+func TestCacheHasTracksTheSourceMtime(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "thumbnails")
+	c := Cache{Dir: dir, Uid: -1, Gid: -1}
+	mountpoint, relPath := "/mnt/hamstor", "a.png"
+
+	if c.Has(mountpoint, relPath, 100) {
+		t.Error("Has reported a thumbnail that was never written")
+	}
+
+	c.Write(mountpoint, relPath, 100, renderFixture(t))
+	if !c.Has(mountpoint, relPath, 100) {
+		t.Error("Has missed a thumbnail it had just written: every pass would rewrite everything")
+	}
+	if c.Has(mountpoint, relPath, 101) {
+		t.Error("Has accepted a thumbnail of an older version: it would never be refreshed")
+	}
+
+	// Both sizes must be good. A half-written pair left in place is never
+	// revisited by anything.
+	if err := os.Remove(thumbPath(dir, "normal", mountpoint, relPath)); err != nil {
+		t.Fatalf("remove normal: %v", err)
+	}
+	if c.Has(mountpoint, relPath, 100) {
+		t.Error("Has accepted a pair with the normal size missing")
+	}
+
+	var zero Cache
+	if zero.Has(mountpoint, relPath, 100) {
+		t.Error("a disabled cache claimed to have a thumbnail")
+	}
+}
+
 // TestZeroCacheIsInert covers the disabled case. It must not panic, must not
 // create anything, and must not report — a mount with no resolvable cache
 // directory is a normal configuration, not an error on every image.

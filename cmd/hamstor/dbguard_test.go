@@ -44,7 +44,7 @@ func TestOpenDBPathMissingLeavesNothingBehind(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "data", "hamstor.db")
 
-	f, err := openDBPath(dbPath, true)
+	f, err := openDBPath(dbPath, true, true)
 	if err == nil {
 		f.Close()
 		t.Fatal("openDBPath created a database that did not exist")
@@ -74,7 +74,7 @@ func TestOpenDBPathExistingTakesLock(t *testing.T) {
 		t.Fatalf("create db: %v", err)
 	}
 
-	f, err := openDBPath(dbPath, true)
+	f, err := openDBPath(dbPath, true, true)
 	if err != nil {
 		t.Fatalf("openDBPath on an existing database: %v", err)
 	}
@@ -85,6 +85,46 @@ func TestOpenDBPathExistingTakesLock(t *testing.T) {
 	f.Close()
 }
 
+// TestOpenDBPathReadOnlySkipsLock: a read-only subcommand must be runnable
+// against a live mount, which means not taking the exclusive lock the daemon
+// holds. It still has to check existence — `hamstor thumbs sync` on a typo'd
+// --db must report the typo, not create an empty database and report an empty
+// library.
+func TestOpenDBPathReadOnlySkipsLock(t *testing.T) {
+	if !readOnlySubcmd("thumbs") {
+		t.Fatal("thumbs is no longer read-only; this test guards the wrong thing")
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "hamstor.db")
+	if err := os.WriteFile(dbPath, nil, 0o600); err != nil {
+		t.Fatalf("create db: %v", err)
+	}
+
+	// Stand in for the running daemon.
+	held, err := acquireDBLock(dbPath)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer held.Close()
+
+	f, err := openDBPath(dbPath, true, false)
+	if err != nil {
+		t.Fatalf("read-only openDBPath while the lock is held: %v", err)
+	}
+	if f != nil {
+		f.Close()
+		t.Error("read-only openDBPath returned a lock file")
+	}
+
+	missing := filepath.Join(t.TempDir(), "nope.db")
+	if _, err := openDBPath(missing, true, false); err == nil {
+		t.Error("read-only openDBPath accepted a database that does not exist")
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Error("read-only openDBPath created the database it was meant to refuse")
+	}
+}
+
 // TestOpenDBPathCreatesForMount pins the other side: first boot and `hamstor
 // restore` must still be able to bring a database into existence, directory and
 // all. A guard that refused here would make the daemon unstartable on a fresh
@@ -93,7 +133,7 @@ func TestOpenDBPathCreatesForMount(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "data", "hamstor.db")
 
-	f, err := openDBPath(dbPath, false)
+	f, err := openDBPath(dbPath, false, true)
 	if err != nil {
 		t.Fatalf("openDBPath for mount mode: %v", err)
 	}

@@ -1,14 +1,54 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 
+	"github.com/milan/hamstor/internal/crypto"
+	"github.com/milan/hamstor/internal/db"
+	"github.com/milan/hamstor/internal/ops"
+	"github.com/milan/hamstor/internal/s3store"
 	"github.com/milan/hamstor/internal/thumb"
 )
+
+// runThumbsCmd handles `hamstor thumbs sync`.
+//
+// It reads the database and the bucket and writes only to the freedesktop cache
+// directory, which is why it can run against a live mount — see readOnlySubcmd
+// for the two exemptions that makes possible. The mount-time pass covers the
+// normal case; this exists for the one that matters most, a machine that has
+// just restored the database and wants its thumbnails now rather than at the
+// next restart.
+func runThumbsCmd(ctx context.Context, database *db.DB, store *s3store.Store, enc *crypto.Encryptor, cache thumb.Cache, mountpoint string, args []string) {
+	action := "sync"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	if action != "sync" {
+		log.Fatalf("thumbs: unknown action %q (want: sync)", action)
+	}
+
+	// The mountpoint is half the freedesktop cache key — the URI a thumbnail is
+	// filed under is file://<mountpoint>/<path> — so without it this would write
+	// a directory full of thumbnails nothing will ever look up.
+	if mountpoint == "" {
+		log.Fatalf("thumbs: --mount is required (it is part of the thumbnail's cache key)")
+	}
+	if cache.Dir == "" {
+		log.Fatalf("thumbs: no thumbnail cache directory; pass --thumbnail-dir")
+	}
+
+	stats, err := ops.SyncThumbnails(ctx, database, store, enc, cache, mountpoint)
+	if err != nil {
+		log.Fatalf("thumbs: %v", err)
+	}
+	fmt.Printf("thumbs: %s -> %s\n", stats, cache.Dir)
+}
 
 // resolveThumbCache decides which freedesktop thumbnail directory to write into.
 //

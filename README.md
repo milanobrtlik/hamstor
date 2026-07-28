@@ -8,7 +8,7 @@ FUSE filesystem that stores files in S3-compatible object storage with SQLite me
 - Metadata (directory tree, permissions, timestamps) lives in a local SQLite database
 - Litestream continuously replicates the database to S3 and can restore it on startup
 - Incomplete uploads from crashes are cleaned up automatically
-- Thumbnails are generated for image files (freedesktop spec)
+- Thumbnails are generated for image files (freedesktop spec) and stored in S3, so a new machine populates its thumbnail cache without downloading the originals
 - File contents can optionally be encrypted at rest (see [Encryption](#encryption))
 
 ## Requirements
@@ -96,6 +96,8 @@ When running as a normal user, pass `--cache-dir` to a writable path. The defaul
 | `--cache-size` | `10` | Max cache size in GB (`0` disables the cache) |
 | `--uid` | caller's UID | Default file owner UID (needed under systemd, which runs as root) |
 | `--gid` | caller's GID | Default file owner GID |
+| `--thumbnail-dir` | the `--uid` user's `~/.cache/thumbnails` | Freedesktop thumbnail cache to write into. Needed when that user's `XDG_CACHE_HOME` is not the default, since the daemon cannot see their environment |
+| `--thumbnails` | `sync` | Thumbnail work at mount: `off`, or `sync` to materialize stored thumbnails into the freedesktop cache |
 | `--stream-rate` | `5` | Streaming rate limit in MB/s for media (`0` disables streaming) |
 | `--stream-buffer` | `16` | Streaming memory per open media file, in MB; rounded down to whole 8 MiB blocks, minimum one |
 | `--entry-timeout` | `60s` | FUSE entry/attr cache timeout |
@@ -121,8 +123,9 @@ Flags work on either side of the subcommand — `hamstor gc --bucket x` and `ham
 | `gc` | Delete orphaned S3 objects (skips objects younger than 10 minutes) |
 | `compact` | Rewrite volumes whose dead space exceeds `--compact-ratio` |
 | `restore` | Restore the database from S3 via Litestream (only when no local DB exists) |
+| `thumbs sync` | Materialize stored thumbnails into the freedesktop cache (needs `--mount`) |
 | `purge-s3` | **Destructive:** delete every object in the bucket and the local database |
 
-`gc`, `compact`, `restore` and `purge-s3` take an exclusive lock on `<db>.lock`; `fsck`, `cache` and `version` do not.
+`gc`, `compact`, `restore` and `purge-s3` take an exclusive lock on `<db>.lock`; `fsck`, `cache`, `version` and `thumbs` do not. `thumbs` also skips replication for the same reason it skips the lock: it is meant to run against a live mount, and a second Litestream on the daemon's database would publish a competing generation over the real backup.
 
 **`gc` will not run against a database it cannot trust.** It refuses a database that does not exist rather than creating an empty one (as do `compact` and `fsck`; `purge-s3` is exempt, since wiping the bucket after losing the database is a legitimate workflow). It refuses a bucket the database was not bound to — the endpoint counts, because the same bucket name commonly exists on more than one backend. And it refuses a run in which the database accounts for less than three quarters of the objects it can classify, printing the numbers and deleting nothing; inspect with `--dry-run`, and re-run with `--allow-mass-delete` if that really is the state of the filesystem.
