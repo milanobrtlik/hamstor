@@ -47,6 +47,7 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "dry-run mode for gc and purge-s3 subcommands")
 	assumeYes := flag.Bool("yes", false, "skip the purge-s3 confirmation prompt (for scripts)")
 	allowMassDelete := flag.Bool("allow-mass-delete", false, "let gc delete an implausible share of the bucket; only after checking why it refused")
+	adoptBucket := flag.Bool("adopt-bucket", false, "rebind this database to the given endpoint and bucket (for a legitimate endpoint change)")
 	cacheDir := flag.String("cache-dir", "/var/lib/hamstor/cache", "local disk cache directory")
 	cacheSizeGB := flag.Int("cache-size", 10, "max cache size in GB (0 to disable)")
 	ownerUid := flag.Int("uid", os.Getuid(), "default file owner UID")
@@ -178,6 +179,14 @@ func main() {
 	store, err := s3store.New(ctx, *bucket, *endpoint, creds.AWSAccessKeyID, creds.AWSSecretAccessKey, r)
 	if err != nil {
 		log.Fatalf("create s3 store: %v", err)
+	}
+
+	// Bind the database to its bucket on first mount, and refuse to run against a
+	// different one afterwards. Only mount mode records: an upgraded database has
+	// no identity yet, and letting a stray gc write one would record the very
+	// mistake this is meant to catch.
+	if err := checkS3Identity(database, *endpoint, *bucket, subcmd == "", *adoptBucket); err != nil {
+		log.Fatalf("hamstor: %v", err)
 	}
 
 	switch subcmd {
