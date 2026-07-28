@@ -89,7 +89,7 @@ When running as a normal user, pass `--cache-dir` to a writable path. The defaul
 | `--bucket` | _(required)_ | S3 bucket name (required for every subcommand except `version`, `fsck`, `cache`) |
 | `--endpoint` | | S3 endpoint URL (Garage/MinIO); a non-empty value enables path-style addressing |
 | `--region` | from `.env` | S3 region |
-| `--db` | `data/hamstor.db` | SQLite database path; its directory also holds `spill/`, `staging/`, `pending/` and the lock file |
+| `--db` | `/var/lib/hamstor/hamstor.db` | SQLite database path; its directory also holds `spill/`, `staging/`, `pending/` and the lock file |
 | `--replicate` | `true` | Enable Litestream replication to S3 |
 | `--passphrase` | | Encryption passphrase (or `HAMSTOR_PASSPHRASE`) — enables encryption, see [Encryption](#encryption) |
 | `--cache-dir` | `/var/lib/hamstor/cache` | Local disk cache directory |
@@ -103,6 +103,8 @@ When running as a normal user, pass `--cache-dir` to a writable path. The defaul
 | `--compact-ratio` | `0.5` | Dead-space ratio threshold for `compact` |
 | `--dry-run` | `false` | Preview mode for `gc`, `compact` and `purge-s3` |
 | `--yes` | `false` | Skip the `purge-s3` confirmation prompt |
+| `--allow-mass-delete` | `false` | Let `gc` delete an implausible share of the bucket; only after checking why it refused |
+| `--adopt-bucket` | `false` | Rebind this database to the given `--endpoint`/`--bucket` after a legitimate move |
 | `--pprof` | | pprof listen address (e.g. `:6060`) |
 
 ### Subcommands
@@ -122,3 +124,5 @@ Flags work on either side of the subcommand — `hamstor gc --bucket x` and `ham
 | `purge-s3` | **Destructive:** delete every object in the bucket and the local database |
 
 `gc`, `compact`, `restore` and `purge-s3` take an exclusive lock on `<db>.lock`; `fsck`, `cache` and `version` do not.
+
+**`gc` will not run against a database it cannot trust.** It refuses a database that does not exist rather than creating an empty one (as do `compact` and `fsck`; `purge-s3` is exempt, since wiping the bucket after losing the database is a legitimate workflow). It refuses a bucket the database was not bound to — the endpoint counts, because the same bucket name commonly exists on more than one backend. And it refuses a run in which the database accounts for less than three quarters of the objects it can classify, printing the numbers and deleting nothing; inspect with `--dry-run`, and re-run with `--allow-mass-delete` if that really is the state of the filesystem.

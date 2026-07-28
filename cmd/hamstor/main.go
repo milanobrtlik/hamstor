@@ -38,7 +38,11 @@ func main() {
 	debug.SetMemoryLimit(150 << 20)
 
 	mountpoint := flag.String("mount", "", "mount point (required for mount mode)")
-	dbPath := flag.String("db", "data/hamstor.db", "SQLite database path")
+	// Absolute, and the same path the systemd unit passes. The old default was
+	// the relative data/hamstor.db, which resolved against whatever directory the
+	// caller happened to be in — so `hamstor gc` run anywhere but the source tree
+	// silently addressed a different filesystem from the daemon's.
+	dbPath := flag.String("db", "/var/lib/hamstor/hamstor.db", "SQLite database path")
 	bucket := flag.String("bucket", "", "S3 bucket name (required)")
 	endpoint := flag.String("endpoint", "", "S3 endpoint URL (for Garage/MinIO)")
 	region := flag.String("region", "", "S3 region (for Garage/MinIO)")

@@ -10,7 +10,6 @@ LDFLAGS = -X main.version=$(VERSION) \
           -X github.com/milan/hamstor/internal/creds.Passphrase=$(HAMSTOR_PASSPHRASE)
 
 build:
-	@mkdir -p data
 # Silenced deliberately: LDFLAGS carries the S3 access key, the secret key and
 # the encryption passphrase, so echoing the command prints all three. They then
 # live in terminal scrollback, in any CI log, and in whatever captured the build
