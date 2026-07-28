@@ -34,61 +34,117 @@ func IsImageExt(name string) bool {
 // maxImageBytes is the limit for image decoding to prevent decompression bombs.
 const maxImageBytes = 100 << 20 // 100 MB
 
-func Generate(mountpoint, relPath string, mtimeSec int64, imgData []byte) {
+// sizes are the freedesktop cache subdirectories and their bounding dimensions.
+var sizes = []struct {
+	dir    string
+	maxDim int
+}{
+	{"normal", 128},
+	{"large", 256},
+}
+
+// Rendered holds the two scaled PNGs for one image, WITHOUT the freedesktop
+// tEXt metadata. The metadata is deliberately not in here: Thumb::URI contains
+// the mountpoint, so a rendered thumbnail that carried it would be bound to the
+// machine and path that produced it. Rendering and stamping are separate so the
+// same bytes can be stored once and stamped per-mountpoint at every place they
+// are materialized.
+type Rendered struct {
+	Normal []byte
+	Large  []byte
+}
+
+// Render decodes an image and scales it to the freedesktop sizes.
+func Render(imgData []byte) (Rendered, error) {
 	if len(imgData) > maxImageBytes {
-		log.Printf("thumb: %s too large (%d bytes), skipping", relPath, len(imgData))
-		return
+		return Rendered{}, fmt.Errorf("image too large (%d bytes)", len(imgData))
 	}
 	img, _, err := image.Decode(bytes.NewReader(imgData))
 	if err != nil {
-		log.Printf("thumb: decode %s: %v", relPath, err)
-		return
+		return Rendered{}, fmt.Errorf("decode: %w", err)
 	}
 
+	var out Rendered
+	for _, s := range sizes {
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, resize(img, s.maxDim)); err != nil {
+			return Rendered{}, fmt.Errorf("encode %s: %w", s.dir, err)
+		}
+		if s.dir == "normal" {
+			out.Normal = buf.Bytes()
+		} else {
+			out.Large = buf.Bytes()
+		}
+	}
+	return out, nil
+}
+
+// Cache is one user's freedesktop thumbnail directory.
+//
+// The directory is passed in rather than resolved from the environment, which
+// is what os.UserCacheDir() did. systemd sets $HOME only for units that have
+// User= set (systemd.exec(5)), and the daemon's unit runs as root without one,
+// so os.UserCacheDir() returned an error on every single image and thumbnails
+// were written nowhere at all — for four months, silently, because the only
+// report was one log line nobody was looking for. The target user is knowable
+// (it is --uid, whose files these are), so it is resolved once at startup and
+// handed here.
+//
+// A zero Cache (empty Dir) disables thumbnails entirely; every method is a
+// no-op, so callers do not need to check.
+type Cache struct {
+	// Dir is the thumbnails directory itself, i.e. <cache home>/thumbnails.
+	Dir string
+
+	// Uid and Gid own what gets written. -1 leaves ownership alone, which is
+	// right whenever the process already runs as the target user. Writing as
+	// root into someone else's cache without this leaves files they cannot
+	// replace, so their own thumbnailer breaks on every image we touched.
+	Uid, Gid int
+}
+
+// Write stores both sizes for one file, stamped with the freedesktop metadata
+// that names it: the URI the desktop will look it up by, and the source mtime
+// it revalidates against.
+func (c Cache) Write(mountpoint, relPath string, mtimeSec int64, r Rendered) {
+	if c.Dir == "" {
+		return
+	}
 	uri := fileURI(mountpoint, relPath)
 	hash := fmt.Sprintf("%x", md5.Sum([]byte(uri)))
-	mtimeStr := fmt.Sprintf("%d", mtimeSec)
-
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		log.Printf("thumb: cache dir: %v", err)
-		return
-	}
-	thumbBase := filepath.Join(cacheDir, "thumbnails")
-
-	sizes := []struct {
-		dir    string
-		maxDim int
-	}{
-		{"normal", 128},
-		{"large", 256},
+	meta := map[string]string{
+		"Thumb::URI":   uri,
+		"Thumb::MTime": fmt.Sprintf("%d", mtimeSec),
 	}
 
 	for _, s := range sizes {
-		dir := filepath.Join(thumbBase, s.dir)
+		data := r.Normal
+		if s.dir != "normal" {
+			data = r.Large
+		}
+		if len(data) == 0 {
+			continue
+		}
+
+		dir := filepath.Join(c.Dir, s.dir)
+		// 0700 is required by the spec, and is also what makes the chown below
+		// matter: a world-readable cache would leak thumbnails of every file.
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			log.Printf("thumb: mkdir %s: %v", dir, err)
 			continue
 		}
-
-		scaled := resize(img, s.maxDim)
-		var buf bytes.Buffer
-		if err := png.Encode(&buf, scaled); err != nil {
-			log.Printf("thumb: encode %s: %v", relPath, err)
-			continue
-		}
-
-		withMeta := insertTextChunks(buf.Bytes(), map[string]string{
-			"Thumb::URI":   uri,
-			"Thumb::MTime": mtimeStr,
-		})
+		c.chown(c.Dir)
+		c.chown(dir)
 
 		outPath := filepath.Join(dir, hash+".png")
 		tmpPath := outPath + ".tmp"
-		if err := os.WriteFile(tmpPath, withMeta, 0o600); err != nil {
+		if err := os.WriteFile(tmpPath, insertTextChunks(data, meta), 0o600); err != nil {
 			log.Printf("thumb: write %s: %v", tmpPath, err)
 			continue
 		}
+		// Chown before the rename, so the file is never visible at its final
+		// name under the wrong owner.
+		c.chown(tmpPath)
 		if err := os.Rename(tmpPath, outPath); err != nil {
 			log.Printf("thumb: rename %s: %v", outPath, err)
 			os.Remove(tmpPath)
@@ -96,20 +152,25 @@ func Generate(mountpoint, relPath string, mtimeSec int64, imgData []byte) {
 	}
 }
 
-func RemoveThumbnails(mountpoint, relPath string) {
-	uri := fileURI(mountpoint, relPath)
-	hash := fmt.Sprintf("%x", md5.Sum([]byte(uri)))
-
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
+// Remove drops both sizes for one file.
+func (c Cache) Remove(mountpoint, relPath string) {
+	if c.Dir == "" {
 		return
 	}
-	thumbBase := filepath.Join(cacheDir, "thumbnails")
-
-	for _, sub := range []string{"normal", "large"} {
-		p := filepath.Join(thumbBase, sub, hash+".png")
-		os.Remove(p)
+	hash := fmt.Sprintf("%x", md5.Sum([]byte(fileURI(mountpoint, relPath))))
+	for _, s := range sizes {
+		os.Remove(filepath.Join(c.Dir, s.dir, hash+".png"))
 	}
+}
+
+// chown applies the target ownership, ignoring failure: when the process is not
+// root it cannot chown, and it does not need to — it is already writing as the
+// user who owns the directory.
+func (c Cache) chown(path string) {
+	if c.Uid < 0 && c.Gid < 0 {
+		return
+	}
+	_ = os.Chown(path, c.Uid, c.Gid)
 }
 
 func fileURI(mountpoint, relPath string) string {
@@ -152,6 +213,38 @@ func resize(img image.Image, maxDim int) image.Image {
 	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
 	return dst
+}
+
+// readTextChunk reads back one tEXt value written by insertTextChunks.
+//
+// It lives next to its writer deliberately: these two are the only agreement
+// about what a stored thumbnail says about itself, and a disagreement between
+// them is silent — a materializer that cannot read Thumb::MTime back either
+// rewrites every thumbnail on every pass or trusts a stale one forever.
+func readTextChunk(pngData []byte, key string) (string, bool) {
+	const sigLen = 8
+	offset := sigLen
+	for offset+8 <= len(pngData) {
+		chunkLen := int(binary.BigEndian.Uint32(pngData[offset : offset+4]))
+		chunkType := string(pngData[offset+4 : offset+8])
+		next := offset + 12 + chunkLen
+		// Same bound as the writer: a corrupt length must not walk us off the
+		// end, and IDAT means the header is over — tEXt chunks go before it.
+		if chunkLen < 0 || next <= offset || next > len(pngData) {
+			return "", false
+		}
+		if chunkType == "IDAT" {
+			return "", false
+		}
+		if chunkType == "tEXt" {
+			data := pngData[offset+8 : offset+8+chunkLen]
+			if i := bytes.IndexByte(data, 0); i >= 0 && string(data[:i]) == key {
+				return string(data[i+1:]), true
+			}
+		}
+		offset = next
+	}
+	return "", false
 }
 
 // insertTextChunks inserts PNG tEXt chunks before the first IDAT chunk.

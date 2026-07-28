@@ -13,6 +13,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/milan/hamstor/internal/db"
+	"github.com/milan/hamstor/internal/thumb"
 )
 
 // Lazy materialization is what the block layout was for. Until this step a file
@@ -666,9 +667,11 @@ func TestThumbnailSkippedAfterPartialOverwrite(t *testing.T) {
 	hfs.SpillDir = t.TempDir()
 	hfs.Mountpoint = t.TempDir()
 	hfs.ThumbSem = make(chan struct{}, 2)
-	cacheHome := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", cacheHome)
-	thumbDir := filepath.Join(cacheHome, "thumbnails")
+	// Point the cache at the test's own directory. Setting XDG_CACHE_HOME would
+	// no longer do anything: internal/thumb does not read the environment, which
+	// is the whole point of thumb.Cache — see resolveThumbCache.
+	thumbDir := filepath.Join(t.TempDir(), "thumbnails")
+	hfs.ThumbCache = thumb.Cache{Dir: thumbDir, Uid: -1, Gid: -1}
 
 	var png bytes.Buffer
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))

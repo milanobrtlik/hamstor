@@ -14,7 +14,6 @@ import (
 	"github.com/milan/hamstor/internal/db"
 	"github.com/milan/hamstor/internal/media"
 	"github.com/milan/hamstor/internal/ratelimit"
-	"github.com/milan/hamstor/internal/thumb"
 	"github.com/milan/hamstor/internal/volume"
 	sqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -541,15 +540,7 @@ func (n *HamstorNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		return toErrno(err)
 	}
 
-	if thumb.IsImageExt(meta.Name) {
-		if relPath, err := n.hfs.DB.InodePath(meta.ID); err == nil {
-			go func() {
-				n.hfs.ThumbSem <- struct{}{}
-				defer func() { <-n.hfs.ThumbSem }()
-				thumb.RemoveThumbnails(n.hfs.Mountpoint, relPath)
-			}()
-		}
-	}
+	n.hfs.removeThumbAsync(meta.ID, meta.Name)
 
 	if meta.VolS3Key == "" && meta.Size > 0 && n.hfs.VolumeBuilder != nil {
 		// May be staged but not yet packed — remove the staging file. Harmless
@@ -608,15 +599,7 @@ func deleteTree(ctx context.Context, hfs *HamstorFS, dirID int64) error {
 			if child.VolS3Key == "" && child.Size > 0 && hfs.VolumeBuilder != nil {
 				os.Remove(hfs.VolumeBuilder.StagePath(child.ID))
 			}
-			if thumb.IsImageExt(child.Name) {
-				if relPath, pathErr := hfs.DB.InodePath(child.ID); pathErr == nil {
-					go func() {
-						hfs.ThumbSem <- struct{}{}
-						defer func() { <-hfs.ThumbSem }()
-						thumb.RemoveThumbnails(hfs.Mountpoint, relPath)
-					}()
-				}
-			}
+			hfs.removeThumbAsync(child.ID, child.Name)
 			orphaned, delErr := hfs.DB.DeleteInodeWithVolume(child.ID, child.VolS3Key)
 			if delErr != nil {
 				return delErr
@@ -720,15 +703,7 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 		}
 	}
 
-	if thumb.IsImageExt(meta.Name) {
-		if oldRelPath, err := n.hfs.DB.InodePath(meta.ID); err == nil {
-			go func() {
-				n.hfs.ThumbSem <- struct{}{}
-				defer func() { <-n.hfs.ThumbSem }()
-				thumb.RemoveThumbnails(n.hfs.Mountpoint, oldRelPath)
-			}()
-		}
-	}
+	n.hfs.removeThumbAsync(meta.ID, meta.Name)
 
 	// Check if target exists -- if so, remove it
 	existing, err := n.hfs.DB.LookupChild(newParentNode.inodeID, newName)
@@ -743,15 +718,7 @@ func (n *HamstorNode) Rename(ctx context.Context, name string, newParent fs.Inod
 				return syscall.ENOTEMPTY
 			}
 		}
-		if thumb.IsImageExt(existing.Name) {
-			if existingPath, err := n.hfs.DB.InodePath(existing.ID); err == nil {
-				go func() {
-					n.hfs.ThumbSem <- struct{}{}
-					defer func() { <-n.hfs.ThumbSem }()
-					thumb.RemoveThumbnails(n.hfs.Mountpoint, existingPath)
-				}()
-			}
-		}
+		n.hfs.removeThumbAsync(existing.ID, existing.Name)
 		if existing.VolS3Key == "" && existing.Size > 0 && n.hfs.VolumeBuilder != nil {
 			os.Remove(n.hfs.VolumeBuilder.StagePath(existing.ID))
 		}

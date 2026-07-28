@@ -33,6 +33,11 @@ type HamstorFS struct {
 	DefaultUid uint32
 	DefaultGid uint32
 
+	// ThumbCache is the freedesktop thumbnail directory to write into. The zero
+	// value disables thumbnails. It is resolved once at startup rather than from
+	// the environment inside internal/thumb — see thumb.Cache for why.
+	ThumbCache thumb.Cache
+
 	// Streaming mode config for multimedia files
 	StreamRate   int // MB/s rate limit (0 = disabled)
 	StreamBuffer int // MB memory buffer for recent chunks
@@ -364,10 +369,10 @@ func (hfs *HamstorFS) dropObjects(ctx context.Context, keys []string) {
 // thumbJob is a pending thumbnail, referenced by path so a queued job costs a
 // few strings rather than a full image buffer.
 type thumbJob struct {
-	inodeID  int64
-	relPath  string
-	mtimeSec int64
-	srcPath  string
+	inodeID int64
+	relPath string
+	mtimeNs int64
+	srcPath string
 }
 
 const (
@@ -397,7 +402,7 @@ func (hfs *HamstorFS) scheduleThumb(inodeID int64, fileName, srcPath string) {
 	if srcPath == "" {
 		return
 	}
-	if !thumb.IsImageExt(fileName) || hfs.Mountpoint == "" {
+	if !thumb.IsImageExt(fileName) || !hfs.thumbnailsEnabled() {
 		os.Remove(srcPath)
 		return
 	}
@@ -417,7 +422,7 @@ func (hfs *HamstorFS) scheduleThumb(inodeID int64, fileName, srcPath string) {
 	hfs.thumbStart.Do(hfs.startThumbWorkers)
 
 	select {
-	case hfs.thumbQueue <- thumbJob{inodeID: inodeID, relPath: relPath, mtimeSec: meta.MtimeNs / 1e9, srcPath: srcPath}:
+	case hfs.thumbQueue <- thumbJob{inodeID: inodeID, relPath: relPath, mtimeNs: meta.MtimeNs, srcPath: srcPath}:
 	default:
 		// Queue full: shed this one rather than pin its temp file indefinitely.
 		os.Remove(srcPath)
@@ -451,9 +456,45 @@ func (hfs *HamstorFS) thumbWorker() {
 				log.Printf("hamstor: thumb source read for inode %d: %v", job.inodeID, err)
 				return
 			}
-			thumb.Generate(hfs.Mountpoint, job.relPath, job.mtimeSec, data)
+			r, err := thumb.Render(data)
+			if err != nil {
+				log.Printf("hamstor: thumbnail %s: %v", job.relPath, err)
+				return
+			}
+			hfs.ThumbCache.Write(hfs.Mountpoint, job.relPath, job.mtimeNs/1e9, r)
 		}()
 	}
+}
+
+// thumbnailsEnabled reports whether there is anywhere to put a thumbnail. Both
+// halves are needed: the mountpoint builds the freedesktop URI the desktop looks
+// a thumbnail up by, and the cache dir is where it goes.
+func (hfs *HamstorFS) thumbnailsEnabled() bool {
+	return hfs.Mountpoint != "" && hfs.ThumbCache.Dir != ""
+}
+
+// removeThumbAsync drops the cached thumbnails of one inode off the hot path.
+//
+// The path must be resolved HERE, before the caller deletes or renames the
+// inode: afterwards nobody can say what URI the thumbnail was filed under.
+func (hfs *HamstorFS) removeThumbAsync(inodeID int64, name string) {
+	if !thumb.IsImageExt(name) || !hfs.thumbnailsEnabled() {
+		return
+	}
+	relPath, err := hfs.DB.InodePath(inodeID)
+	if err != nil {
+		return
+	}
+	go func() {
+		// A nil ThumbSem means unbounded rather than blocked forever: this used
+		// to send unconditionally, so any HamstorFS built without the semaphore
+		// leaked a goroutine parked on a nil channel for every image unlinked.
+		if hfs.ThumbSem != nil {
+			hfs.ThumbSem <- struct{}{}
+			defer func() { <-hfs.ThumbSem }()
+		}
+		hfs.ThumbCache.Remove(hfs.Mountpoint, relPath)
+	}()
 }
 
 func (hfs *HamstorFS) MaybeFreeMem() {
