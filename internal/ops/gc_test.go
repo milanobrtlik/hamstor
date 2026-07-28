@@ -3,6 +3,7 @@ package ops
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -102,6 +103,122 @@ func TestGCPhase1KeepsBlockObjects(t *testing.T) {
 	if result.OrphansFound != 1 || result.OrphansDeleted != 1 {
 		t.Errorf("gc found %d orphans and deleted %d, want 1 and 1 (the control object alone)",
 			result.OrphansFound, result.OrphansDeleted)
+	}
+}
+
+// TestGCRefusesWhenTheDatabaseKnowsNothing reproduces the wrong-working
+// -directory bug. `hamstor gc` with the default relative --db created a fresh
+// empty database, which db.Open plus seedRoot make indistinguishable from a
+// filesystem holding no files, and phase 1 then handed the entire bucket to one
+// DeleteBatch.
+//
+// setupGCTest already hands out exactly that database — a db.Open on a path in
+// t.TempDir() — so the only thing this test adds is objects in the bucket. That
+// is what makes it a reproduction rather than a simulation of one.
+func TestGCRefusesWhenTheDatabaseKnowsNothing(t *testing.T) {
+	database, store := setupGCTest(t)
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("gcguard-%d/", time.Now().UnixNano())
+	keys := []string{prefix + "a", prefix + "b", prefix + "c"}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			store.Delete(ctx, k)
+		}
+	})
+	for _, k := range keys {
+		if err := store.Upload(ctx, k, []byte("data nobody in this database has heard of")); err != nil {
+			t.Fatalf("upload %s: %v", k, err)
+		}
+	}
+
+	// Zero grace makes all three deletable, which is what the bug's ten-minute-old
+	// bucket looked like. The prefix keeps that zero grace off the objects the
+	// other packages are using in this same bucket.
+	result, err := gcScoped(ctx, database, store, false, gcOptions{grace: 0, listPrefix: prefix})
+
+	var guard *GCGuardError
+	if !errors.As(err, &guard) {
+		t.Fatalf("gc returned %v (result %+v), want a GCGuardError: a database that knows "+
+			"nothing about a populated bucket must not delete it", err, result)
+	}
+	if guard.Matched != 0 || guard.Orphans != 3 {
+		t.Errorf("guard saw matched=%d orphans=%d, want 0 and 3", guard.Matched, guard.Orphans)
+	}
+
+	// The assertion that carries the test: without it a pass proves only that an
+	// error came back, not that the objects survived it.
+	for _, k := range keys {
+		if _, err := store.Download(ctx, k); err != nil {
+			t.Errorf("gc deleted %s despite refusing the run: %v", k, err)
+		}
+	}
+	if result.OrphansDeleted != 0 {
+		t.Errorf("gc reported %d deletions on a refused run", result.OrphansDeleted)
+	}
+}
+
+// TestGCAllowMassDeleteOverridesGuard is the twin of the test above, and it is
+// what proves the guard was the only thing that stopped it: same setup, same
+// counts, one field different.
+func TestGCAllowMassDeleteOverridesGuard(t *testing.T) {
+	database, store := setupGCTest(t)
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("gcguard-override-%d/", time.Now().UnixNano())
+	keys := []string{prefix + "a", prefix + "b", prefix + "c"}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			store.Delete(ctx, k)
+		}
+	})
+	for _, k := range keys {
+		if err := store.Upload(ctx, k, []byte("data nobody in this database has heard of")); err != nil {
+			t.Fatalf("upload %s: %v", k, err)
+		}
+	}
+
+	result, err := gcScoped(ctx, database, store, false,
+		gcOptions{grace: 0, listPrefix: prefix, allowMassDelete: true})
+	if err != nil {
+		t.Fatalf("gc with allowMassDelete: %v", err)
+	}
+	if result.OrphansDeleted != 3 {
+		t.Errorf("deleted %d objects, want 3 — the escape hatch has to actually work", result.OrphansDeleted)
+	}
+	for _, k := range keys {
+		if _, err := store.Download(ctx, k); err == nil {
+			t.Errorf("%s survived a run that was explicitly allowed to delete it", k)
+		}
+	}
+}
+
+// TestGCDryRunReportsTheRefusalAfterTheListing pins that --dry-run still shows
+// the operator what it would have deleted. Returning the refusal early would
+// withhold exactly the listing needed to judge it.
+func TestGCDryRunReportsTheRefusalAfterTheListing(t *testing.T) {
+	database, store := setupGCTest(t)
+	ctx := context.Background()
+
+	prefix := fmt.Sprintf("gcguard-dryrun-%d/", time.Now().UnixNano())
+	key := prefix + "a"
+	t.Cleanup(func() { store.Delete(ctx, key) })
+	if err := store.Upload(ctx, key, []byte("data")); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	result, err := gcScoped(ctx, database, store, true, gcOptions{grace: 0, listPrefix: prefix})
+
+	var guard *GCGuardError
+	if !errors.As(err, &guard) {
+		t.Fatalf("dry run returned %v, want a GCGuardError", err)
+	}
+	if result.OrphansFound != 1 {
+		t.Errorf("dry run reported %d orphans, want 1 — the report must complete before the refusal",
+			result.OrphansFound)
+	}
+	if _, err := store.Download(ctx, key); err != nil {
+		t.Errorf("dry run deleted %s: %v", key, err)
 	}
 }
 

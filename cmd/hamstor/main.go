@@ -46,6 +46,7 @@ func main() {
 	enableReplication := flag.Bool("replicate", true, "enable SQLite replication to S3")
 	dryRun := flag.Bool("dry-run", false, "dry-run mode for gc and purge-s3 subcommands")
 	assumeYes := flag.Bool("yes", false, "skip the purge-s3 confirmation prompt (for scripts)")
+	allowMassDelete := flag.Bool("allow-mass-delete", false, "let gc delete an implausible share of the bucket; only after checking why it refused")
 	cacheDir := flag.String("cache-dir", "/var/lib/hamstor/cache", "local disk cache directory")
 	cacheSizeGB := flag.Int("cache-size", 10, "max cache size in GB (0 to disable)")
 	ownerUid := flag.Int("uid", os.Getuid(), "default file owner UID")
@@ -181,8 +182,14 @@ func main() {
 
 	switch subcmd {
 	case "gc":
-		result, err := ops.GC(ctx, database, store, *dryRun)
-		if err != nil {
+		result, err := ops.GC(ctx, database, store, ops.GCConfig{
+			DryRun:          *dryRun,
+			AllowMassDelete: *allowMassDelete,
+		})
+		var guard *ops.GCGuardError
+		if errors.As(err, &guard) {
+			reportGCRefusal(guard, *bucket, *dbPath)
+		} else if err != nil {
 			log.Fatalf("gc: %v", err)
 		}
 		log.Printf("gc: %d s3 orphans, %d db orphans, %d deleted, %d errors", result.OrphansFound, result.DBOrphans, result.OrphansDeleted, result.Errors)
@@ -526,6 +533,38 @@ func acquireDBLock(dbPath string) (*os.File, error) {
 		return nil, fmt.Errorf("flock %s: %w", lockPath, err)
 	}
 	return f, nil
+}
+
+// reportGCRefusal prints a refused GC in the terms the operator can act on and
+// exits nonzero. The numbers alone do not say what to do about them, and the
+// answer is almost never "run it again anyway" — it is to check which database
+// this run was pointed at, which is why the message names it.
+//
+// There is no prompt. A refusal is a diagnosis rather than a request for
+// confirmation, and a prompt would put the decision in the terminal at the one
+// moment there is nothing to inspect. Two deliberate invocations — --dry-run to
+// look, then --allow-mass-delete to proceed — is the better shape, and it keeps
+// an unattended run failing loudly rather than answering its own question.
+func reportGCRefusal(guard *ops.GCGuardError, bucket, dbPath string) {
+	rel := ""
+	if !filepath.IsAbs(dbPath) {
+		rel = " — a relative path, resolved against the current directory"
+	}
+	fmt.Fprintf(os.Stderr, `
+gc: REFUSED — the database references %d of the %d objects it can classify in
+    bucket %q. %d of them are past the grace period and would have
+    been deleted; %d are inside it.
+
+This is what a gc run against the WRONG DATABASE looks like. Check that this is
+the database holding the filesystem that owns that bucket (`+"`hamstor restore`"+`
+fetches it from S3):
+
+    --db %s%s
+
+Nothing was deleted. Inspect with `+"`hamstor gc --dry-run`"+`; if this really is
+the state of the filesystem, re-run with --allow-mass-delete.
+`, guard.Matched, guard.Classified(), bucket, guard.Orphans, guard.TooYoung, dbPath, rel)
+	os.Exit(1)
 }
 
 // dbMustExist reports whether subcmd refuses to create a database rather than
