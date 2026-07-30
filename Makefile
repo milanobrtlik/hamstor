@@ -70,6 +70,11 @@ purge-s3: build
 	@systemctl is-active --quiet hamstor 2>/dev/null && { echo "Error: hamstor service is running. Run 'make uninstall' first."; exit 1; } || true
 	@echo "WARNING: This will delete ALL data in S3 bucket '$(HAMSTOR_BUCKET)' and the local database!"
 	@read -p "Type 'yes' to confirm: " confirm && [ "$$confirm" = "yes" ] || { echo "Aborted."; exit 1; }
-	./hamstor --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) purge-s3
+# sudo for the same reason install and uninstall have it: no --db here means the
+# compiled-in default /var/lib/hamstor/hamstor.db, which install creates as root.
+# purge-s3 is exempt from the must-exist check on purpose ("I lost the database,
+# wipe the bucket"), so unprivileged it does not stop at "no database" — it goes
+# on to create the directory and dies there.
+	sudo ./hamstor --bucket $(HAMSTOR_BUCKET) --endpoint $(HAMSTOR_ENDPOINT) purge-s3
 
 .PHONY: lint build install uninstall purge-s3
